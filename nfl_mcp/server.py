@@ -700,6 +700,9 @@ TOOLS = [
         },
     ),
 ]
+
+
+@_mcp_server.list_tools()
 async def list_tools() -> list[Tool]:
     return TOOLS
 

@@ -58,3 +58,21 @@
    - Validation passed: `sh -n entrypoint.sh && sh -n update_db.sh`.
    - Tests could not run because pytest is not installed in this environment; `shellcheck` is also unavailable.
    - Current relevant untracked files after reconciliation: `Dockerfile.dev`, `PLAN.md`, `entrypoint.sh`, `tests/test_dockerfile_dev.py`, `update_db.sh`.
+
+4. Goal: Fix MCPO connection failure where `session.list_tools()` returns MCP `Method not found`.
+   - Preserve the current desired baseline: latest upstream/main `nfl-mcp` code plus only the database update feature, with minimal additional compatibility fixes required for MCP protocol correctness.
+   - Investigate current `nfl_mcp/server.py` after the upstream reset and determine whether `tools/list` is registered with the MCP server at the protocol handler level.
+   - Investigate current transport wiring and MCPO expectations enough to confirm whether the server is reachable/initialized but lacks `tools/list`, or whether MCPO is using an incompatible transport/path.
+   - If `tools/list` is missing, add the minimal upstream-compatible fix by registering the existing tool listing function with the MCP SDK server API while preserving existing direct testability.
+   - Add or restore focused regression coverage proving `tools/list` is registered at the protocol/server-handler level, not only available as a plain Python function.
+   - Do not reintroduce unrelated fork drift or broad server rewrites; keep latest upstream code authoritative except for this protocol correctness fix and the database update feature.
+   - Run focused tests if pytest is available and shell syntax checks for update scripts; report unavailable tooling explicitly.
+   - Return a structured summary of root cause, files changed, tests run, and exact MCPO verification steps.
+
+   Implementation notes:
+   - Root cause: current upstream `nfl_mcp/server.py` defined `list_tools()` but did not register it with the MCP SDK via `@_mcp_server.list_tools()`. MCPO could reach/initialize the Streamable HTTP server, but `session.list_tools()` dispatched to an unregistered `tools/list` method and received MCP `Method not found`.
+   - Minimal protocol correctness fix applied in `nfl_mcp/server.py`: added `@_mcp_server.list_tools()` directly above the existing `list_tools()` function.
+   - Regression coverage added in `tests/test_server.py`: imports `ListToolsRequest` and asserts it is present in `server_module._mcp_server.request_handlers`.
+   - No transport rewrite was applied; `entrypoint.sh` still starts `nfl-mcp serve --host 0.0.0.0 --port 8000`, and the CLI serves Streamable HTTP at `/mcp`.
+   - Shell syntax checks passed: `sh -n entrypoint.sh` and `sh -n update_db.sh`.
+   - Pytest could not be run because pytest is not installed in this environment; local verification should run `python3 -m pytest tests/test_server.py tests/test_dockerfile_dev.py` after installing dev dependencies.

@@ -3,6 +3,8 @@
 import asyncio
 import json
 
+from mcp.types import ListToolsRequest
+
 import nfl_mcp.server as server_module
 from nfl_mcp.server import _tool_error_payload, create_app
 
@@ -28,6 +30,10 @@ def test_list_tools_returns_registered_tools():
     tools = asyncio.run(server_module.list_tools())
     names = {tool.name for tool in tools}
     assert {"nfl_schema", "nfl_query", "nfl_schedule"}.issubset(names)
+
+
+def test_list_tools_registered_with_mcp_server():
+    assert ListToolsRequest in server_module._mcp_server.request_handlers
 
 
 def test_call_tool_success_with_arguments(monkeypatch):
