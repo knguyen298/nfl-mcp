@@ -139,7 +139,7 @@ TOOLS = [
                 },
                 "season": {
                     "type": "integer",
-                    "description": "Exact season year (2013–2025). Use season_from/season_to for ranges.",
+                    "description": "Exact season year (2013 through the current season). Use season_from/season_to for ranges.",
                 },
                 "season_from": {
                     "type": "integer",

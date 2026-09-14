@@ -142,6 +142,20 @@ class TestSeasonRangeValidation:
         result = runner.invoke(main, ["ingest", "--start", "2025", "--end", "2020"])
         assert "start" in result.output.lower() or "end" in result.output.lower()
 
+    def test_current_season_is_accepted_and_next_year_is_rejected(self, runner, monkeypatch):
+        from nfl_mcp.cli import CURRENT_SEASON
+        captured = {}
+        monkeypatch.setattr(
+            "nfl_mcp.ingest.run_ingest_datasets",
+            lambda **kw: captured.update(kw),
+        )
+        ok = runner.invoke(main, ["ingest", "--start", str(CURRENT_SEASON), "--end", str(CURRENT_SEASON)])
+        assert ok.exit_code == 0, ok.output
+        assert captured["end"] == CURRENT_SEASON
+
+        bad = runner.invoke(main, ["ingest", "--end", str(CURRENT_SEASON + 1)])
+        assert bad.exit_code != 0
+
     def test_equal_start_end_is_valid(self, runner, monkeypatch):
         monkeypatch.setattr(
             "nfl_mcp.ingest.run_ingest_datasets",

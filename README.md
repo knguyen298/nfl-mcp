@@ -145,7 +145,7 @@ nfl-mcp ingest --fresh                  # re-ingest even if already loaded
 nfl-mcp ingest --list                   # show all available dataset names
 ```
 
-Ingest is **idempotent** — re-running skips datasets and seasons already in the database.
+Ingest is **idempotent** — re-running skips completed seasons already in the database. The current season and the static snapshot tables (rankings, players, contracts, teams) are re-fetched on every run, so run `nfl-mcp ingest` after a game week to pick up new stats. The current season is computed from today's date (the league year rolls over in March), so a new season is picked up automatically.
 
 ## Datasets
 
@@ -240,7 +240,8 @@ pytest -m integration  # integration tests (requires loaded DB)
 - `nfl-mcp doctor` is the fastest way to verify config, database, and client setup.
 - If tools return database errors, run `nfl-mcp ingest` to ensure data is loaded.
 - You can override the DB location with `NFL_MCP_DB_PATH=/path/to/nflread.duckdb`.
-- Re-running `nfl-mcp ingest` is safe — it skips anything already loaded.
+- Re-running `nfl-mcp ingest` is safe — it skips completed seasons and re-fetches only the current season and static tables.
+- Stats for a game usually appear in nflverse within a few hours; play-by-play is rebuilt overnight and official stat corrections land midweek. Run `nfl-mcp ingest` (or wait for the container cron) after that.
 
 ## License
 

@@ -28,6 +28,9 @@ from nfl_mcp.ingest import (
     _write_df_to_table,
     run_ingest,
     run_ingest_datasets,
+    ALL_SEASONS,
+    all_seasons,
+    current_season,
 )
 
 
@@ -437,7 +440,7 @@ class TestGenericDatasetIngestion:
         assert _is_loaded(conn, "fake_static")
         assert conn.execute("SELECT COUNT(*) FROM fake_static").fetchone()[0] == 1
 
-    def test_static_dataset_skips_when_already_loaded(self, conn, monkeypatch):
+    def test_static_dataset_refreshes_when_already_loaded(self, conn, monkeypatch):
         defn = DatasetDef(
             dataset_id="fake_static",
             loader_fn="load_fake_static",
@@ -445,15 +448,36 @@ class TestGenericDatasetIngestion:
             seasonal=False,
             default=False,
         )
-        _record_loaded(conn, "fake_static", "fake_static", "load_fake_static", 1)
+        conn.execute("CREATE TABLE fake_static (x BIGINT)")
+        conn.execute("INSERT INTO fake_static VALUES (1), (2)")
+        _record_loaded(conn, "fake_static", "fake_static", "load_fake_static", 2)
         called = []
         _install_fake_nflreadpy(
             monkeypatch,
-            load_fake_static=lambda **kwargs: called.append(True) or pl.DataFrame({"x": [1]}),
+            load_fake_static=lambda **kwargs: called.append(True) or pl.DataFrame({"x": [99]}),
         )
         total = _ingest_generic_dataset(conn, defn, seasons=[2024], fresh=False)
-        assert total == 0
-        assert called == []
+        assert total == 1
+        assert called == [True]
+        assert conn.execute("SELECT x FROM fake_static").fetchall() == [(99,)]
+
+    def test_static_dataset_keeps_old_table_when_refresh_fetch_fails(self, conn, monkeypatch):
+        defn = DatasetDef(
+            dataset_id="fake_static",
+            loader_fn="load_fake_static",
+            table_name="fake_static",
+            seasonal=False,
+            default=False,
+        )
+        conn.execute("CREATE TABLE fake_static (x BIGINT)")
+        conn.execute("INSERT INTO fake_static VALUES (1)")
+        _record_loaded(conn, "fake_static", "fake_static", "load_fake_static", 1)
+        _install_fake_nflreadpy(
+            monkeypatch,
+            load_fake_static=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        assert _ingest_generic_dataset(conn, defn, seasons=[2024], fresh=False) == 0
+        assert conn.execute("SELECT x FROM fake_static").fetchall() == [(1,)]
 
     def test_static_dataset_handles_loader_error_and_empty(self, conn, monkeypatch):
         defn = DatasetDef(
@@ -493,6 +517,7 @@ class TestGenericDatasetIngestion:
             return pl.DataFrame({"season": [season], "value": [season]})
 
         _install_fake_nflreadpy(monkeypatch, load_fake_seasonal=loader)
+        monkeypatch.setattr("nfl_mcp.ingest.current_season", lambda: 2030)
         total = _ingest_generic_dataset(
             conn,
             defn,
@@ -541,6 +566,133 @@ class TestGenericDatasetIngestion:
         )
         total = _ingest_generic_dataset(conn, defn, seasons=[2024], fresh=True)
         assert total == 1
+
+
+    def test_seasonal_current_season_is_refetched_even_when_loaded(self, conn, monkeypatch):
+        defn = DatasetDef(
+            dataset_id="fake_seasonal",
+            loader_fn="load_fake_seasonal",
+            table_name="fake_seasonal",
+            seasonal=True,
+            default=False,
+        )
+        conn.execute("CREATE TABLE fake_seasonal (season BIGINT, value BIGINT)")
+        conn.execute("INSERT INTO fake_seasonal VALUES (2024, 1), (2023, 9)")
+        _record_loaded(conn, "fake_seasonal", "fake_seasonal", "load_fake_seasonal", 1, season=2024)
+        _record_loaded(conn, "fake_seasonal", "fake_seasonal", "load_fake_seasonal", 1, season=2023)
+        monkeypatch.setattr("nfl_mcp.ingest.current_season", lambda: 2024)
+
+        fetched = []
+        def loader(seasons, **kwargs):
+            fetched.append(seasons[0])
+            return pl.DataFrame({"season": [2024, 2024], "value": [1, 2]})
+
+        _install_fake_nflreadpy(monkeypatch, load_fake_seasonal=loader)
+        total = _ingest_generic_dataset(conn, defn, seasons=[2023, 2024], fresh=False)
+
+        assert fetched == [2024]          # 2023 is complete → skipped
+        assert total == 2
+        rows = conn.execute("SELECT season, value FROM fake_seasonal ORDER BY season, value").fetchall()
+        assert rows == [(2023, 9), (2024, 1), (2024, 2)]   # no duplicate 2024 rows
+
+    def test_seasonal_current_season_keeps_rows_when_fetch_fails(self, conn, monkeypatch):
+        defn = DatasetDef(
+            dataset_id="fake_seasonal",
+            loader_fn="load_fake_seasonal",
+            table_name="fake_seasonal",
+            seasonal=True,
+            default=False,
+        )
+        conn.execute("CREATE TABLE fake_seasonal (season BIGINT, value BIGINT)")
+        conn.execute("INSERT INTO fake_seasonal VALUES (2024, 1)")
+        _record_loaded(conn, "fake_seasonal", "fake_seasonal", "load_fake_seasonal", 1, season=2024)
+        monkeypatch.setattr("nfl_mcp.ingest.current_season", lambda: 2024)
+        _install_fake_nflreadpy(
+            monkeypatch,
+            load_fake_seasonal=lambda seasons, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        assert _ingest_generic_dataset(conn, defn, seasons=[2024], fresh=False) == 0
+        assert conn.execute("SELECT value FROM fake_seasonal").fetchall() == [(1,)]
+
+
+class TestPbpCurrentSeasonRefresh:
+    def _plays(self, conn, rows):
+        df = pl.DataFrame(rows)
+        _create_plays_table(conn, df)
+        conn.register("_seed", df.with_columns(pl.lit("").alias("enhanced_description")).to_arrow())
+        conn.execute("INSERT INTO plays BY NAME SELECT * FROM _seed")
+        conn.unregister("_seed")
+
+    def test_ingest_pbp_season_replaces_existing_rows_for_that_season(self, conn, monkeypatch):
+        base = {"posteam": ["KC"], "defteam": ["BAL"], "play_id": [1], "game_id": ["g"], "week": [1]}
+        self._plays(conn, {**base, "season": [2024]})
+        self._plays_extra = None
+        conn.execute("INSERT INTO plays BY NAME SELECT 'PHI' AS posteam, 'DAL' AS defteam, 2 AS play_id, 'h' AS game_id, 1 AS week, 2023 AS season, '' AS enhanced_description")
+
+        new_df = pl.DataFrame({**base, "play_id": [1, 2], "posteam": ["KC", "KC"], "defteam": ["BAL", "BAL"],
+                               "game_id": ["g", "g"], "week": [1, 2], "season": [2024, 2024]})
+        _install_fake_nflreadpy(monkeypatch, load_pbp=lambda seasons: new_df)
+
+        assert _ingest_pbp_season(conn, 2024) == 2
+        rows = conn.execute("SELECT season, COUNT(*) FROM plays GROUP BY season ORDER BY season").fetchall()
+        assert rows == [(2023, 1), (2024, 2)]
+
+    def test_run_ingest_datasets_refetches_current_season_pbp(self, monkeypatch, tmp_path):
+        conn = TestRunIngestOrchestration._DummyConn(loaded_rows=[(2023,), (2024,)])
+        pbp_calls = []
+        monkeypatch.setattr("nfl_mcp.ingest.current_season", lambda: 2024)
+        _install_fake_nflreadpy(
+            monkeypatch,
+            load_pbp=lambda seasons: pl.DataFrame({"season": [2024], "posteam": ["KC"], "defteam": ["BAL"]}),
+        )
+        monkeypatch.setattr("nfl_mcp.ingest.duckdb.connect", lambda path: conn)
+        monkeypatch.setattr("nfl_mcp.ingest._ensure_metadata_table", lambda c: None)
+        monkeypatch.setattr("nfl_mcp.ingest._create_plays_table", lambda c, df, fresh=False: None)
+        monkeypatch.setattr("nfl_mcp.ingest._ingest_pbp_season", lambda c, season: pbp_calls.append(season) or 1)
+        monkeypatch.setattr("nfl_mcp.ingest._record_loaded", lambda *a, **k: None)
+        monkeypatch.setattr("nfl_mcp.ingest._create_indexes", lambda c: None)
+
+        run_ingest_datasets(["pbp"], start=2023, end=2024, skip_views=True,
+                            db_path=str(tmp_path / "nflread.duckdb"))
+        assert pbp_calls == [2024]
+
+    def test_schema_discovery_falls_back_when_current_season_has_no_pbp(self, monkeypatch, tmp_path):
+        conn = TestRunIngestOrchestration._DummyConn(loaded_rows=[])
+        asked = []
+        def load_pbp(seasons):
+            asked.append(seasons[0])
+            if seasons[0] == 2025:
+                raise FileNotFoundError("no file yet")
+            return pl.DataFrame({"season": [2024], "posteam": ["KC"], "defteam": ["BAL"]})
+        monkeypatch.setattr("nfl_mcp.ingest.current_season", lambda: 2025)
+        _install_fake_nflreadpy(monkeypatch, load_pbp=load_pbp)
+        monkeypatch.setattr("nfl_mcp.ingest.duckdb.connect", lambda path: conn)
+        monkeypatch.setattr("nfl_mcp.ingest._ensure_metadata_table", lambda c: None)
+        monkeypatch.setattr("nfl_mcp.ingest._create_plays_table", lambda c, df, fresh=False: None)
+        monkeypatch.setattr("nfl_mcp.ingest._ingest_pbp_season", lambda c, season: 0)
+        monkeypatch.setattr("nfl_mcp.ingest._create_indexes", lambda c: None)
+
+        run_ingest_datasets(["pbp"], start=2024, end=2025, skip_views=True,
+                            db_path=str(tmp_path / "nflread.duckdb"))
+        assert asked[:2] == [2025, 2024]
+
+
+class TestSeasonHelpers:
+    @pytest.mark.parametrize("date_, expected", [
+        (datetime.date(2026, 9, 14), 2026),
+        (datetime.date(2026, 3, 1), 2026),
+        (datetime.date(2026, 2, 28), 2025),
+        (datetime.date(2025, 1, 15), 2024),
+    ])
+    def test_current_season_rolls_over_in_march(self, date_, expected):
+        assert current_season(date_) == expected
+
+    def test_all_seasons_ends_at_current(self):
+        seasons = all_seasons(datetime.date(2026, 9, 14))
+        assert seasons[0] == 2013 and seasons[-1] == 2026
+
+    def test_all_seasons_constant_matches_today(self):
+        assert ALL_SEASONS[-1] == current_season()
 
 
 # ── aggregate tables and indexes ────────────────────────────────────────────────

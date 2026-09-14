@@ -23,6 +23,8 @@ echo "[$(date -u)] Target DB : $TARGET"
 echo "[$(date -u)] Copying active DB to target slot..."
 cp "$DB_DIR/$CURRENT" "$TARGET"
 
+# Incremental: completed seasons are skipped; the current season and static
+# snapshot tables (rankings, players, contracts) are re-fetched every run.
 echo "[$(date -u)] Running incremental ingest..."
 NFL_MCP_DB_PATH="$TARGET" nfl-mcp ingest
 

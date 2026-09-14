@@ -17,6 +17,9 @@ import click
 import uvicorn
 
 from .server import create_app
+from .seasons import FIRST_SEASON, EARLIEST_SEASON, current_season
+
+CURRENT_SEASON = current_season()
 
 
 @click.group()
@@ -49,9 +52,9 @@ def serve(host, port):
                   "Dataset(s) to load. Pass multiple times or use 'all' / 'default'. "
                   "Run with --list to see all available names."
               ))
-@click.option("--start",      default=None, type=click.IntRange(2013, 2025),
-              help="First season to load. Omit to load all available seasons.")
-@click.option("--end",        default=None, type=click.IntRange(2013, 2025),
+@click.option("--start",      default=None, type=click.IntRange(EARLIEST_SEASON, CURRENT_SEASON),
+              help="First season to load (1999+ for datasets like schedules). Omit to load all available seasons.")
+@click.option("--end",        default=None, type=click.IntRange(EARLIEST_SEASON, CURRENT_SEASON),
               help="Last season to load (inclusive). Omit to load all available seasons.")
 @click.option("--fresh",      is_flag=True,
               help="Re-ingest even if dataset+season is already recorded as loaded.")
@@ -113,11 +116,11 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets):
 # ── init ───────────────────────────────────────────────────────────────────────
 
 @main.command()
-@click.option("--start", default=2013, show_default=True,
-              type=click.IntRange(2013, 2025),
+@click.option("--start", default=FIRST_SEASON, show_default=True,
+              type=click.IntRange(FIRST_SEASON, CURRENT_SEASON),
               help="First season to load.")
-@click.option("--end", default=2025, show_default=True,
-              type=click.IntRange(2013, 2025),
+@click.option("--end", default=CURRENT_SEASON, show_default=True,
+              type=click.IntRange(FIRST_SEASON, CURRENT_SEASON),
               help="Last season to load.")
 @click.option("--skip-ingest", is_flag=True,
               help="Skip data ingestion (configure only).")

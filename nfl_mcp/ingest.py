@@ -14,7 +14,20 @@ import polars as pl
 from pathlib import Path
 from tqdm import tqdm
 
-ALL_SEASONS = list(range(2013, 2026))
+from .seasons import FIRST_SEASON, EARLIEST_SEASON, all_seasons, current_season
+
+# Computed at import time; the current season is always the last entry.
+ALL_SEASONS = all_seasons()
+
+
+def _refresh_seasons() -> set[int]:
+    """Seasons that are re-fetched on every ingest, even if already recorded as loaded.
+
+    The in-progress season gains new games every week, so its 'already loaded' record
+    only means 'loaded at some point', never 'complete'. Resolved at call time (not
+    import time) so a long-running process or a test can override current_season.
+    """
+    return {current_season()}
 
 
 def _apply_duckdb_pragmas(conn: duckdb.DuckDBPyConnection, db_path: str) -> None:
@@ -282,6 +295,9 @@ def _ingest_pbp_season(conn: duckdb.DuckDBPyConnection, season: int) -> int:
     df = df.with_columns(pl.Series("enhanced_description", descriptions))
 
     _reconcile_schema(conn, "plays", df)
+    # Replace, not append: the fetch above succeeded, so it is safe to drop the stale
+    # copy of this season (a partial in-progress season, or a --fresh re-run).
+    conn.execute("DELETE FROM plays WHERE season = ?", [season])
     conn.register("_ingest_df", df.to_arrow())
     conn.execute("INSERT INTO plays BY NAME SELECT * FROM _ingest_df")
     conn.unregister("_ingest_df")
@@ -328,12 +344,12 @@ def _ingest_generic_dataset(
     bulk_mode = seasons is None  # pass True to loader instead of per-season list
 
     if not dataset_def.seasonal:
-        # Static dataset — one load, replace table
+        # Static dataset — one load, replace table. Static tables are point-in-time
+        # snapshots (weekly rankings, player ids, contracts, teams), so they are
+        # re-fetched on every ingest; the old table is only dropped after the fetch succeeds.
         print(f"\n  {dataset_def.dataset_id} (static)")
-
-        if _is_loaded(conn, dataset_def.dataset_id) and not fresh:
-            print(f"    Already loaded, skipping")
-            return 0
+        if _is_loaded(conn, dataset_def.dataset_id):
+            print(f"    Already loaded, refreshing")
 
         try:
             df = loader(**dataset_def.extra_params)
@@ -361,9 +377,12 @@ def _ingest_generic_dataset(
             if dataset_def.max_season and season > dataset_def.max_season:
                 continue
 
-            if _is_loaded(conn, dataset_def.dataset_id, season) and not fresh:
+            already = _is_loaded(conn, dataset_def.dataset_id, season)
+            if already and not fresh and season not in _refresh_seasons():
                 print(f"    {dataset_def.dataset_id} {season}: already loaded, skipping")
                 continue
+            if already:
+                print(f"    {dataset_def.dataset_id} {season}: refreshing")
 
             print(f"\n  {dataset_def.dataset_id} {season}")
             try:
@@ -379,12 +398,12 @@ def _ingest_generic_dataset(
             df = _safe_rename(df)
             print(f"    {len(df):,} rows, {len(df.columns)} columns")
 
-            if fresh:
-                # Remove stale rows for this season before re-inserting
-                try:
-                    conn.execute(f"DELETE FROM {table} WHERE season = {season}")
-                except Exception:
-                    pass
+            # Replace, not append: the fetch succeeded, so drop any stale rows for this
+            # season (no-op on first load; table may not exist yet).
+            try:
+                conn.execute(f"DELETE FROM {table} WHERE season = {season}")
+            except Exception:
+                pass
 
             _write_df_to_table(conn, table, df)
             _record_loaded(conn, dataset_def.dataset_id, table, dataset_def.loader_fn, len(df), season)
@@ -861,13 +880,17 @@ def run_ingest_datasets(
 
     bulk_mode = start is None and end is None
     if not bulk_mode:
-        start = start or 2013
-        end = end or 2025
+        start = start or FIRST_SEASON
+        end = end or current_season()
         if start > end:
             raise ValueError("start must be less than or equal to end")
 
     path = db_path or str(get_duckdb_path())
-    seasons: list[int] | None = None if bulk_mode else [s for s in ALL_SEASONS if start <= s <= end]
+    # Explicit ranges may start before 2013 (e.g. schedules go back to ~1999);
+    # per-dataset min_season still clips each dataset's own coverage window.
+    seasons: list[int] | None = None if bulk_mode else [
+        s for s in range(EARLIEST_SEASON, current_season() + 1) if start <= s <= end
+    ]
 
     print("=" * 60)
     print("NFL MCP — Multi-Dataset Ingest")
@@ -890,10 +913,19 @@ def run_ingest_datasets(
     if has_pbp:
         print("\n── Play-by-play ──")
 
-        pbp_seasons = ALL_SEASONS if bulk_mode else seasons
-        schema_season = pbp_seasons[-1]
-        print(f"  Discovering schema from {schema_season}…")
-        sample_df = nflreadpy.load_pbp([schema_season])
+        pbp_seasons = all_seasons() if bulk_mode else seasons
+        # Discover the schema from the newest season that actually has a pbp file.
+        # Early in a new league year the current season has no play-by-play yet.
+        sample_df = None
+        for schema_season in reversed(pbp_seasons):
+            print(f"  Discovering schema from {schema_season}…")
+            try:
+                sample_df = nflreadpy.load_pbp([schema_season])
+                break
+            except Exception as e:
+                print(f"    Not available ({e}); trying an earlier season")
+        if sample_df is None:
+            raise RuntimeError("Could not load play-by-play for any requested season")
         print(f"  {len(sample_df.columns)} columns · {len(sample_df):,} rows")
 
         _create_plays_table(conn, sample_df, fresh=fresh)
@@ -904,11 +936,15 @@ def run_ingest_datasets(
             ).fetchall()
         } if not fresh else set()
 
-        to_ingest = [s for s in pbp_seasons if s not in loaded_pbp]
-        skipped   = [s for s in pbp_seasons if s in loaded_pbp]
+        refresh   = _refresh_seasons()
+        to_ingest = [s for s in pbp_seasons if s not in loaded_pbp or s in refresh]
+        skipped   = [s for s in pbp_seasons if s in loaded_pbp and s not in refresh]
+        refreshed = [s for s in pbp_seasons if s in loaded_pbp and s in refresh]
 
         if skipped:
             print(f"  Already loaded, skipping: {skipped}")
+        if refreshed:
+            print(f"  Current season, re-fetching: {refreshed}")
         if not to_ingest:
             print("  All PBP seasons already loaded.")
         else:
@@ -951,8 +987,8 @@ def run_ingest_datasets(
 
 
 def run_ingest(
-    start: int = 2013,
-    end: int = 2025,
+    start: int = FIRST_SEASON,
+    end: int | None = None,
     fresh: bool = False,
     skip_views: bool = False,
     db_path: str | None = None,
