@@ -40,7 +40,7 @@ ENV NFL_MCP_DB_PATH=/data/nflread.duckdb
 # the build instead of shipping a broken image.
 #
 # INGEST_ARGS is empty by default, so production/release builds bake the default window:
-# 1970 onward, clipped per dataset (play-by-play and the stats tables from their 1999
+# 1966 onward, clipped per dataset (play-by-play and the stats tables from their 1999
 # source floor). That is a multi-GB build; pass e.g. INGEST_ARGS=--start 1999 for a smaller
 # image, or a single season in CI to validate the build pipeline quickly without the bake.
 ARG INGEST_ARGS=""

@@ -890,7 +890,7 @@ def run_ingest_datasets(
 
     path = db_path or str(get_duckdb_path())
     # Build the widest range the caller asked for; each dataset is then clipped to its
-    # own min_season/max_season, so asking for 1970 does not make load_pbp try 1970.
+    # own min_season/max_season, so asking for 1966 does not make load_pbp try 1966.
     seasons: list[int] | None = None if bulk_mode else [
         s for s in range(EARLIEST_SEASON, current_season() + 1) if start <= s <= end
     ]
@@ -917,7 +917,7 @@ def run_ingest_datasets(
         print("\n── Play-by-play ──")
 
         # Play-by-play is on a special code path, so it must clip to its own window
-        # explicitly: the default backfill starts in 1970, but load_pbp only publishes
+        # explicitly: the default backfill starts in 1966, but load_pbp only publishes
         # from 1999 and raises for anything earlier.
         pbp_seasons = _clip_to_window(all_seasons() if bulk_mode else seasons, REGISTRY["pbp"])
         # Discover the schema from the newest season that actually has a pbp file.

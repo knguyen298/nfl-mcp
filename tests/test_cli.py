@@ -68,10 +68,10 @@ class TestIngestList:
         assert "2022–present" in result.output   # ftn_charting
 
     def test_list_flags_when_the_default_start_clips_a_dataset(self, runner):
-        # rosters publishes from 1920 but the default backfill starts in 1970, so the
-        # listing must not imply the pre-1970 seasons load on their own.
+        # rosters publishes from 1920 but the default backfill starts in 1966, so the
+        # listing must not imply the pre-1966 seasons load on their own.
         result = runner.invoke(main, ["ingest", "--list"])
-        assert "1920–present (from 1970 by default)" in result.output
+        assert "1920–present (from 1966 by default)" in result.output
 
     @pytest.mark.parametrize("low,high,expected", [
         (1999, None, "1999–present"),

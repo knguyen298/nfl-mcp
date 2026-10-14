@@ -48,7 +48,8 @@ The ingest loop in `ingest.py` is fully generic — it reads from the registry a
 dataset requests a season its source never published. Two bounds in `seasons.py` set the
 outer limits of what gets requested:
 
-- `FIRST_SEASON = 1970` — the **default** backfill start (merger era).
+- `FIRST_SEASON = 1966` — the **default** backfill start (the AFL–NFL merger agreement
+  year, so the final four AFL seasons of rosters are included).
 - `EARLIEST_SEASON = 1920` — how deep `--start` may reach; a test asserts this equals
   `registry.earliest_season()`, the oldest declared dataset floor. Keep them distinct:
   changing the default should not silently redefine what is reachable.

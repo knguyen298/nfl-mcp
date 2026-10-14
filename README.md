@@ -1,6 +1,6 @@
 # nfl-mcp
 
-MCP server for NFL data (default backfill to 1970; play-by-play from 1999, rosters to 1920 on request), powered by [nflreadpy](https://github.com/nflverse/nflreadpy) and DuckDB.
+MCP server for NFL data (default backfill to 1966; play-by-play from 1999, rosters to 1920 on request), powered by [nflreadpy](https://github.com/nflverse/nflreadpy) and DuckDB.
 Query play-by-play, rosters, injuries, stats, and more using natural language in Claude Code, VS Code, or Claude Desktop.
 
 Ask Claude questions like:
@@ -192,18 +192,19 @@ DuckDB:
 **Every dataset below is ingested by default** — `nfl-mcp ingest` loads the full family so
 any data a client might need is already there.
 
-> **Season coverage: 1970 onward by default, deeper on request.** The default backfill
-> starts at **1970** and each dataset is then clipped to its own first available season (the
-> `min_season` in `nfl_mcp/registry.py`), so a fresh install loads rosters from 1970 while
+> **Season coverage: 1966 onward by default, deeper on request.** The default backfill
+> starts at **1966** — the AFL–NFL merger agreement year, so the final four AFL seasons are
+> included — and each dataset is then clipped to its own first available season (the
+> `min_season` in `nfl_mcp/registry.py`), so a fresh install loads rosters from 1966 while
 > play-by-play and the stats tables start at their 1999 source floor and Next Gen Stats at
-> 2016. Pass `--start` to go deeper — `--start 1920` adds the pre-merger rosters, and no
+> 2016. Pass `--start` to go deeper — `--start 1920` adds the earlier pre-merger rosters, and no
 > dataset ever requests a season its source never published. `nfl-mcp ingest --list` prints
 > the window for every dataset. Non-seasonal reference tables (draft picks, combine,
 > contracts, players) carry their full historical record.
 
 | Table | Loaded range |
 |---|---|
-| `rosters` | 1970–present (1920 with `--start 1920`) |
+| `rosters` | 1966–present (1920 with `--start 1920`) |
 | `plays` | 1999–present |
 | `schedules` | 1999–present |
 | `player_stats` | 1999–present |
@@ -231,8 +232,8 @@ any data a client might need is already there.
 > Older seasons are thinner than modern ones. Play-by-play carries `epa`, `wp`, and
 > `shotgun` from 1999, but tracking-derived data (Next Gen Stats, FTN charting), snap
 > counts, and weekly depth only exist from their respective start years above — so any
-> query that spans decades mixes eras of very different column coverage. Pre-1970 rosters
-> are available but cover the pre-merger leagues.
+> query that spans decades mixes eras of very different column coverage. Rosters before
+> 1966 are available with `--start 1920` and cover the pre-merger leagues.
 
 ```bash
 nfl-mcp ingest                 # load the full nflverse family (default)

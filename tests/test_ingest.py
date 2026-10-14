@@ -690,7 +690,7 @@ class TestSeasonHelpers:
 
     def test_all_seasons_spans_the_oldest_dataset_and_ends_at_current(self):
         seasons = all_seasons(datetime.date(2026, 9, 14))
-        assert seasons[0] == 1970 and seasons[-1] == 2026
+        assert seasons[0] == 1966 and seasons[-1] == 2026
 
     def test_all_seasons_constant_matches_today(self):
         assert ALL_SEASONS[-1] == current_season()

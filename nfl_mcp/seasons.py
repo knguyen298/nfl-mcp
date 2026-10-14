@@ -10,16 +10,16 @@ import datetime
 #
 #   EARLIEST_SEASON — how deep the upstream sources actually go (rosters, 1920).
 #                     The lower bound for --start; nothing can be loaded below it.
-#   FIRST_SEASON    — the default backfill start. 1970, the merger era, so a fresh
-#                     install gets a century of rosters without the pre-merger leagues.
+#   FIRST_SEASON    — the default backfill start. 1966, the AFL–NFL merger agreement year,
+#                     so a fresh install gets pre-merger rosters as well as every merged season.
 #
 # Every dataset is additionally clipped to its own registry min_season/max_season, so the
-# default starts *later* than 1970 for anything whose source began publishing after it
+# default starts *later* than 1966 for anything whose source began publishing after it
 # (play-by-play and all stats tables start 1999, Next Gen Stats 2016, FTN charting 2022).
-# Passing --start 1920 reaches the pre-1970 rosters; tests assert EARLIEST_SEASON stays
+# Passing --start 1920 reaches the pre-1966 rosters; tests assert EARLIEST_SEASON stays
 # equal to registry.earliest_season().
 EARLIEST_SEASON = 1920
-FIRST_SEASON = 1970
+FIRST_SEASON = 1966
 
 
 def current_season(today: datetime.date | None = None) -> int:
