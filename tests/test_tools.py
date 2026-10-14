@@ -803,7 +803,12 @@ class TestNflTeamRecordsIntegration:
         via_alias = nfl_team_records(team="OAK", season=2024)["records"]
         assert modern == via_alias
 
-    def test_season_range(self):
-        result = nfl_team_records(team="PHI", from_season=2022, to_season=2024)
-        assert {row["season"] for row in result["records"]} >= {2022, 2023, 2024}
-        assert all(row["team"] == "PHI" for row in result["records"])
+    def test_season_range_is_clipped_to_the_bounds(self):
+        # CI ingests one season, so assert what a range must always guarantee rather than
+        # assuming the database spans it.
+        bounded = nfl_team_records(team="PHI", from_season=2000, to_season=2024)["records"]
+        assert bounded
+        assert {row["season"] for row in bounded} <= set(range(2000, 2025))
+        assert all(row["team"] == "PHI" for row in bounded)
+        unbounded = nfl_team_records(team="PHI")["records"]
+        assert len(bounded) <= len(unbounded)
