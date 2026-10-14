@@ -50,6 +50,15 @@ def _apply_duckdb_pragmas(conn: duckdb.DuckDBPyConnection, db_path: str) -> None
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+def _clip_to_window(season_list, dataset_def):
+    """Drop seasons outside a dataset's own published coverage window (no network)."""
+    return [
+        s for s in season_list
+        if (dataset_def.min_season is None or s >= dataset_def.min_season)
+        and (dataset_def.max_season is None or s <= dataset_def.max_season)
+    ]
+
+
 def _safe_col(name: str) -> str:
     return name.replace(".", "_").replace(" ", "_").replace("-", "_")
 
@@ -369,14 +378,8 @@ def _ingest_generic_dataset(
 
     else:
         # Seasonal dataset — iterate per season (bulk mode uses ALL_SEASONS)
-        season_list = ALL_SEASONS if bulk_mode else seasons
+        season_list = _clip_to_window(ALL_SEASONS if bulk_mode else seasons, dataset_def)
         for season in season_list:
-            # Skip seasons outside the dataset's known coverage window
-            if dataset_def.min_season and season < dataset_def.min_season:
-                continue
-            if dataset_def.max_season and season > dataset_def.max_season:
-                continue
-
             already = _is_loaded(conn, dataset_def.dataset_id, season)
             if already and not fresh and season not in _refresh_seasons():
                 print(f"    {dataset_def.dataset_id} {season}: already loaded, skipping")
@@ -886,8 +889,8 @@ def run_ingest_datasets(
             raise ValueError("start must be less than or equal to end")
 
     path = db_path or str(get_duckdb_path())
-    # Explicit ranges may start before 2013 (e.g. schedules go back to ~1999);
-    # per-dataset min_season still clips each dataset's own coverage window.
+    # Build the widest range the caller asked for; each dataset is then clipped to its
+    # own min_season/max_season, so asking for 1970 does not make load_pbp try 1970.
     seasons: list[int] | None = None if bulk_mode else [
         s for s in range(EARLIEST_SEASON, current_season() + 1) if start <= s <= end
     ]
@@ -913,7 +916,10 @@ def run_ingest_datasets(
     if has_pbp:
         print("\n── Play-by-play ──")
 
-        pbp_seasons = all_seasons() if bulk_mode else seasons
+        # Play-by-play is on a special code path, so it must clip to its own window
+        # explicitly: the default backfill starts in 1970, but load_pbp only publishes
+        # from 1999 and raises for anything earlier.
+        pbp_seasons = _clip_to_window(all_seasons() if bulk_mode else seasons, REGISTRY["pbp"])
         # Discover the schema from the newest season that actually has a pbp file.
         # Early in a new league year the current season has no play-by-play yet.
         sample_df = None

@@ -8,6 +8,7 @@ from nfl_mcp.registry import (
     DEFAULT_DATASETS,
     REGISTRY,
     DatasetDef,
+    earliest_season,
 )
 
 
@@ -81,14 +82,54 @@ class TestSeasonCoverageWindows:
         ("nextgen_stats_passing", 2016),
         ("pfr_advstats_pass",     2018),
         ("ftn_charting",          2022),
-        ("snap_counts",           2012),
+        ("snap_counts",           2013),
         ("injuries",              2009),
+        ("schedules",             1999),
+        ("pbp",                   1999),
+        ("rosters",               1920),
     ])
     def test_known_min_seasons(self, dataset_id, expected_min):
         assert REGISTRY[dataset_id].min_season == expected_min
 
-    def test_participation_has_max_season(self):
-        assert REGISTRY["participation"].max_season == 2024
+    def test_participation_is_not_capped_at_the_top(self):
+        # Upstream publishes participation for every season from 2016, so an upper
+        # bound here would silently stop ingesting new seasons.
+        assert REGISTRY["participation"].max_season is None
+
+    def test_every_seasonal_dataset_declares_a_min_season(self):
+        # Depth comes from min_season: a seasonal dataset without one would fall back
+        # to the global floor and burn network requests on seasons that never existed.
+        missing = [d.dataset_id for d in REGISTRY.values()
+                   if d.seasonal and d.min_season is None]
+        assert missing == []
+
+    def test_hard_floor_matches_the_oldest_dataset(self):
+        # EARLIEST_SEASON is what --start may reach; it must track the oldest registered
+        # dataset, otherwise deep seasons are silently unreachable.
+        from nfl_mcp.seasons import EARLIEST_SEASON
+        assert EARLIEST_SEASON == earliest_season()
+
+    def test_default_start_is_reachable_but_conservative(self):
+        # FIRST_SEASON is the default backfill start (the merger era). It must sit inside
+        # the range --start accepts, and must not be deeper than the sources allow.
+        from nfl_mcp.seasons import EARLIEST_SEASON, FIRST_SEASON
+        assert EARLIEST_SEASON <= FIRST_SEASON
+        assert FIRST_SEASON == 1970
+
+    def test_default_start_only_clips_the_oldest_dataset(self):
+        # Only rosters predate the 1970 default, so the default costs exactly one
+        # dataset's history. If this starts failing, a newly registered dataset is being
+        # silently truncated by the default and its real floor should be documented.
+        from nfl_mcp.seasons import FIRST_SEASON
+        clipped = [d.dataset_id for d in REGISTRY.values()
+                   if d.seasonal and d.min_season is not None and d.min_season < FIRST_SEASON]
+        assert clipped == ["rosters"]
+
+    def test_earliest_season_is_the_oldest_declared_floor(self):
+        assert earliest_season() == min(
+            d.min_season for d in REGISTRY.values()
+            if d.seasonal and d.min_season is not None
+        )
 
 
 # ── Loader functions ───────────────────────────────────────────────────────────

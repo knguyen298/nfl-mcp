@@ -12,6 +12,7 @@ from nfl_mcp.registry import DatasetDef
 from nfl_mcp.ingest import (
     _apply_duckdb_pragmas,
     _build_enhanced_description,
+    _clip_to_window,
     _create_aggregate_tables,
     _create_fantasy_tables,
     _create_indexes,
@@ -687,12 +688,53 @@ class TestSeasonHelpers:
     def test_current_season_rolls_over_in_march(self, date_, expected):
         assert current_season(date_) == expected
 
-    def test_all_seasons_ends_at_current(self):
+    def test_all_seasons_spans_the_oldest_dataset_and_ends_at_current(self):
         seasons = all_seasons(datetime.date(2026, 9, 14))
-        assert seasons[0] == 2013 and seasons[-1] == 2026
+        assert seasons[0] == 1970 and seasons[-1] == 2026
 
     def test_all_seasons_constant_matches_today(self):
         assert ALL_SEASONS[-1] == current_season()
+
+
+# ── per-dataset depth clipping ───────────────────────────────────────────
+
+class TestClipToWindow:
+    def test_clips_the_early_years_a_dataset_cannot_supply(self):
+        from nfl_mcp.registry import REGISTRY
+        deep = list(range(1920, 1931))
+        assert _clip_to_window(deep, REGISTRY["pbp"]) == []
+        assert _clip_to_window(deep, REGISTRY["rosters"]) == deep
+
+    def test_clips_both_ends_when_a_max_is_declared(self):
+        defn = DatasetDef(dataset_id="x", loader_fn="load_x", table_name="x",
+                          seasonal=True, default=False, min_season=2016, max_season=2018)
+        assert _clip_to_window(list(range(2014, 2021)), defn) == [2016, 2017, 2018]
+
+    def test_unbounded_windows_pass_through(self):
+        defn = DatasetDef(dataset_id="x", loader_fn="load_x", table_name="x",
+                          seasonal=True, default=False)
+        assert _clip_to_window([1920, 2026], defn) == [1920, 2026]
+
+    def test_pbp_ingest_clips_to_play_by_play_coverage(self, monkeypatch, tmp_path):
+        # A request that reaches back before 1999 must not fire load_pbp for those
+        # seasons: nflreadpy raises for them, so they would be pure noise in the log.
+        conn = TestRunIngestOrchestration._DummyConn(loaded_rows=[])
+        pbp_calls = []
+        monkeypatch.setattr("nfl_mcp.ingest.current_season", lambda: 2000)
+        _install_fake_nflreadpy(
+            monkeypatch,
+            load_pbp=lambda seasons: pl.DataFrame({"season": [1999], "posteam": ["KC"], "defteam": ["BAL"]}),
+        )
+        monkeypatch.setattr("nfl_mcp.ingest.duckdb.connect", lambda path: conn)
+        monkeypatch.setattr("nfl_mcp.ingest._ensure_metadata_table", lambda c: None)
+        monkeypatch.setattr("nfl_mcp.ingest._create_plays_table", lambda c, df, fresh=False: None)
+        monkeypatch.setattr("nfl_mcp.ingest._ingest_pbp_season", lambda c, season: pbp_calls.append(season) or 1)
+        monkeypatch.setattr("nfl_mcp.ingest._record_loaded", lambda *a, **k: None)
+        monkeypatch.setattr("nfl_mcp.ingest._create_indexes", lambda c: None)
+
+        run_ingest_datasets(["pbp"], start=1995, end=2000, skip_views=True,
+                            db_path=str(tmp_path / "nflread.duckdb"))
+        assert pbp_calls == [1999, 2000]
 
 
 # ── aggregate tables and indexes ────────────────────────────────────────────────

@@ -22,6 +22,13 @@ from .seasons import FIRST_SEASON, EARLIEST_SEASON, current_season
 CURRENT_SEASON = current_season()
 
 
+def _season_window_label(min_season: int | None, max_season: int | None) -> str:
+    """Render a dataset's coverage window for --list, e.g. '1999-present'."""
+    start = str(min_season) if min_season is not None else "earliest"
+    end = str(max_season) if max_season is not None else "present"
+    return f"{start}–{end}"
+
+
 @click.group()
 def main():
     """NFL play-by-play MCP server."""
@@ -53,7 +60,9 @@ def serve(host, port):
                   "Run with --list to see all available names."
               ))
 @click.option("--start",      default=None, type=click.IntRange(EARLIEST_SEASON, CURRENT_SEASON),
-              help="First season to load (1999+ for datasets like schedules). Omit to load all available seasons.")
+              help=f"First season to load (default {FIRST_SEASON}, the oldest available being "
+                   f"{EARLIEST_SEASON} for rosters). Omit to load every season each dataset "
+                   "supports within that bound — each dataset is clipped to its own coverage window.")
 @click.option("--end",        default=None, type=click.IntRange(EARLIEST_SEASON, CURRENT_SEASON),
               help="Last season to load (inclusive). Omit to load all available seasons.")
 @click.option("--fresh",      is_flag=True,
@@ -79,6 +88,11 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets):
         for ds_id, defn in REGISTRY.items():
             default_tag = "[default]" if defn.default else ""
             click.echo(f"  {ds_id:<35} {default_tag:<10}  {defn.description}")
+            if defn.seasonal:
+                label = _season_window_label(defn.min_season, defn.max_season)
+                if defn.min_season is not None and defn.min_season < FIRST_SEASON:
+                    label += f" (from {FIRST_SEASON} by default)"
+                click.echo(f"  {'':<35} {'':<10}  → seasons {label}")
         click.echo()
         return
 
@@ -117,10 +131,10 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets):
 
 @main.command()
 @click.option("--start", default=FIRST_SEASON, show_default=True,
-              type=click.IntRange(FIRST_SEASON, CURRENT_SEASON),
+              type=click.IntRange(EARLIEST_SEASON, CURRENT_SEASON),
               help="First season to load.")
 @click.option("--end", default=CURRENT_SEASON, show_default=True,
-              type=click.IntRange(FIRST_SEASON, CURRENT_SEASON),
+              type=click.IntRange(EARLIEST_SEASON, CURRENT_SEASON),
               help="Last season to load.")
 @click.option("--skip-ingest", is_flag=True,
               help="Skip data ingestion (configure only).")

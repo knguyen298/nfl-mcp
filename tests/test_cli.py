@@ -6,7 +6,7 @@ import pytest
 from click.testing import CliRunner
 
 import nfl_mcp.cli as cli
-from nfl_mcp.cli import main
+from nfl_mcp.cli import main, _season_window_label
 from nfl_mcp.registry import ALL_DATASETS, DEFAULT_DATASETS, REGISTRY
 
 
@@ -61,6 +61,26 @@ class TestIngestList:
     def test_list_marks_default_datasets(self, runner):
         result = runner.invoke(main, ["ingest", "--list"])
         assert "[default]" in result.output
+
+    def test_list_shows_per_dataset_season_windows(self, runner):
+        result = runner.invoke(main, ["ingest", "--list"])
+        assert "1999–present" in result.output   # pbp / schedules / player_stats
+        assert "2022–present" in result.output   # ftn_charting
+
+    def test_list_flags_when_the_default_start_clips_a_dataset(self, runner):
+        # rosters publishes from 1920 but the default backfill starts in 1970, so the
+        # listing must not imply the pre-1970 seasons load on their own.
+        result = runner.invoke(main, ["ingest", "--list"])
+        assert "1920–present (from 1970 by default)" in result.output
+
+    @pytest.mark.parametrize("low,high,expected", [
+        (1999, None, "1999–present"),
+        (2016, 2024, "2016–2024"),
+        (None, 2024, "earliest–2024"),
+        (None, None, "earliest–present"),
+    ])
+    def test_season_window_label(self, low, high, expected):
+        assert _season_window_label(low, high) == expected
 
     def test_list_does_not_start_ingest(self, runner, monkeypatch):
         called = []

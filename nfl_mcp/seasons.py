@@ -6,8 +6,20 @@ Kept dependency-free so the CLI can import it without pulling in DuckDB / polars
 
 import datetime
 
-FIRST_SEASON = 2013   # earliest season where every nflverse source is complete
-EARLIEST_SEASON = 1999  # earliest season any nflverse dataset (e.g. schedules) covers
+# Two distinct bounds, deliberately kept apart:
+#
+#   EARLIEST_SEASON — how deep the upstream sources actually go (rosters, 1920).
+#                     The lower bound for --start; nothing can be loaded below it.
+#   FIRST_SEASON    — the default backfill start. 1970, the merger era, so a fresh
+#                     install gets a century of rosters without the pre-merger leagues.
+#
+# Every dataset is additionally clipped to its own registry min_season/max_season, so the
+# default starts *later* than 1970 for anything whose source began publishing after it
+# (play-by-play and all stats tables start 1999, Next Gen Stats 2016, FTN charting 2022).
+# Passing --start 1920 reaches the pre-1970 rosters; tests assert EARLIEST_SEASON stays
+# equal to registry.earliest_season().
+EARLIEST_SEASON = 1920
+FIRST_SEASON = 1970
 
 
 def current_season(today: datetime.date | None = None) -> int:
@@ -24,5 +36,10 @@ def current_season(today: datetime.date | None = None) -> int:
 
 
 def all_seasons(today: datetime.date | None = None) -> list[int]:
-    """Every season from FIRST_SEASON through the current one, inclusive."""
+    """Every season from FIRST_SEASON through the current one, inclusive.
+
+    This is the default backfill window, and the widest one any dataset could want inside
+    it. Callers must clip it to the per-dataset coverage window before loading (see
+    registry min_season/max_season).
+    """
     return list(range(FIRST_SEASON, current_season(today) + 1))

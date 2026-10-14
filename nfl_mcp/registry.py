@@ -20,7 +20,10 @@ class DatasetDef:
     extra_params: dict = field(default_factory=dict, compare=False, hash=False)
     storage: str = "append_by_season"   # "replace" | "append_by_season"
     # Known coverage window — seasons outside this range are skipped without
-    # making a network request.  None means no known bound.
+    # making a network request.  None means no known bound.  min_season is the
+    # authoritative "how far back does this stat go" answer: it is set to the first
+    # season whose upstream file actually contains rows, verified against nflverse /
+    # DynastyProcess / ffverse, and always matches nflreadpy's own season validator.
     min_season: int | None = None
     max_season: int | None = None
 
@@ -111,6 +114,7 @@ _DEFS: list[DatasetDef] = [
         table_name="schedules",
         seasonal=True, default=True,
         description="Game-level schedule and results",
+        min_season=1999,   # schedules/games published seasons are 1999+ (verified)
     ),
     DatasetDef(
         dataset_id="rosters",
@@ -152,7 +156,7 @@ _DEFS: list[DatasetDef] = [
         table_name="snap_counts",
         seasonal=True, default=True,
         description="Player snap counts (Pro Football Reference)",
-        min_season=2012,
+        min_season=2013,  # the 2012 file exists and downloads fine but holds 0 rows
     ),
 
     # ── Analytics enrichment ───────────────────────────────────────
@@ -187,7 +191,7 @@ _DEFS: list[DatasetDef] = [
         seasonal=True, default=True,
         description="Player participation per play — very large dataset",
         min_season=2016,
-        max_season=2024,
+        # No upper bound: upstream publishes every season from 2016 onward.
     ),
     DatasetDef(
         dataset_id="nextgen_stats_passing",
@@ -280,3 +284,16 @@ REGISTRY: dict[str, DatasetDef] = {d.dataset_id: d for d in _DEFS}
 DEFAULT_DATASETS: list[str] = [d.dataset_id for d in _DEFS if d.default]
 
 ALL_DATASETS: list[str] = [d.dataset_id for d in _DEFS]
+
+
+def earliest_season() -> int:
+    """Oldest season any registered seasonal dataset can supply.
+
+    This is the floor the default backfill should start at. Keeping it derived from the
+    registry means adding an older dataset automatically deepens the backfill; the test
+    suite asserts it stays equal to seasons.FIRST_SEASON.
+    """
+    return min(
+        d.min_season for d in _DEFS
+        if d.seasonal and d.min_season is not None
+    )
