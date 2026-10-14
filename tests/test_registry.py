@@ -140,7 +140,7 @@ class TestLoaderFunctions:
         missing = [
             d.dataset_id
             for d in REGISTRY.values()
-            if not hasattr(nflreadpy, d.loader_fn)
+            if d.source == "nflreadpy" and not hasattr(nflreadpy, d.loader_fn)
         ]
         assert not missing, f"loader_fn not found in nflreadpy: {missing}"
 
@@ -163,11 +163,48 @@ class TestLoaderFunctions:
 # ── Default dataset completeness ───────────────────────────────────────────────
 
 class TestDefaultDatasets:
-    def test_every_dataset_is_default(self):
-        """Full nflverse import is baked in — every dataset ships by default."""
-        non_default = [d.dataset_id for d in REGISTRY.values() if not d.default]
+    def test_every_nflreadpy_dataset_is_default(self):
+        """Full nflverse import is baked in; only the external pull is opt-in."""
+        non_default = [
+            d.dataset_id for d in REGISTRY.values()
+            if not d.default and d.source == "nflreadpy"
+        ]
         assert non_default == [], \
-            f"these datasets are not default but should be: {non_default}"
+            f"these nflreadpy datasets are not default but should be: {non_default}"
 
-    def test_default_datasets_equals_all_datasets(self):
-        assert set(DEFAULT_DATASETS) == set(ALL_DATASETS)
+    def test_external_sources_are_opt_in(self):
+        # A dataset that reaches another publisher at ingest time must never ride along on
+        # the container's scheduled refresh, so it stays out of 'default'.
+        for d in REGISTRY.values():
+            if d.source != "nflreadpy":
+                assert d.default is False, f"{d.dataset_id} is external but default"
+
+    def test_only_the_espn_records_pull_is_opt_in(self):
+        assert {d.dataset_id for d in REGISTRY.values() if not d.default} == {"espn_records"}
+
+    def test_default_datasets_equals_all_except_opt_in(self):
+        assert set(DEFAULT_DATASETS) == set(ALL_DATASETS) - {"espn_records"}
+
+
+class TestExternalRecordsSource:
+    """The pre-1999 records pull is the one dataset that is not nflreadpy."""
+
+    def setup_method(self):
+        self.defn = REGISTRY["espn_records"]
+
+    def test_declared_as_external(self):
+        assert self.defn.source == "espn"
+        assert self.defn.table_name == "espn_team_records"
+        assert self.defn.loader_fn not in dir(nflreadpy), "records loader is not an nflreadpy function"
+
+    def test_window_matches_the_franchise_registry(self):
+        from nfl_mcp.franchises import RECORDS_FIRST_SEASON, RECORDS_LAST_ESPN_SEASON
+        assert self.defn.min_season == RECORDS_FIRST_SEASON
+        assert self.defn.max_season == RECORDS_LAST_ESPN_SEASON
+
+    def test_window_abuts_the_nflverse_schedule_floor(self):
+        # The two sources must meet with no gap and no overlap: ESPN stops where nflverse starts.
+        assert self.defn.max_season + 1 == REGISTRY["schedules"].min_season
+
+    def test_depth_helpers_are_unaffected(self):
+        assert earliest_season() == 1920  # still rosters, the oldest nflreadpy asset

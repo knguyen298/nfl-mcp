@@ -62,6 +62,15 @@ class TestIngestList:
         result = runner.invoke(main, ["ingest", "--list"])
         assert "[default]" in result.output
 
+    def test_list_marks_opt_in_datasets(self, runner):
+        # Datasets that reach an outside publisher are not in 'default'; the listing must say so.
+        result = runner.invoke(main, ["ingest", "--list"])
+        lines = result.output.splitlines()
+        row = next((index for index, line in enumerate(lines) if "espn_records" in line), None)
+        assert row is not None, "espn_records missing from --list"
+        assert "[opt-in]" in lines[row]
+        assert "1970–1998" in "\n".join(lines[row:row + 2])  # window prints on the next line
+
     def test_list_shows_per_dataset_season_windows(self, runner):
         result = runner.invoke(main, ["ingest", "--list"])
         assert "1999–present" in result.output   # pbp / schedules / player_stats
@@ -149,6 +158,33 @@ class TestDatasetResolution:
         )
         runner.invoke(main, ["ingest", "--dataset", "schedules", "--dataset", "schedules"])
         assert captured["ids"].count("schedules") == 1
+
+    def test_pre1999_adds_the_external_records_pull(self, runner, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            "nfl_mcp.ingest.run_ingest_datasets",
+            lambda dataset_ids, **kw: captured.update({"ids": dataset_ids}),
+        )
+        runner.invoke(main, ["ingest", "--dataset", "schedules", "--pre1999"])
+        assert captured["ids"] == ["schedules", "espn_records"]
+
+    def test_pre1999_does_not_duplicate(self, runner, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            "nfl_mcp.ingest.run_ingest_datasets",
+            lambda dataset_ids, **kw: captured.update({"ids": dataset_ids}),
+        )
+        runner.invoke(main, ["ingest", "--dataset", "all", "--pre1999"])
+        assert captured["ids"].count("espn_records") == 1
+
+    def test_default_ingest_leaves_the_external_pull_out(self, runner, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            "nfl_mcp.ingest.run_ingest_datasets",
+            lambda dataset_ids, **kw: captured.update({"ids": dataset_ids}),
+        )
+        runner.invoke(main, ["ingest", "--dataset", "default"])
+        assert "espn_records" not in captured["ids"]
 
 
 # ── ingest season range validation ────────────────────────────────────────────

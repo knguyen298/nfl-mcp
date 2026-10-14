@@ -27,6 +27,10 @@ Aggregate tables (faster for team-level queries):
   team_defense_stats  (team, season_year, yards_allowed, sacks, turnovers_forced, avg_epa_allowed, ...)
   situational_stats   (team, season_year, situation, plays, avg_epa, conversion_pct)
   formation_effectiveness (team, season_year, formation, play_type, avg_epa, ...)
+  team_records        (season, team, source_team, games, wins, losses, ties, source) — final
+                      regular-season record per franchise, 1970+ (1970-1998 needs the optional
+                      'nfl-mcp ingest --pre1999'). `team` is the CURRENT abbreviation, so the
+                      Raiders are 'LV' in every season and will not match `posteam`='OAK' in plays.
 
 Categories available (pass category='<name>' for full detail):
   game_context, teams, game_situation, play_details, timeouts, score,

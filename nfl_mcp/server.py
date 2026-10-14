@@ -1,7 +1,7 @@
 """
 NFL MCP Server
 Tools: nfl_schema, nfl_status, nfl_query, nfl_search_plays, nfl_team_stats, nfl_player_stats, nfl_compare,
-       nfl_catalog, nfl_roster, nfl_injuries, nfl_schedule, nfl_snap_counts
+       nfl_catalog, nfl_roster, nfl_injuries, nfl_schedule, nfl_snap_counts, nfl_team_records
 """
 
 import contextlib
@@ -24,6 +24,7 @@ from .tools import (
     nfl_fantasy_opportunity, nfl_fantasy_rankings, nfl_ftn_charting,
     nfl_td_luck, nfl_role_trend, nfl_separation_opportunity,
     nfl_drop_rate, nfl_contract_value, nfl_injury_return,
+    nfl_team_records,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -703,6 +704,40 @@ TOOLS = [
             },
         },
     ),
+    Tool(
+        name="nfl_team_records",
+        description=(
+            "PREFERRED for win-loss, record and standings questions. Returns each "
+            "franchise's final regular-season record, 1970 to present. Use the team's "
+            "CURRENT abbreviation ('LV' for the Raiders in every era); rows include the "
+            "name the club played that season under. Pre-1999 seasons need the optional "
+            "'nfl-mcp ingest --pre1999' pull and report record_not_available if absent."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "team": {
+                    "type": "string",
+                    "description": (
+                        "Team abbreviation — current or historical codes are accepted "
+                        "(OAK, SD, STL resolve to LV, LAC, LA). Omit for all teams."
+                    ),
+                },
+                "season": {
+                    "type": "integer",
+                    "description": "Season year (1970 or later).",
+                },
+                "from_season": {
+                    "type": "integer",
+                    "description": "Start of a season range, for streaks or era comparisons.",
+                },
+                "to_season": {
+                    "type": "integer",
+                    "description": "End of a season range (inclusive).",
+                },
+            },
+        },
+    ),
 ]
 
 
@@ -737,6 +772,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         "nfl_drop_rate":            nfl_drop_rate,
         "nfl_contract_value":       nfl_contract_value,
         "nfl_injury_return":        nfl_injury_return,
+        "nfl_team_records":         nfl_team_records,
     }
 
     try:

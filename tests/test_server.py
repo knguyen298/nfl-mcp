@@ -124,3 +124,34 @@ def test_create_app_lifespan_runs(monkeypatch):
 
     assert entered == [True]
     assert exited == [True]
+
+
+def test_team_records_is_exposed_with_its_arguments():
+    tool = next(tool for tool in server_module.TOOLS if tool.name == "nfl_team_records")
+    assert set(tool.inputSchema["properties"]) == {"team", "season", "from_season", "to_season"}
+
+
+def test_call_tool_dispatches_team_records(monkeypatch):
+    seen = {}
+
+    def fake(team=None, season=None, from_season=None, to_season=None):
+        seen.update(team=team, season=season, from_season=from_season, to_season=to_season)
+        return {"records": [{"season": 1996, "team": "GB", "wins": 13}], "count": 1}
+
+    monkeypatch.setattr(server_module, "nfl_team_records", fake)
+    result = asyncio.run(server_module.call_tool("nfl_team_records", {"team": "OAK", "season": 1996}))
+    payload = json.loads(result[0].text)
+    assert payload["count"] == 1
+    assert seen == {"team": "OAK", "season": 1996, "from_season": None, "to_season": None}
+
+
+def test_every_exposed_tool_has_a_handler():
+    """A tool listed in TOOLS with no dispatch entry would fail only at call time."""
+    exposed = {tool.name for tool in server_module.TOOLS}
+    assert "nfl_team_records" in exposed
+    for name in sorted(exposed):
+        payload = json.loads(asyncio.run(server_module.call_tool(name, {}))[0].text)
+        error = payload.get("error")
+        # Tools report failures as a plain string; only the server reports UNKNOWN_TOOL.
+        code = error.get("code") if isinstance(error, dict) else None
+        assert code != "UNKNOWN_TOOL", name

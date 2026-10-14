@@ -10,6 +10,7 @@ from nfl_mcp.tools import (
     nfl_fantasy_opportunity, nfl_fantasy_rankings, nfl_ftn_charting,
     nfl_td_luck, nfl_role_trend, nfl_separation_opportunity,
     nfl_drop_rate, nfl_contract_value, nfl_injury_return,
+    nfl_team_records,
 )
 
 
@@ -700,3 +701,109 @@ class TestInputValidation:
     def test_invalid_compare_type(self):
         result = nfl_compare(entity1="KC", entity2="BAL", compare_type="coach")
         assert "error" in result
+
+
+class TestNflTeamRecords:
+    """Unit tests — franchise availability and query building, no database needed."""
+
+    def test_requires_a_filter(self):
+        assert "error" in nfl_team_records()
+
+    def test_unknown_team(self):
+        result = nfl_team_records(team="USFL-NY", season=1985)
+        assert "error" in result
+        assert "USFL-NY" in result["error"]
+
+    def test_historical_codes_resolve_to_the_current_franchise(self):
+        with patch("nfl_mcp.tools._execute", return_value=[]) as execute:
+            nfl_team_records(team="OAK", season=2019)
+        assert execute.call_args[0][1] == ["LV", 2019]
+
+    def test_franchise_that_did_not_exist_yet(self):
+        with patch("nfl_mcp.tools._execute", side_effect=AssertionError("no DB hit")):
+            result = nfl_team_records(team="HOU", season=1995)
+        assert result["status"] == "franchise_not_yet_active"
+        assert result["first_season"] == 2002
+        assert result["records"] == []
+
+    def test_franchise_that_sat_a_season_out(self):
+        result = nfl_team_records(team="CLE", season=1997)
+        assert result["status"] == "franchise_inactive"
+        assert "1997" in result["reason"]
+
+    def test_before_the_covered_era(self):
+        result = nfl_team_records(team="GB", season=1965)
+        assert result["status"] == "before_coverage"
+        assert result["first_season"] == 1970
+
+    def test_rows_carry_the_name_played_that_season(self):
+        rows = [
+            {"season": 1970, "team": "IND", "source_team": "BAL", "games": 14,
+             "wins": 11, "losses": 2, "ties": 1, "source": "espn"},
+            {"season": 1985, "team": "IND", "source_team": "IND", "games": 14,
+             "wins": 5, "losses": 11, "ties": 0, "source": "espn"},
+        ]
+        with patch("nfl_mcp.tools._execute", return_value=rows):
+            result = nfl_team_records(team="IND", from_season=1970, to_season=1985)
+        assert [row["club"] for row in result["records"]] == [
+            "Baltimore Colts", "Indianapolis Colts",
+        ]
+        assert result["count"] == 2
+
+    def test_range_filters_are_passed_as_parameters(self):
+        with patch("nfl_mcp.tools._execute", return_value=[]) as execute:
+            nfl_team_records(team="LV", from_season=1970, to_season=1980)
+        sql, params = execute.call_args[0]
+        assert "season >= ?" in sql and "season <= ?" in sql
+        assert params == ["LV", 1970, 1980]
+
+    def test_all_teams_in_one_season_has_no_team_filter(self):
+        with patch("nfl_mcp.tools._execute", return_value=[]) as execute:
+            nfl_team_records(season=2024)
+        sql, params = execute.call_args[0]
+        assert "team = ?" not in sql
+        assert params == [2024]
+
+    def test_missing_pre1999_record_points_at_the_opt_in_pull(self):
+        with patch("nfl_mcp.tools._execute", return_value=[]):
+            result = nfl_team_records(team="GB", season=1996)
+        assert result["status"] == "record_not_available"
+        assert "--pre1999" in result["reason"]
+
+    def test_missing_modern_record_makes_no_pull_suggestion(self):
+        with patch("nfl_mcp.tools._execute", return_value=[]):
+            result = nfl_team_records(team="GB", season=2024)
+        assert result["status"] == "record_not_available"
+        assert "pre1999" not in result["reason"]
+
+    def test_database_errors_are_returned(self):
+        with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("no table team_records")):
+            result = nfl_team_records(season=2024)
+        assert "team_records" in result["error"]
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("require_db")
+class TestNflTeamRecordsIntegration:
+    def test_one_row_per_team(self):
+        result = nfl_team_records(season=2024)
+        assert "error" not in result
+        assert result["count"] >= 30
+        teams = {row["team"] for row in result["records"]}
+        assert len(teams) == result["count"]
+
+    def test_records_are_complete(self):
+        row = nfl_team_records(team="KC", season=2024)["records"][0]
+        assert row["wins"] + row["losses"] + row["ties"] == row["games"] == 17
+        assert row["source"] == "nflverse"
+        assert row["club"] == "Kansas City Chiefs"
+
+    def test_alias_finds_the_same_franchise(self):
+        modern = nfl_team_records(team="LV", season=2024)["records"]
+        via_alias = nfl_team_records(team="OAK", season=2024)["records"]
+        assert modern == via_alias
+
+    def test_season_range(self):
+        result = nfl_team_records(team="PHI", from_season=2022, to_season=2024)
+        assert {row["season"] for row in result["records"]} >= {2022, 2023, 2024}
+        assert all(row["team"] == "PHI" for row in result["records"])

@@ -26,6 +26,10 @@ class DatasetDef:
     # DynastyProcess / ffverse, and always matches nflreadpy's own season validator.
     min_season: int | None = None
     max_season: int | None = None
+    # Where the rows come from. "nflreadpy" is every nflverse/DynastyProcess/ffverse
+    # dataset; "espn" is the external records fetch, which is not an nflreadpy loader and
+    # is opt-in because it is rate-limited and belongs to another publisher.
+    source: str = "nflreadpy"
 
 
 # ── Registry ───────────────────────────────────────────────────────────────────
@@ -274,6 +278,18 @@ _DEFS: list[DatasetDef] = [
         description="Fantasy football opportunity model",
         extra_params={"stat_type": "weekly"},
         min_season=2006,
+    ),
+
+    # ── External publisher (opt-in) ─────────────────────────────────────────
+    DatasetDef(
+        dataset_id="espn_records",
+        loader_fn="espn_records",
+        table_name="espn_team_records",
+        seasonal=True, default=False,
+        description="Final season win-loss records 1970-1998, from ESPN (nflverse has no games before 1999)",
+        min_season=1970,
+        max_season=1998,
+        source="espn",
     ),
 ]
 

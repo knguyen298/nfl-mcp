@@ -71,7 +71,9 @@ def serve(host, port):
               help="Skip rebuilding PBP aggregate tables.")
 @click.option("--list", "list_datasets", is_flag=True,
               help="Print all available dataset names and exit.")
-def ingest(datasets, start, end, fresh, skip_views, list_datasets):
+@click.option("--pre1999", is_flag=True,
+              help="Also pull pre-1999 season win-loss records from ESPN (opt-in external source).")
+def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999):
     """Download NFL data via nflreadpy and load into DuckDB.
 
     Examples:
@@ -79,6 +81,7 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets):
       nfl-mcp ingest --dataset all            # every dataset, all seasons
       nfl-mcp ingest --dataset schedules      # one dataset, all seasons
       nfl-mcp ingest --dataset pbp --start 2020 --end 2024
+      nfl-mcp ingest --pre1999                # defaults + ESPN 1970-1998 records
       nfl-mcp ingest --list                   # show all dataset names
     """
     from .registry import REGISTRY, DEFAULT_DATASETS, ALL_DATASETS
@@ -86,7 +89,7 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets):
     if list_datasets:
         click.echo("\nAvailable datasets:\n")
         for ds_id, defn in REGISTRY.items():
-            default_tag = "[default]" if defn.default else ""
+            default_tag = "[default]" if defn.default else "[opt-in]"
             click.echo(f"  {ds_id:<35} {default_tag:<10}  {defn.description}")
             if defn.seasonal:
                 label = _season_window_label(defn.min_season, defn.max_season)
@@ -116,6 +119,11 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets):
     # Deduplicate, preserve order
     seen: set[str] = set()
     dataset_ids = [d for d in resolved if not (d in seen or seen.add(d))]
+
+    # The ESPN records pull is opt-in, so it is never part of 'default' (and therefore
+    # never part of the container's scheduled refresh) unless asked for explicitly.
+    if pre1999 and "espn_records" not in dataset_ids:
+        dataset_ids.append("espn_records")
 
     from .ingest import run_ingest_datasets
     run_ingest_datasets(

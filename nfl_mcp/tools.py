@@ -19,6 +19,12 @@ from typing import Any, Dict
 import duckdb
 
 from .database import get_db_connection
+from .franchises import (
+    RECORDS_FIRST_NFLVERSE_SEASON,
+    availability,
+    canonical_team,
+    era_name,
+)
 from .schema_pbp import _SCHEMA_SUMMARY, _SCHEMA_CATEGORIES
 
 logger = logging.getLogger("nfl-mcp")
@@ -772,6 +778,82 @@ def nfl_schedule(
         return {"error": str(e)}
 
 
+# ── Team records (1970–present) ───────────────────────────────────────────────
+
+def nfl_team_records(
+    team: str | None = None,
+    season: int | None = None,
+    from_season: int | None = None,
+    to_season: int | None = None,
+) -> Dict[str, Any]:
+    """
+    PREFERRED for win-loss / standings questions. Final regular-season records per
+    franchise, 1970 to present. Teams are given by their CURRENT abbreviation, so the
+    Raiders are 'LV' in every season; each row also carries `club` (the name the franchise
+    played that season under) and `source_team` (the code the source used).
+
+    Records before 1999 come from ESPN's opt-in ingest (run 'nfl-mcp ingest --pre1999');
+    a franchise ESPN's archive does not cover is reported as record_not_available rather
+    than estimated.
+    """
+    if not team and season is None and from_season is None and to_season is None:
+        return {"error": "Provide team, season, or a from_season/to_season range."}
+
+    key = canonical_team(team) if team else None
+    if team and key is None:
+        return {"error": f"Unknown team '{team}'."}
+
+    if key and season is not None:
+        note = availability(key, season)
+        if note:
+            return {"team": key, "season": int(season), "records": [], "count": 0, **note}
+
+    conditions: list[str] = []
+    params: list[Any] = []
+    if key:
+        conditions.append("team = ?")
+        params.append(key)
+    if season is not None:
+        conditions.append("season = ?")
+        params.append(int(season))
+    if from_season is not None:
+        conditions.append("season >= ?")
+        params.append(int(from_season))
+    if to_season is not None:
+        conditions.append("season <= ?")
+        params.append(int(to_season))
+    where = " AND ".join(conditions) or "1=1"
+
+    sql = f"""
+        SELECT season, team, source_team, games, wins, losses, ties, source
+        FROM team_records
+        WHERE {where}
+        ORDER BY season DESC, team
+        LIMIT 500
+    """
+    try:
+        rows = _execute(sql, params if params else None)
+    except (duckdb.Error, ValueError, TimeoutError) as e:
+        logger.error("Tool error: %s", e, exc_info=True)
+        return {"error": str(e)}
+
+    for row in rows:
+        row["club"] = era_name(row["season"], row["team"])
+
+    result: Dict[str, Any] = {"records": rows, "count": len(rows)}
+    if key and not rows:
+        result["status"] = "record_not_available"
+        if season is not None and season < RECORDS_FIRST_NFLVERSE_SEASON:
+            result["reason"] = (
+                "No stored record for that franchise and season. Records before "
+                f"{RECORDS_FIRST_NFLVERSE_SEASON} come from the opt-in ESPN pull: "
+                "run 'nfl-mcp ingest --pre1999'."
+            )
+        else:
+            result["reason"] = "No stored record for that franchise and season."
+    return result
+
+
 def nfl_snap_counts(
     player: str | None = None,
     team: str | None = None,
@@ -1369,4 +1451,5 @@ __all__ = [
     "nfl_fantasy_opportunity", "nfl_fantasy_rankings", "nfl_ftn_charting",
     "nfl_td_luck", "nfl_role_trend", "nfl_separation_opportunity",
     "nfl_drop_rate", "nfl_contract_value", "nfl_injury_return",
+    "nfl_team_records",
 ]

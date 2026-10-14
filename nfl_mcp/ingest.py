@@ -416,6 +416,79 @@ def _ingest_generic_dataset(
     return total_rows
 
 
+# ── External records (ESPN, pre-1999) ─────────────────────────────────────────
+
+_ESPN_RECORDS_DDL = """
+    CREATE TABLE IF NOT EXISTS espn_team_records (
+        season          INTEGER NOT NULL,
+        team            VARCHAR NOT NULL,   -- canonical current abbreviation
+        espn_team_id    BIGINT,
+        espn_abbrev     VARCHAR,            -- abbreviation ESPN used that season
+        games           INTEGER,
+        wins            INTEGER,
+        losses          INTEGER,
+        ties            INTEGER,
+        record_summary  VARCHAR,            -- ESPN's own "12-4" string
+        source_game_id  VARCHAR,            -- event the record was read from
+        fetched_at      TIMESTAMP           -- when we pulled it
+    )
+"""
+
+
+def _ingest_espn_records(
+    conn: duckdb.DuckDBPyConnection,
+    seasons: list[int] | None,
+    fresh: bool = False,
+) -> int:
+    """Pull final season records for 1970-1998 from ESPN, one season at a time.
+
+    Seasons are only marked loaded when rows came back, so a season that failed (or that
+    ESPN has no data for) is retried on the next run instead of being silently frozen.
+    """
+    from .espn import EspnUnavailable, fetch_season_records
+    from .franchises import expected_franchise_count
+    from .registry import REGISTRY
+
+    defn = REGISTRY["espn_records"]
+    season_list = _clip_to_window(ALL_SEASONS if seasons is None else seasons, defn)
+    conn.execute(_ESPN_RECORDS_DDL)
+    if not season_list:
+        print("\n  espn_records: nothing in range (covers 1970-1998), skipping")
+        return 0
+
+    print("\n  espn_records (external source, ~2 requests per season)")
+    total = 0
+    for season in season_list:
+        if _is_loaded(conn, defn.dataset_id, season) and not fresh:
+            print(f"    espn_records {season}: already loaded, skipping")
+            continue
+        try:
+            records = fetch_season_records(season)
+        except EspnUnavailable as exc:
+            print(f"    espn_records {season}: ESPN unavailable ({exc}); retrying next run")
+            continue
+        if not records:
+            print(f"    espn_records {season}: no records published")
+            continue
+
+        conn.execute("DELETE FROM espn_team_records WHERE season = ?", [season])
+        conn.executemany(
+            "INSERT INTO espn_team_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (r.season, r.team, r.espn_team_id, r.espn_abbrev, r.games,
+                 r.wins, r.losses, r.ties, r.record_summary, r.source_game_id, r.fetched_at)
+                for r in records
+            ],
+        )
+        _record_loaded(conn, defn.dataset_id, defn.table_name, "espn_records", len(records), season)
+        total += len(records)
+
+        expected = expected_franchise_count(season)
+        gap = "" if len(records) == expected else f"  ({expected - len(records)} franchises absent from ESPN's archive)"
+        print(f"    espn_records {season}: {len(records)}/{expected} franchises{gap}")
+    return total
+
+
 # ── Aggregate tables (pbp-derived) ────────────────────────────────────────────
 
 _SITUATION_EXPR = """
@@ -844,6 +917,59 @@ def _create_fantasy_tables(conn: duckdb.DuckDBPyConnection):
     print("  Fantasy derived tables done")
 
 
+def _create_team_records(conn: duckdb.DuckDBPyConnection):
+    """Build team_records: one row per franchise per season with its final regular-season mark.
+
+    Two sources, unioned, because no single publisher spans the whole era: nflverse games
+    from 1999 (aggregated from scores) and ESPN's reported records for 1970-1998 (see
+    nfl_mcp/espn.py for why scores cannot be used there). Team codes are normalized to the
+    canonical current abbreviation so one query spans relocations and renames.
+    """
+    from .franchises import schedule_alias_case
+
+    statements: list[str] = []
+    if _table_exists(conn, "espn_team_records"):
+        statements.append("""
+            SELECT season, team, espn_abbrev AS source_team, games, wins, losses, ties,
+                   'espn' AS source
+            FROM espn_team_records
+        """)
+    if _table_exists(conn, "schedules"):
+        statements.append(f"""
+            WITH games AS (
+                SELECT season, home_team AS source_team, away_team AS opponent,
+                       home_score AS points_for, away_score AS points_against
+                FROM schedules
+                WHERE game_type = 'REG' AND home_team IS NOT NULL
+                  AND home_score IS NOT NULL AND away_score IS NOT NULL
+                UNION ALL
+                SELECT season, away_team, home_team, away_score, home_score
+                FROM schedules
+                WHERE game_type = 'REG' AND away_team IS NOT NULL
+                  AND home_score IS NOT NULL AND away_score IS NOT NULL
+            )
+            SELECT season, {schedule_alias_case("source_team")} AS team, source_team,
+                   COUNT(*)                                    AS games,
+                   SUM(CASE WHEN points_for > points_against THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN points_for < points_against THEN 1 ELSE 0 END) AS losses,
+                   SUM(CASE WHEN points_for = points_against THEN 1 ELSE 0 END) AS ties,
+                   'nflverse' AS source
+            FROM games
+            GROUP BY 1, 2, 3
+        """)
+    if not statements:
+        print("    team_records — skipped (needs schedules or espn_team_records)")
+        return
+
+    conn.execute("DROP TABLE IF EXISTS team_records")
+    conn.execute(f"CREATE TABLE team_records AS {statements[0]}")
+    for extra in statements[1:]:
+        conn.execute(f"INSERT INTO team_records {extra}")
+    row_count = conn.execute("SELECT COUNT(*) FROM team_records").fetchone()[0]
+    _record_loaded(conn, "team_records", "team_records", "derived", row_count, season=None)
+    print(f"    team_records ✓ ({row_count:,} rows)")
+
+
 def _create_indexes(conn: duckdb.DuckDBPyConnection):
     print("\n  Creating indexes…")
     for idx_sql in [
@@ -975,11 +1101,15 @@ def run_ingest_datasets(
             if defn is None:
                 print(f"\n  WARNING: unknown dataset '{dataset_id}', skipping")
                 continue
-            _ingest_generic_dataset(conn, defn, seasons, fresh=fresh)
+            if defn.source == "espn":
+                _ingest_espn_records(conn, seasons, fresh=fresh)
+            else:
+                _ingest_generic_dataset(conn, defn, seasons, fresh=fresh)
 
     # ── Fantasy derived tables (built from already-ingested sources) ────────
     if not skip_views:
         _create_fantasy_tables(conn)
+        _create_team_records(conn)
 
     conn.close()
     print("\n" + "=" * 60)

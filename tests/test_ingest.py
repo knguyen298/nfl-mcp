@@ -17,8 +17,11 @@ from nfl_mcp.ingest import (
     _create_fantasy_tables,
     _create_indexes,
     _create_plays_table,
+    _create_team_records,
     _duckdb_type_for_polars,
+    _ingest_espn_records,
     _ensure_metadata_table,
+    _ESPN_RECORDS_DDL,
     _ingest_generic_dataset,
     _ingest_pbp_season,
     _is_loaded,
@@ -26,6 +29,7 @@ from nfl_mcp.ingest import (
     _reconcile_schema,
     _safe_rename,
     _str,
+    _table_exists,
     _write_df_to_table,
     run_ingest,
     run_ingest_datasets,
@@ -905,6 +909,10 @@ class TestRunIngestOrchestration:
             lambda c: calls.__setitem__("fantasy", calls.get("fantasy", 0) + 1),
         )
         monkeypatch.setattr(
+            "nfl_mcp.ingest._create_team_records",
+            lambda c: calls.__setitem__("records", calls.get("records", 0) + 1),
+        )
+        monkeypatch.setattr(
             "nfl_mcp.ingest._ingest_generic_dataset",
             lambda c, defn, seasons, fresh=False: calls["other"].append((defn.dataset_id, seasons, fresh)) or 5,
         )
@@ -923,6 +931,7 @@ class TestRunIngestOrchestration:
         assert calls["idx"] == 1
         assert calls["agg"] == 1
         assert calls.get("fantasy") == 1
+        assert calls.get("records") == 1
         assert calls["other"] and calls["other"][0][0] == "schedules"
         assert conn.closed is True
 
@@ -967,6 +976,7 @@ class TestRunIngestOrchestration:
             lambda c, defn, seasons, fresh=False: generic_calls.append(defn.dataset_id) or 1,
         )
         monkeypatch.setattr("nfl_mcp.ingest._create_fantasy_tables", lambda c: None)
+        monkeypatch.setattr("nfl_mcp.ingest._create_team_records", lambda c: None)
 
         run_ingest_datasets(
             dataset_ids=["schedules"],
@@ -975,6 +985,35 @@ class TestRunIngestOrchestration:
             db_path=str(tmp_path / "nflread.duckdb"),
         )
         assert generic_calls == ["schedules"]
+        assert conn.closed is True
+
+    def test_run_ingest_datasets_routes_external_datasets_to_the_records_pull(
+        self, monkeypatch, tmp_path
+    ):
+        conn = self._DummyConn(loaded_rows=[])
+        calls = []
+
+        _install_fake_nflreadpy(monkeypatch)
+        monkeypatch.setattr("nfl_mcp.ingest.duckdb.connect", lambda path: conn)
+        monkeypatch.setattr("nfl_mcp.ingest._ensure_metadata_table", lambda c: None)
+        monkeypatch.setattr(
+            "nfl_mcp.ingest._ingest_generic_dataset",
+            lambda c, defn, seasons, fresh=False: calls.append(("generic", defn.dataset_id)) or 1,
+        )
+        monkeypatch.setattr(
+            "nfl_mcp.ingest._ingest_espn_records",
+            lambda c, seasons, fresh=False: calls.append(("espn", tuple(seasons), fresh)) or 1,
+        )
+
+        run_ingest_datasets(
+            dataset_ids=["espn_records"],
+            start=1996,
+            end=1996,
+            skip_views=True,
+            db_path=str(tmp_path / "nflread.duckdb"),
+        )
+        # An external dataset must not go through the nflreadpy loader path.
+        assert calls == [("espn", (1996,), False)]
         assert conn.closed is True
 
     def test_run_ingest_wrapper_calls_dataset_entrypoint(self, monkeypatch):
@@ -1020,3 +1059,177 @@ class TestApplyDuckdbPragmas:
         default_threads = conn.execute("SELECT current_setting('threads')").fetchone()[0]
         _apply_duckdb_pragmas(conn, "/tmp/nflread.duckdb")
         assert conn.execute("SELECT current_setting('threads')").fetchone()[0] == default_threads
+
+
+# ── Team records: ESPN ingest + derived table ─────────────────────────────────
+
+from nfl_mcp.espn import EspnUnavailable, SeasonRecord  # noqa: E402
+
+
+def _record(season, team, summary, wins, losses, ties, *, espn_id=9, abbrev="GB", game="g1"):
+    return SeasonRecord(
+        season=season, team=team, wins=wins, losses=losses, ties=ties,
+        games=wins + losses + ties, record_summary=summary, espn_team_id=espn_id,
+        espn_abbrev=abbrev, source_game_id=game, fetched_at="1997-01-01T00:00:00Z",
+    )
+
+
+def _schedules_table(conn, rows):
+    conn.execute("""
+        CREATE TABLE schedules (
+            season INTEGER, game_type VARCHAR, home_team VARCHAR, away_team VARCHAR,
+            home_score INTEGER, away_score INTEGER
+        )
+    """)
+    conn.executemany("INSERT INTO schedules VALUES (?, ?, ?, ?, ?, ?)", rows)
+
+
+def _team_row(conn, team, season):
+    return conn.execute(
+        "SELECT games, wins, losses, ties, source, source_team FROM team_records "
+        "WHERE team = ? AND season = ?", [team, season],
+    ).fetchone()
+
+
+class TestCreateTeamRecords:
+    def test_aggregates_regular_season_games(self, conn):
+        _schedules_table(conn, [
+            (2024, "REG", "KC", "BAL", 26, 10),
+            (2024, "REG", "BAL", "KC", 14, 17),
+            (2024, "POST", "KC", "BAL", 34, 7),    # playoffs stay out of the record
+            (2024, "REG", "SF", "SEA", None, None),  # unfinished game is skipped
+        ])
+        _create_team_records(conn)
+        assert _team_row(conn, "KC", 2024) == (2, 2, 0, 0, "nflverse", "KC")
+        assert _team_row(conn, "BAL", 2024) == (2, 0, 2, 0, "nflverse", "BAL")
+        # One row per team per season; the unfinished game contributes nothing.
+        assert conn.execute("SELECT COUNT(*) FROM team_records").fetchone()[0] == 2
+
+    def test_counts_ties(self, conn):
+        _schedules_table(conn, [(1974, "REG", "DET", "CHI", 10, 10)])
+        _create_team_records(conn)
+        assert _team_row(conn, "DET", 1974) == (1, 0, 0, 1, "nflverse", "DET")
+
+    def test_normalizes_relocated_team_codes(self, conn):
+        _schedules_table(conn, [
+            (2019, "REG", "OAK", "SD", 24, 3),
+            (2016, "REG", "STL", "TB", 31, 17),
+        ])
+        _create_team_records(conn)
+        assert _team_row(conn, "LV", 2019) == (1, 1, 0, 0, "nflverse", "OAK")
+        assert _team_row(conn, "LAC", 2019) == (1, 0, 1, 0, "nflverse", "SD")
+        assert _team_row(conn, "LA", 2016) == (1, 1, 0, 0, "nflverse", "STL")
+
+    def test_unions_the_espn_years(self, conn):
+        conn.execute(_ESPN_RECORDS_DDL)
+        conn.execute(
+            "INSERT INTO espn_team_records VALUES "
+            "(1996, 'GB', 9, 'GB', 16, 13, 3, 0, '13-3', 'g9', '1997-01-01'),"
+            "(1996, 'ARI', 22, 'ARI', 16, 7, 9, 0, '7-9', 'g9', '1997-01-01')"
+        )
+        _schedules_table(conn, [(1999, "REG", "GB", "ARI", 27, 24)])
+        _create_team_records(conn)
+
+        assert _team_row(conn, "GB", 1996) == (16, 13, 3, 0, "espn", "GB")
+        assert _team_row(conn, "GB", 1999) == (1, 1, 0, 0, "nflverse", "GB")
+        seasons = [r[0] for r in conn.execute("SELECT DISTINCT season FROM team_records ORDER BY season").fetchall()]
+        assert seasons == [1996, 1999]
+
+    def test_espn_only_still_builds(self, conn):
+        conn.execute(_ESPN_RECORDS_DDL)
+        _create_team_records(conn)
+        assert conn.execute("SELECT COUNT(*) FROM team_records").fetchone()[0] == 0
+
+    def test_skips_when_no_source_tables(self, conn, capsys):
+        _create_team_records(conn)
+        assert "team_records — skipped" in capsys.readouterr().out
+        assert _table_exists(conn, "team_records") is False
+
+    def test_recorded_as_derived_dataset(self, conn):
+        _schedules_table(conn, [(2024, "REG", "KC", "BAL", 26, 10)])
+        _create_team_records(conn)
+        meta = conn.execute(
+            "SELECT loader_fn, season, row_count FROM _ingest_metadata WHERE dataset_id = 'team_records'"
+        ).fetchone()
+        assert meta == ("derived", None, 2)
+
+    def test_rebuild_replaces_rows(self, conn):
+        _schedules_table(conn, [(2024, "REG", "KC", "BAL", 26, 10)])
+        _create_team_records(conn)
+        conn.execute("INSERT INTO schedules VALUES (2024, 'REG', 'DAL', 'NYG', 20, 10)")
+        _create_team_records(conn)
+        assert conn.execute("SELECT COUNT(*) FROM team_records").fetchone()[0] == 4
+
+
+class TestIngestEspnRecords:
+    def test_stores_rows_and_marks_the_season_loaded(self, conn, monkeypatch):
+        calls = []
+
+        def fake_fetch(season, **kwargs):
+            calls.append(season)
+            return [_record(season, "GB", "13-3", 13, 3, 0), _record(season, "NE", "11-5", 11, 5, 0)]
+
+        monkeypatch.setattr("nfl_mcp.espn.fetch_season_records", fake_fetch)
+        assert _ingest_espn_records(conn, [1996]) == 2
+
+        rows = conn.execute(
+            "SELECT season, team, wins, losses, ties, games, source_game_id FROM espn_team_records ORDER BY team"
+        ).fetchall()
+        assert rows == [(1996, "GB", 13, 3, 0, 16, "g1"), (1996, "NE", 11, 5, 0, 16, "g1")]
+        assert _is_loaded(conn, "espn_records", 1996) is True
+        assert calls == [1996]
+
+    def test_already_loaded_seasons_are_skipped(self, conn, monkeypatch):
+        calls = []
+        monkeypatch.setattr("nfl_mcp.espn.fetch_season_records",
+                            lambda season, **kw: calls.append(season) or [_record(season, "GB", "13-3", 13, 3, 0)])
+        _ingest_espn_records(conn, [1996])
+        _ingest_espn_records(conn, [1996])
+        assert calls == [1996]
+
+        _ingest_espn_records(conn, [1996], fresh=True)
+        assert calls == [1996, 1996]
+        assert conn.execute("SELECT COUNT(*) FROM espn_team_records").fetchone()[0] == 1
+
+    def test_requests_outside_the_window_are_dropped(self, conn, monkeypatch):
+        monkeypatch.setattr("nfl_mcp.espn.fetch_season_records",
+                            lambda season, **kw: pytest.fail("must not call ESPN outside 1970-1998"))
+        assert _ingest_espn_records(conn, [1999, 2024]) == 0
+
+    def test_null_seasons_uses_the_full_window(self, conn, monkeypatch):
+        calls = []
+        monkeypatch.setattr("nfl_mcp.espn.fetch_season_records",
+                            lambda season, **kw: calls.append(season) or [])
+        _ingest_espn_records(conn, None)
+        assert calls == list(range(1970, 1999))
+
+    def test_unavailable_espn_leaves_the_season_unrecorded(self, conn, monkeypatch, capsys):
+        def boom(season, **kwargs):
+            raise EspnUnavailable("ESPN request failed: 503")
+
+        monkeypatch.setattr("nfl_mcp.espn.fetch_season_records", boom)
+        assert _ingest_espn_records(conn, [1996]) == 0
+        assert _is_loaded(conn, "espn_records", 1996) is False
+        assert "retrying next run" in capsys.readouterr().out
+
+    def test_empty_response_leaves_the_season_unrecorded(self, conn, monkeypatch, capsys):
+        monkeypatch.setattr("nfl_mcp.espn.fetch_season_records", lambda season, **kw: [])
+        assert _ingest_espn_records(conn, [1970]) == 0
+        assert _is_loaded(conn, "espn_records", 1970) is False
+        assert "no records published" in capsys.readouterr().out
+
+    def test_reports_how_much_of_the_league_espn_covered(self, conn, monkeypatch, capsys):
+        monkeypatch.setattr("nfl_mcp.espn.fetch_season_records",
+                            lambda season, **kw: [_record(season, "GB", "13-3", 13, 3, 0)])
+        _ingest_espn_records(conn, [1996])
+        out = capsys.readouterr().out
+        assert "1/30 franchises" in out
+        assert "29 franchises absent" in out
+
+    def test_complete_season_reports_no_gap(self, conn, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "nfl_mcp.espn.fetch_season_records",
+            lambda season, **kw: [_record(season, "GB", "13-3", 13, 3, 0)] * 30,
+        )
+        _ingest_espn_records(conn, [1996])
+        assert "30/30 franchises" in capsys.readouterr().out
