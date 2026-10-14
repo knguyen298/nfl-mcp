@@ -14,9 +14,12 @@ Ask Claude questions like:
 ## Quickstart
 
 ```bash
-pip install nfl-mcp        # or: uvx nfl-mcp
+pip install git+https://github.com/knguyen298/nfl-mcp.git
 nfl-mcp init               # configure, load data, and start the server
 ```
+
+`pip install nfl-mcp` works too, but installs the upstream PyPI build — this repository
+publishes only the container image, so its own fixes are not on PyPI.
 
 `init` walks you through setup and offers to start the server immediately when done. No database server to install. No credentials to manage. Data is stored locally in DuckDB.
 
@@ -63,6 +66,7 @@ Notes on the updater:
 
 1. The [`Publish container image`](.github/workflows/docker.yml) workflow builds `Dockerfile` and pushes it to `ghcr.io/<owner>/<repo>` — the image path follows whichever repository the workflow runs in. It runs weekly, on each GitHub release, or manually via *Actions → Run workflow*. The build ingests every default dataset, so it takes considerably longer than a normal image build.
 2. To `docker pull` without credentials, make the GHCR package **public**: repo → *Packages* → `nfl-mcp` → *Package settings* → *Change visibility → Public*. Scheduled builds are **disabled on forks by default** — enable them under *Actions* if you want the weekly refresh there.
+3. A release publishes the **image only**. The `Publish to PyPI` workflow is gone: PyPI's trusted publisher is registered for the upstream repository, so every release on a fork failed that job while shipping nothing. Cut a release (or *Run workflow* on `Publish container image`) and the image is what lands.
 
 ## Prerequisites
 
