@@ -179,6 +179,13 @@ back to summing scores. `_ingest_espn_records` stops after `ESPN_FAILURE_LIMIT` 
 fail in a row, which bounds how long a blocked network can hold up an image build; leave
 that breaker in place.
 
+34 of 808 franchise-seasons in the band have no record from either ESPN feed (mostly CIN
+and IND before 1991). The tempting fix — sum those clubs' game scores instead — is not
+free: those seasons contain exactly one hollow Monday-night `0-0` per week, so the fallback
+can hand a franchise a phantom tie. If you add it, restrict it to rows the record path
+cannot produce, keep it labelled as a different source, and treat a 0-0 result as suspect
+rather than as a tie.
+
 ## Container Image & Data Refresh
 
 Two independent paths keep the published image current. Change one without breaking the other.

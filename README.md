@@ -283,10 +283,17 @@ Two things about the ESPN years are worth knowing:
   slot, filed as `Final 0-0` with no box score. Summing scores would invent ties and get
   roughly one in fifteen records wrong, so the record ESPN itself reports is used instead.
   Checked against published standings: 30 of 30 franchises correct for 1996.
-* **Some franchises are missing entirely.** ESPN publishes no record at all for a handful
-  of clubs in individual seasons (the 1970 Colts and Bengals, for example). Those seasons
-  report `record_not_available` — never a guessed record — and the rest of the season
-  still loads.
+* **Some franchise-seasons have no record at all.** Across 1970–1998, ESPN publishes a
+  complete regular-season record for **774 of 808** franchise-seasons (96%). The gaps sit
+  almost entirely with two clubs: **Cincinnati** (14 seasons, 1970–1990) and **Indianapolis**
+  (14 seasons, 1970–1983). The other six are scattered — Pittsburgh in 1974 and 1997, Green
+  Bay and Tampa Bay in 1977, Dallas in 1989, Washington in 1997. Eight seasons are complete:
+  1985 and 1991–1996, 1998. Missing rows report `record_not_available` — never a guessed
+  record — and the rest of the season still loads.
+  This is not a source-selection mistake: ESPN's standings feed (`apis/v2/.../standings`) was
+  measured over the same 29 seasons, agrees with all 774 records exactly, and recovers none
+  of the 34 gaps — its figures for those clubs are in-season snapshots (the 1997 Steelers
+  appear as 10-5, fifteen games) that fail the same schedule-length check.
 
 Records are stored under each franchise's **current** abbreviation, so one query spans
 relocations and renames: the Raiders are `LV` in 1970 and in 2024, and historical codes
