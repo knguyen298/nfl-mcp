@@ -175,7 +175,9 @@ reaches back to the final AFL seasons. Changing one should not move the other.
 `espn.py` fetches 1970–1998 records. Keep its transport injectable — every test drives a
 fake transport, and CI must not depend on ESPN. The reason it reads ESPN's reported record
 instead of counting scores is documented in that module's docstring; do not "simplify" it
-back to summing scores.
+back to summing scores. `_ingest_espn_records` stops after `ESPN_FAILURE_LIMIT` seasons
+fail in a row, which bounds how long a blocked network can hold up an image build; leave
+that breaker in place.
 
 ## Container Image & Data Refresh
 

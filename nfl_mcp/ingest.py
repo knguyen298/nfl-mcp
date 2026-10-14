@@ -418,6 +418,10 @@ def _ingest_generic_dataset(
 
 # ── External records (ESPN, pre-1999) ─────────────────────────────────────────
 
+# Three straight failures means the endpoint itself is unhappy, so the run stops rather
+# than spending the rest of its timeout budget on a dead network.
+ESPN_FAILURE_LIMIT = 3
+
 _ESPN_RECORDS_DDL = """
     CREATE TABLE IF NOT EXISTS espn_team_records (
         season          INTEGER NOT NULL,
@@ -444,6 +448,10 @@ def _ingest_espn_records(
 
     Seasons are only marked loaded when rows came back, so a season that failed (or that
     ESPN has no data for) is retried on the next run instead of being silently frozen.
+
+    Three seasons failing in a row stops the run: that pattern means the endpoint is down
+    or rate-limiting us, not that individual seasons are empty, and it bounds how long a
+    blocked network can hold up an image build. The remaining seasons stay unrecorded.
     """
     from .espn import EspnUnavailable, fetch_season_records
     from .franchises import expected_franchise_count
@@ -458,6 +466,7 @@ def _ingest_espn_records(
 
     print("\n  espn_records (external source, ~2 requests per season)")
     total = 0
+    failures = 0
     for season in season_list:
         if _is_loaded(conn, defn.dataset_id, season) and not fresh:
             print(f"    espn_records {season}: already loaded, skipping")
@@ -465,7 +474,12 @@ def _ingest_espn_records(
         try:
             records = fetch_season_records(season)
         except EspnUnavailable as exc:
+            failures += 1
             print(f"    espn_records {season}: ESPN unavailable ({exc}); retrying next run")
+            if failures >= ESPN_FAILURE_LIMIT:
+                print(f"    espn_records: {ESPN_FAILURE_LIMIT} seasons failed in a row, "
+                      "stopping — run 'nfl-mcp ingest --pre1999' again later to resume")
+                break
             continue
         if not records:
             print(f"    espn_records {season}: no records published")
@@ -482,6 +496,7 @@ def _ingest_espn_records(
         )
         _record_loaded(conn, defn.dataset_id, defn.table_name, "espn_records", len(records), season)
         total += len(records)
+        failures = 0
 
         expected = expected_franchise_count(season)
         gap = "" if len(records) == expected else f"  ({expected - len(records)} franchises absent from ESPN's archive)"

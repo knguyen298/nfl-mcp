@@ -272,6 +272,10 @@ it. Re-running only fetches seasons not already recorded. The published image ba
 records at build time, so `docker run ghcr.io/knguyen298/nfl-mcp` answers 1970+ standings
 with no extra step.
 
+If three seasons fail back to back the pull stops and says so — that pattern means the
+endpoint is down, not that those seasons are empty. Run `--pre1999` again later and it picks
+up where it left off.
+
 Two things about the ESPN years are worth knowing:
 
 * **Final records are reliable; game scores are not.** ESPN's archive is missing the

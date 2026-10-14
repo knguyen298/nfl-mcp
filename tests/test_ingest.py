@@ -1212,6 +1212,35 @@ class TestIngestEspnRecords:
         assert _is_loaded(conn, "espn_records", 1996) is False
         assert "retrying next run" in capsys.readouterr().out
 
+    def test_repeated_failures_stop_the_run(self, conn, monkeypatch, capsys):
+        """A dead endpoint must cost three seasons, not the whole backfill."""
+        calls = []
+
+        def boom(season, **kwargs):
+            calls.append(season)
+            raise EspnUnavailable("ESPN request failed: timeout")
+
+        monkeypatch.setattr("nfl_mcp.espn.fetch_season_records", boom)
+        assert _ingest_espn_records(conn, [1970, 1971, 1972, 1973, 1974]) == 0
+        assert calls == [1970, 1971, 1972]
+        out = capsys.readouterr().out
+        assert "stopping" in out and "resume" in out
+        assert _is_loaded(conn, "espn_records", 1970) is False
+
+    def test_a_success_resets_the_failure_count(self, conn, monkeypatch):
+        calls = []
+
+        def flaky(season, **kwargs):
+            calls.append(season)
+            if season in (1970, 1971, 1973, 1974):
+                raise EspnUnavailable("ESPN request failed: 503")
+            return [_record(season, "GB", "10-4", 10, 4, 0)]
+
+        monkeypatch.setattr("nfl_mcp.espn.fetch_season_records", flaky)
+        assert _ingest_espn_records(conn, [1970, 1971, 1972, 1973, 1974]) == 1
+        assert calls == [1970, 1971, 1972, 1973, 1974]
+        assert _is_loaded(conn, "espn_records", 1972) is True
+
     def test_empty_response_leaves_the_season_unrecorded(self, conn, monkeypatch, capsys):
         monkeypatch.setattr("nfl_mcp.espn.fetch_season_records", lambda season, **kw: [])
         assert _ingest_espn_records(conn, [1970]) == 0
