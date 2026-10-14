@@ -4,7 +4,9 @@ on:
   release:
     types: [published]
   schedule:
-    # Thursday 08:00 UTC — rebuild the image with refreshed NFL data
+    # Thursday 08:00 UTC — rebuild so a freshly pulled image seeds itself with recent
+    # data. Long-running containers refresh themselves via update_db.sh; this covers
+    # everyone who pulls the image instead.
     - cron: "0 8 * * 4"
   workflow_dispatch:
 
