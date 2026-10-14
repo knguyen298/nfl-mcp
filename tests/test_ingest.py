@@ -677,6 +677,26 @@ class TestPbpCurrentSeasonRefresh:
                             db_path=str(tmp_path / "nflread.duckdb"))
         assert asked[:2] == [2025, 2024]
 
+    def test_schema_discovery_gives_up_when_no_requested_season_has_pbp(self, monkeypatch, tmp_path):
+        # Every candidate raised, so there is no schema to build the table from. This has
+        # to fail loudly instead of writing an empty plays table and reporting success.
+        conn = TestRunIngestOrchestration._DummyConn(loaded_rows=[])
+        asked = []
+
+        def load_pbp(seasons):
+            asked.append(seasons[0])
+            raise FileNotFoundError("no pbp file")
+
+        monkeypatch.setattr("nfl_mcp.ingest.current_season", lambda: 2025)
+        _install_fake_nflreadpy(monkeypatch, load_pbp=load_pbp)
+        monkeypatch.setattr("nfl_mcp.ingest.duckdb.connect", lambda path: conn)
+        monkeypatch.setattr("nfl_mcp.ingest._ensure_metadata_table", lambda c: None)
+
+        with pytest.raises(RuntimeError, match="Could not load play-by-play"):
+            run_ingest_datasets(["pbp"], start=2024, end=2025, skip_views=True,
+                                db_path=str(tmp_path / "nflread.duckdb"))
+        assert asked == [2025, 2024]
+
 
 class TestSeasonHelpers:
     @pytest.mark.parametrize("date_, expected", [
