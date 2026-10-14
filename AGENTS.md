@@ -171,6 +171,7 @@ Rules:
 - **Player names are abbreviated**: `'P.Mahomes'`, `'T.Hill'` — use `ILIKE '%name%'` for fuzzy matching.
 - **Boolean columns are `DOUBLE PRECISION` 0/1** in the plays table — filter with `= 1`, not `IS TRUE`.
 - **`nfl_query` is last resort** — prefer structured tools. The tool descriptions use "PREFERRED for..." language intentionally to steer the model away from raw SQL.
+- **Models invent column names** (`play_epa` for `epa`). `_sql_error_detail` in `tools.py` turns DuckDB's binder/catalog text into `code` + `unknown_column`/`unknown_table` + `did_you_mean`, re-ranked against `information_schema` by last snake_case word, because DuckDB's own "Candidate bindings" are spelling-based and miss the real metric. Keep the vocabulary hints in `schema_pbp.py` up to date — that text is what the model actually reads.
 
 ## Coverage Gaps (Known)
 

@@ -9,10 +9,12 @@ NFL MCP Server tools:
   nfl_compare       → side-by-side comparison
 """
 
+import difflib
 import logging
 import re
 import threading
-from typing import Any, Dict, Sequence
+from collections.abc import Iterable, Sequence
+from typing import Any, Dict
 
 import duckdb
 
@@ -145,6 +147,97 @@ def nfl_status() -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+# ── Self-correcting SQL errors ────────────────────────────────────────────────
+#
+# Raw SQL arrives from a language model, so invented column and table names are the
+# most common failure. DuckDB reports them as free text whose "nearest name" list is
+# spelling-based, which is useless for a name like `play_epa` (the real column is
+# `epa`). These helpers re-rank against the live schema by *meaning*: in a snake_case
+# name the last word is the metric and earlier words qualify it.
+
+_COLUMN_NOT_FOUND = re.compile(r'Referenced column "(?P<name>[^"]+)" not found', re.IGNORECASE)
+_TABLE_NOT_FOUND = re.compile(r"Table with name (?P<name>\S+) does not exist", re.IGNORECASE)
+_QUOTED_NAMES = re.compile(r'"(?P<name>[^"]+)"')
+_WORDS = re.compile(r"[^a-z0-9]+")
+
+_COLUMN_NAMES_SQL = (
+    "SELECT DISTINCT column_name FROM information_schema.columns "
+    "WHERE table_schema = 'main'"
+)
+_TABLE_NAMES_SQL = (
+    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+)
+
+
+def _live_names(sql: str) -> list[str]:
+    """Names straight from the live schema; empty if the lookup itself fails."""
+    try:
+        return [next(iter(row.values())) for row in _execute(sql)]
+    except (duckdb.Error, ValueError, TimeoutError):
+        return []
+
+
+def _similarity(unknown: str, candidate: str) -> float:
+    """Score how well `candidate` matches the name the caller guessed."""
+    guessed, actual = unknown.lower(), candidate.lower()
+    if guessed == actual:
+        return 5.0
+    g_words = [w for w in _WORDS.split(guessed) if w]
+    a_words = [w for w in _WORDS.split(actual) if w]
+    if not g_words or not a_words:
+        return difflib.SequenceMatcher(None, guessed, actual).ratio()
+    g_set, a_set = set(g_words), set(a_words)
+    if g_words[-1] == a_words[-1]:
+        base = 3.0
+    elif g_words[-1] in a_set:
+        base = 2.5
+    elif g_set & a_set:
+        base = 1.5
+    else:
+        return difflib.SequenceMatcher(None, guessed, actual).ratio()
+    overlap = len(g_set & a_set) / len(g_set | a_set)
+    substring = 0.4 if (guessed in actual or actual in guessed) else 0.0
+    return base + overlap + substring
+
+
+def _nearest(unknown: str, candidates: Iterable[str], limit: int = 5) -> list[str]:
+    """Closest real names to `unknown`, best match first, ties alphabetical."""
+    unique = {c.lower() for c in candidates if c and c.lower() != unknown.lower()}
+    return sorted(unique, key=lambda c: (-_similarity(unknown, c), c))[:limit]
+
+
+def _sql_error_detail(exc: Exception) -> Dict[str, Any]:
+    """Turn a DuckDB binder/catalog error into fields the caller can act on."""
+    message = str(exc)
+    spelled = [m.group("name") for m in _QUOTED_NAMES.finditer(message)]
+
+    guessed_column = _COLUMN_NOT_FOUND.search(message)
+    if guessed_column:
+        unknown = guessed_column.group("name")
+        return {
+            "code": "COLUMN_NOT_FOUND",
+            "unknown_column": unknown,
+            "did_you_mean": _nearest(unknown, _live_names(_COLUMN_NAMES_SQL) + spelled),
+            "hint": (
+                "Column names must match the schema exactly. Call "
+                "nfl_schema(table='<table>') for non-pbp tables, or "
+                "nfl_schema(category='<name>') for play-by-play columns."
+            ),
+        }
+
+    guessed_table = _TABLE_NOT_FOUND.search(message)
+    if guessed_table:
+        unknown = guessed_table.group("name")
+        return {
+            "code": "TABLE_NOT_FOUND",
+            "unknown_table": unknown,
+            "did_you_mean": _nearest(unknown, _live_names(_TABLE_NAMES_SQL) + spelled),
+            "hint": "Call nfl_catalog() or nfl_schema() to list the loaded tables.",
+        }
+
+    return {}
+
+
 def nfl_query(sql: str, max_rows: int = 100) -> Dict[str, Any]:
     """
     Execute a read-only SQL SELECT against the nflread database.
@@ -155,6 +248,9 @@ def nfl_query(sql: str, max_rows: int = 100) -> Dict[str, Any]:
       - Multiple statements (semicolons) blocked
       - Results capped at max_rows (hard max 500)
       - 10-second statement timeout
+
+    Unknown column/table failures also return `code`, the offending name,
+    `did_you_mean` (ranked against the live schema) and a `hint`.
     """
     sql = sql.strip()
 
@@ -186,7 +282,7 @@ def nfl_query(sql: str, max_rows: int = 100) -> Dict[str, Any]:
 
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
-        return {"error": str(e)}
+        return {"error": str(e), **_sql_error_detail(e)}
 
 
 def nfl_search_plays(

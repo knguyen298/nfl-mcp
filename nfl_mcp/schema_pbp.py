@@ -14,9 +14,13 @@ Key columns for common queries:
 Player names are abbreviated: 'P.Mahomes', 'J.Allen', 'D.Henry'
 Team abbreviations: KC, BUF, BAL, PHI, SF, DAL, DET, etc.
 
+Column names are literal — do not invent one. Per-play EPA is `epa`, not `play_epa`.
+Columns prefixed `play_` are metadata (play_id, play_type, play_type_nfl,
+play_deleted, play_clock), never metrics.
+
 Aggregate tables (faster for team-level queries):
   team_offense_stats  (team, season_year, total_plays, total_yards, avg_epa, ...)
-  team_defense_stats  (team, season_year, yards_allowed, sacks, turnovers_forced, ...)
+  team_defense_stats  (team, season_year, yards_allowed, sacks, turnovers_forced, avg_epa_allowed, ...)
   situational_stats   (team, season_year, situation, plays, avg_epa, conversion_pct)
   formation_effectiveness (team, season_year, formation, play_type, avg_epa, ...)
 
@@ -304,7 +308,8 @@ PROBABILITY MODELS  (pre-play estimates)
 """,
     "epa": """
 EPA — EXPECTED POINTS ADDED  (positive = good for offense)
-  epa              DOUBLE PRECISION  total EPA on play
+  epa              DOUBLE PRECISION  total EPA on play (this IS the per-play value;
+                                     there is no play_epa column)
   qb_epa           DOUBLE PRECISION  EPA credited to QB (pass + scramble)
 
   CUMULATIVE (running totals within game at time of play)
@@ -435,5 +440,9 @@ QUERY TIPS
   • game_date is TEXT in 'YYYY-MM-DD' format — cast if needed: game_date::date
   • `success` = 1 means play met the success threshold (50%+ of yards on 1st, 70%+ on 2nd, 100% on 3rd/4th)
   • OT is qtr = 5
+  • Metric columns have no `play_` prefix: epa, qb_epa, wpa, success, yards_gained.
+    Inventing play_epa / epa_play / def_epa raises a binder error — read the names above.
+  • EPA a defense allows: AVG(epa) grouped by defteam on plays, or the pre-computed
+    team_defense_stats.avg_epa_allowed for season totals
 """,
 }

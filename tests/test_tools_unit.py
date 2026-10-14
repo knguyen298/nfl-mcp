@@ -181,6 +181,94 @@ def test_nfl_query_returns_error_when_execute_fails(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad sql")))
     result = tools.nfl_query("SELECT 1")
     assert result["error"] == "bad sql"
+    assert "code" not in result
+
+
+COLUMN_ERROR = (
+    'Binder Error: Referenced column "play_epa" not found in FROM clause!\n'
+    'Candidate bindings: "play_type", "play", "play_id", "play_type_nfl", "play_deleted"\n'
+    "\n"
+    "LINE 3:  ROUND(AVG(play_epa),4) epa_allowed_per_play,\n"
+    "                   ^"
+)
+
+TABLE_ERROR = (
+    'Catalog Error: Table with name playz does not exist!\n'
+    'Did you mean "plays"?'
+)
+
+PLAY_COLUMNS = [
+    "play_id", "play_type", "play_type_nfl", "play_deleted", "play", "play_clock",
+    "epa", "qb_epa", "air_epa", "yac_epa", "xyac_epa", "success", "yards_gained",
+]
+
+
+def _failing_query(exc, schema_rows):
+    """Fake _execute: answers schema lookups, raises `exc` for the caller's SQL."""
+
+    def fake_execute(sql, params=None):
+        if "information_schema" in sql:
+            return schema_rows
+        raise exc
+
+    return fake_execute
+
+
+def test_nfl_query_suggests_real_columns_for_an_invented_column(monkeypatch):
+    monkeypatch.setattr(
+        tools, "_execute", _failing_query(duckdb.BinderException(COLUMN_ERROR),
+                                          [{"column_name": c} for c in PLAY_COLUMNS]),
+    )
+    result = tools.nfl_query("SELECT defteam, ROUND(AVG(play_epa),4) FROM plays GROUP BY 1")
+
+    assert result["code"] == "COLUMN_NOT_FOUND"
+    assert result["unknown_column"] == "play_epa"
+    assert result["did_you_mean"][0] == "epa"
+    assert set(result["did_you_mean"]) == {"epa", "air_epa", "qb_epa", "xyac_epa", "yac_epa"}
+    assert "nfl_schema" in result["hint"]
+
+
+def test_nfl_query_suggests_real_tables_for_an_invented_table(monkeypatch):
+    monkeypatch.setattr(
+        tools, "_execute", _failing_query(duckdb.CatalogException(TABLE_ERROR),
+                                          [{"table_name": t} for t in ("plays", "schedules")]),
+    )
+    result = tools.nfl_query("SELECT * FROM playz")
+
+    assert result["code"] == "TABLE_NOT_FOUND"
+    assert result["unknown_table"] == "playz"
+    assert result["did_you_mean"][0] == "plays"
+    assert "nfl_catalog" in result["hint"]
+
+
+def test_nfl_query_falls_back_to_duckdb_candidates_when_schema_lookup_fails(monkeypatch):
+    def fake_execute(sql, params=None):
+        if "information_schema" in sql:
+            raise duckdb.Error("schema unavailable")
+        raise duckdb.BinderException(COLUMN_ERROR)
+
+    monkeypatch.setattr(tools, "_execute", fake_execute)
+    result = tools.nfl_query("SELECT AVG(play_epa) FROM plays")
+
+    assert result["code"] == "COLUMN_NOT_FOUND"
+    assert "play_type" in result["did_you_mean"]
+    assert "epa" not in result["did_you_mean"]
+
+
+def test_similarity_prefers_the_last_word_of_a_snake_case_name():
+    assert tools._similarity("epa", "epa") == 5.0
+    assert tools._similarity("play_epa", "epa") > tools._similarity("play_epa", "play_type")
+    assert tools._similarity("epa_play", "play_epa") > tools._similarity("epa_play", "yards_gained")
+    assert tools._similarity("abc", "xyz") < 1.0
+    assert tools._similarity("_", "epa") < 1.0
+
+
+def test_nearest_drops_the_guess_and_ranks_by_similarity():
+    candidates = ["epa", "EPA", "", "qb_epa", "air_epa", "yac_epa", "xyac_epa", "wpa"]
+
+    assert tools._nearest("epa", candidates) == [
+        "air_epa", "qb_epa", "xyac_epa", "yac_epa", "wpa",
+    ]
 
 
 @pytest.mark.parametrize(

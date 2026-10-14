@@ -94,7 +94,9 @@ TOOLS = [
         description=(
             "LAST RESORT: Execute raw SQL only when nfl_search_plays, nfl_team_stats, "
             "nfl_player_stats, and nfl_compare cannot answer the question. "
-            "Requires calling nfl_schema first. Read-only SELECT only. "
+            "Requires calling nfl_schema first, and column names must be copied from it, "
+            "never guessed (per-play EPA is `epa`, not `play_epa`). "
+            "Read-only SELECT only. "
             "500 row cap. 10s timeout."
         ),
         inputSchema={
