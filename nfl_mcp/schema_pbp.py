@@ -1,6 +1,6 @@
 _SCHEMA_SUMMARY = """
 Database: nflread (DuckDB)
-Table: plays (2013 through the current season, 372 columns)
+Table: plays (1999 through the current season, 372 columns)
 
 Key columns for common queries:
   season (INT), week (INT), season_type ('REG'|'POST'), game_id, game_date
@@ -17,6 +17,10 @@ Team abbreviations: KC, BUF, BAL, PHI, SF, DAL, DET, etc.
 Column names are literal — do not invent one. Per-play EPA is `epa`, not `play_epa`.
 Columns prefixed `play_` are metadata (play_id, play_type, play_type_nfl,
 play_deleted, play_clock), never metrics.
+
+The team identifier is named differently in every table: `posteam`/`defteam` in plays,
+`team` in the aggregate tables below, `team_abbr` in the `teams` table (which has no `team`
+column — `team_name` is 'Minnesota Vikings', `team_nick` is 'Vikings').
 
 Aggregate tables (faster for team-level queries):
   team_offense_stats  (team, season_year, total_plays, total_yards, avg_epa, ...)
@@ -444,5 +448,10 @@ QUERY TIPS
     Inventing play_epa / epa_play / def_epa raises a binder error — read the names above.
   • EPA a defense allows: AVG(epa) grouped by defteam on plays, or the pre-computed
     team_defense_stats.avg_epa_allowed for season totals
+  • There is no `team` column in the `teams` table — it has team_abbr, team_name, team_nick,
+    team_conf, team_division, team_color*, and logo URLs. `team` only exists in the
+    aggregate tables. Find a franchise with: WHERE team_name ILIKE '%viking%'
+  • nfl_schema(table='<name>') returns the live column list for any non-pbp table
+    (teams, players, contracts, schedules, rosters, ...). Use it instead of guessing.
 """,
 }
