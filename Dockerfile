@@ -43,6 +43,11 @@ ENV NFL_MCP_DB_PATH=/data/nflread.duckdb
 # 1966 onward, clipped per dataset (play-by-play and the stats tables from their 1999
 # source floor). That is a multi-GB build; pass e.g. INGEST_ARGS=--start 1999 for a smaller
 # image, or a single season in CI to validate the build pipeline quickly without the bake.
+#
+# --pre1999 is passed unconditionally so the seed carries 1970-1998 season records from
+# ESPN (about 60 requests, roughly a minute). It is build-time only: the runtime ingest in
+# entrypoint.sh and update_db.sh leaves it out, so a running container never waits on ESPN.
+# A season that fails to fetch is simply absent from the seed and the build still passes.
 ARG INGEST_ARGS=""
 RUN mkdir -p /seed /data /var/log/nflmcp \
  && chmod 777 /data /var/log/nflmcp \
@@ -50,7 +55,7 @@ RUN mkdir -p /seed /data /var/log/nflmcp \
     NFL_MCP_DUCKDB_MEMORY_LIMIT=3GB \
     NFL_MCP_DUCKDB_THREADS=2 \
     POLARS_MAX_THREADS=2 \
-    nfl-mcp ingest ${INGEST_ARGS} \
+    nfl-mcp ingest --pre1999 ${INGEST_ARGS} \
  && rm -rf /seed/.duckdb_spill /data/.duckdb_spill /root/.cache \
  && test ! -e /seed/nflread.duckdb.wal \
  && python -c "import duckdb,sys; c=duckdb.connect('/seed/nflread.duckdb',read_only=True); rows={t:c.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in ('plays','schedules')}; print('baked rows:',rows); sys.exit(0 if all(v>0 for v in rows.values()) else 1)"

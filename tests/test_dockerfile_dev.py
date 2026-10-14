@@ -79,6 +79,15 @@ class TestPublishedImageCarriesUpdater:
         assert "test ! -e /seed/nflread.duckdb.wal" in dockerfile
         assert "('plays','schedules')" in dockerfile
 
+    def test_seed_includes_pre1999_records_but_runtime_does_not(self):
+        # The published image answers 1970+ standings out of the box, while a running
+        # container never calls ESPN: the opt-in flag belongs to the build only.
+        assert "nfl-mcp ingest --pre1999 ${INGEST_ARGS}" in _read("Dockerfile")
+        for script in ("entrypoint.sh", "update_db.sh"):
+            contents = _read(script)
+            assert "nfl-mcp ingest" in contents
+            assert "--pre1999" not in contents
+
     def test_dockerfile_and_entrypoint_agree_on_the_served_path(self):
         # The drift that disabled auto-updating was these two paths diverging.
         served = 'ENV NFL_MCP_DB_PATH=/data/nflread.duckdb'

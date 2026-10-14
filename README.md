@@ -176,6 +176,7 @@ nfl-mcp ingest --dataset schedules      # one specific dataset
 nfl-mcp ingest --dataset pbp --dataset injuries   # multiple datasets
 nfl-mcp ingest --start 2020 --end 2024  # limit to a season range
 nfl-mcp ingest --fresh                  # re-ingest even if already loaded
+nfl-mcp ingest --pre1999                # also pull 1970–1998 season records from ESPN
 nfl-mcp ingest --list                   # show all available dataset names
 ```
 
@@ -192,9 +193,11 @@ DuckDB:
 | [nflverse-data](https://github.com/nflverse/nflverse-data) | play-by-play, schedules, rosters, stats, injuries, snap counts, depth charts, officials, participation, Next Gen Stats, PFR advanced stats, FTN charting, teams, players, contracts, trades, draft picks, combine |
 | [DynastyProcess](https://github.com/dynastyprocess/data) | fantasy player IDs and draft/weekly rankings |
 | [ffverse](https://github.com/ffverse/ffopportunity) | fantasy opportunity model |
+| [ESPN](https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard) | final season win-loss records before 1999 (opt-in, see below) |
 
-**Every dataset below is ingested by default** — `nfl-mcp ingest` loads the full family so
-any data a client might need is already there.
+**Every nflreadpy dataset below is ingested by default** — `nfl-mcp ingest` loads the full
+family so any data a client might need is already there. The single exception is
+`espn_records`, which reaches a different publisher and is opt-in.
 
 > **Season coverage: 1966 onward by default, deeper on request.** The default backfill
 > starts at **1966** — the AFL–NFL merger agreement year, so the final four AFL seasons are
@@ -232,6 +235,8 @@ any data a client might need is already there.
 | `ff_playerids` | current |
 | `ff_rankings_draft` | current |
 | `ff_rankings_week` | current |
+| `espn_team_records` | 1970–1998 (opt-in, `--pre1999`) |
+| `team_records` | 1970–present once both sources are loaded (derived) |
 
 > Older seasons are thinner than modern ones. Play-by-play carries `epa`, `wp`, and
 > `shotgun` from 1999, but tracking-derived data (Next Gen Stats, FTN charting), snap
@@ -243,6 +248,52 @@ any data a client might need is already there.
 nfl-mcp ingest                 # load the full nflverse family (default)
 nfl-mcp ingest --list          # see all dataset names
 nfl-mcp ingest --dataset pbp   # load just one dataset
+```
+
+## Team records, 1970 to present
+
+`nfl_team_records` answers win-loss and standings questions. One table is not enough,
+because no publisher spans the era:
+
+| Seasons | Source | How the record is obtained |
+|---|---|---|
+| 1999–present | nflverse `schedules` | wins, losses and ties counted from game scores |
+| 1970–1998 | ESPN scoreboard API | the cumulative overall record ESPN reports per club |
+
+nflverse has no games before 1999, so the earlier years need one extra, opt-in step:
+
+```bash
+nfl-mcp ingest --pre1999     # 29 seasons x 2 requests; a few minutes, idempotent
+```
+
+It is opt-in because it talks to ESPN rather than nflreadpy, so the container's scheduled
+refresh never calls it and `--dataset all` on a modern season range requests nothing from
+it. Re-running only fetches seasons not already recorded. The published image bakes these
+records at build time, so `docker run ghcr.io/knguyen298/nfl-mcp` answers 1970+ standings
+with no extra step.
+
+Two things about the ESPN years are worth knowing:
+
+* **Final records are reliable; game scores are not.** ESPN's archive is missing the
+  scores for about 7% of games per season from 1970 to 2001 — always the Monday-night
+  slot, filed as `Final 0-0` with no box score. Summing scores would invent ties and get
+  roughly one in fifteen records wrong, so the record ESPN itself reports is used instead.
+  Checked against published standings: 30 of 30 franchises correct for 1996.
+* **Some franchises are missing entirely.** ESPN publishes no record at all for a handful
+  of clubs in individual seasons (the 1970 Colts and Bengals, for example). Those seasons
+  report `record_not_available` — never a guessed record — and the rest of the season
+  still loads.
+
+Records are stored under each franchise's **current** abbreviation, so one query spans
+relocations and renames: the Raiders are `LV` in 1970 and in 2024, and historical codes
+(`OAK`, `SD`, `STL`) resolve to the same club. Every row also carries `club`, the name that
+franchise played that season under, so `team=IND, season=1970` reports the Baltimore Colts.
+A franchise that did not exist yet, or sat the season out, is reported that way rather than
+as `0-0`: the Texans return `franchise_not_yet_active` for 1995, the Browns
+`franchise_inactive` for 1996–1998, and any season before 1970 `before_coverage`.
+
+```sql
+SELECT season, team, wins, losses, ties FROM team_records WHERE season = 1972 AND team = 'MIA';
 ```
 
 ## MCP Tools
@@ -257,6 +308,7 @@ nfl-mcp ingest --dataset pbp   # load just one dataset
 | `nfl_player_stats` | Player stats by season and season type — passing, rushing, or receiving |
 | `nfl_compare` | Side-by-side comparison of two teams or two players |
 | `nfl_schedule` | Game schedule and results — scores, spread, weather, coaches |
+| `nfl_team_records` | Final season win-loss records per franchise, 1970–present (1970–1998 needs `--pre1999`) |
 | `nfl_roster` | Team roster by season and position |
 | `nfl_injuries` | Player injury report status by team, week, and designation |
 | `nfl_snap_counts` | Offensive, defensive, and special teams snap counts per player |
