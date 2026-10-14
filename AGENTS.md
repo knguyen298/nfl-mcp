@@ -19,6 +19,11 @@ nfl_mcp/
   database.py     # get_db_connection() context manager (read-only DuckDB)
   config.py       # ~/.nfl-mcp/config.json read/write, get_duckdb_path()
 
+entrypoint.sh   # Container start: seed -> slot A -> symlink -> supercronic -> serve
+update_db.sh    # Scheduled refresh: ingest idle slot, atomically swap the symlink
+Dockerfile      # Published image (baked seed + runtime A/B updater)
+Dockerfile.dev  # Same updater, no baked seed (cold ingest on first start)
+
 tests/
   test_registry.py   # Registry structure, coverage windows, loader functions
   test_ingest.py     # Ingest helpers using in-memory DuckDB (no network)
@@ -37,6 +42,29 @@ tests/
 1. `registry.py` — add a `DatasetDef` entry to `REGISTRY`
 
 The ingest loop in `ingest.py` is fully generic — it reads from the registry and handles everything else (idempotency, schema reconciliation, bulk vs ranged mode).
+
+**`min_season` is the depth knob.** Ingest clips every dataset to its own
+`min_season`/`max_season`, so one dataset's early start never delays the rest and no
+dataset requests a season its source never published. Two bounds in `seasons.py` set the
+outer limits of what gets requested:
+
+- `FIRST_SEASON = 1970` — the **default** backfill start (merger era).
+- `EARLIEST_SEASON = 1920` — how deep `--start` may reach; a test asserts this equals
+  `registry.earliest_season()`, the oldest declared dataset floor. Keep them distinct:
+  changing the default should not silently redefine what is reachable.
+
+- Always set `min_season` for a seasonal dataset — a test asserts none are left `None`.
+- If you register something older than the default, a test will flag that the default
+  clips it; update that test's expected list deliberately rather than moving `FIRST_SEASON`
+  reflexively.
+- Set `min_season` to the first season whose file has **rows**, not the first season the file
+  exists for: nflverse publishes an empty `snap_counts_2012.parquet`, and nflreadpy happily
+  returns 0 rows for it.
+- `min_season` must match nflreadpy's own season validator (each `load_*.py` raises
+  `Season must be between <floor> and ...`). nflreadpy is the hard ceiling — going deeper
+  than its floor needs a PR upstream, not a registry change.
+- Don't set `max_season` unless upstream genuinely stopped publishing; a stale cap silently
+  freezes a dataset (`participation` carried `max_season=2024` while 2025 was already live).
 
 **Never hardcode table schemas** for non-pbp tables. Use `nfl_schema(table=<name>)` which queries `information_schema.columns` at runtime. PBP schema strings live in `schema_pbp.py` because they carry human-readable annotations — not just types.
 
@@ -105,6 +133,36 @@ Each entry in `REGISTRY` is a `DatasetDef` with:
 ## Ingest Idempotency
 
 The ingest loop checks `_ingest_metadata` before every dataset+season. Re-running the same ingest command is safe — already-loaded combinations are skipped. Use `--fresh` to force re-ingest.
+
+## Container Image & Data Refresh
+
+Two independent paths keep the published image current. Change one without breaking the other.
+
+1. **Build time (seed).** `Dockerfile` runs `nfl-mcp ingest ${INGEST_ARGS}` into
+   `/seed/nflread.duckdb`, then validates it (no WAL, `plays`/`schedules` non-empty) so an
+   incomplete ingest fails the build. GitHub Actions rebuilds weekly, on release, and on
+   demand — this is what makes a fresh `docker pull` current.
+2. **Runtime (A/B swap).** `entrypoint.sh` copies the seed to `/data/nflread_a.duckdb`,
+   symlinks `/data/nflread.duckdb` to the active slot, starts `supercronic`, then `exec`
+   `nfl-mcp serve`. `update_db.sh` ingests into the idle slot and swaps the symlink. No
+   restart is needed because `get_db_connection()` opens a fresh read-only connection per
+   tool call.
+
+Rules:
+
+- **The published `Dockerfile` must keep `ENTRYPOINT ["/entrypoint.sh"]`.** This feature once
+  regressed to a no-op because the updater lived only in `Dockerfile.dev`, and
+  `.github/workflows/docker.yml` builds `./Dockerfile` (no `file:` input). `tests/test_dockerfile_dev.py`
+  guards this — extend it rather than deleting assertions.
+- Never re-ingest at container start. A cold ingest takes 10+ minutes and blocks
+  readiness behind any startup probe or health check; copy the seed instead.
+- The image must run standalone (`docker run -p 8000:8000 <image>`) with no mounted
+  volume and no external storage. `/data` and `/var/log/nflmcp` are `chmod 777` so an
+  arbitrary `--user` works. Anything that requires platform-specific storage (e.g. an
+  Azure Files mount) is out of scope for the image design.
+- Use `ln -sfn`, not `ln -s`: the plain form fails with `File exists` on an existing
+  regular file, and both scripts run `set -eu`, so the container crash-loops.
+- Scripts are POSIX `/bin/sh` (no `pipefail`); `sh -n` is asserted in the tests.
 
 ## Common Pitfalls
 

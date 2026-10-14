@@ -1,6 +1,6 @@
 # nfl-mcp
 
-MCP server for NFL data (2013–2025), powered by [nflreadpy](https://github.com/nflverse/nflreadpy) and DuckDB.
+MCP server for NFL data (default backfill to 1970; play-by-play from 1999, rosters to 1920 on request), powered by [nflreadpy](https://github.com/nflverse/nflreadpy) and DuckDB.
 Query play-by-play, rosters, injuries, stats, and more using natural language in Claude Code, VS Code, or Claude Desktop.
 
 Ask Claude questions like:
@@ -20,19 +20,49 @@ nfl-mcp init               # configure, load data, and start the server
 
 `init` walks you through setup and offers to start the server immediately when done. No database server to install. No credentials to manage. Data is stored locally in DuckDB.
 
-## Deploy to Azure
+## Run the container
 
-Run the server in the cloud as an [Azure Container App](https://learn.microsoft.com/azure/container-apps/) with one click:
+The image is self-contained: the database is inside it, so there is no external storage,
+database server, or credentials to configure.
 
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Febhattad%2Fnfl-mcp%2Fmain%2Finfra%2Fazuredeploy.json)
+```bash
+docker run -d -p 8000:8000 -v nfl-mcp-data:/data \
+  ghcr.io/knguyen298/nfl-mcp:latest
+```
 
-The button opens the Azure portal's **Custom deployment** blade prefilled from [`infra/azuredeploy.json`](infra/azuredeploy.json). Pick a resource group, then **Create**. It provisions a Container Apps Environment, a Log Analytics workspace, and the Container App (public HTTPS ingress on port 8000). When the deployment finishes, the `mcpUrl` output is your endpoint — point any MCP client at `https://<app>.<region>.azurecontainerapps.io/mcp`.
+Point any MCP client at `http://localhost:8000/mcp`. The `-v` mount is **optional**:
 
-> **The data is baked into the image.** The full DuckDB database is built into the container image at build time, so the app serves read-only with **no runtime ingest** — it starts instantly, never re-downloads data, needs no external storage, and runs comfortably on `0.5` vCPU / `1Gi`. To refresh the data, rebuild the image (re-run the publish workflow); the [`Publish container image`](.github/workflows/docker.yml) workflow also rebuilds weekly. The replica is pinned to a single instance (`minReplicas = maxReplicas = 1`).
+| | Without `-v` | With `-v nfl-mcp-data:/data` |
+|---|---|---|
+| First start | copies the baked seed | copies the baked seed |
+| Scheduled refreshes | apply immediately, live in the container's writable layer | apply immediately |
+| Container restart | falls back to the image's seed | keeps the last refreshed copy |
 
-**One-time setup before the button works:**
-1. The [`Publish container image`](.github/workflows/docker.yml) workflow must have pushed an image to `ghcr.io/ebhattad/nfl-mcp` (it runs weekly, on each GitHub release, or manually via *Actions → Run workflow*). The build ingests all default datasets, so it takes longer than a normal image build.
-2. Make that GHCR package **public**: repo → *Packages* → `nfl-mcp` → *Package settings* → *Change visibility → Public*. The ARM template pulls the image without credentials, so it must be public.
+Budget roughly **twice the database size** of free space in `/data` (the A/B slots) plus
+room for ingest spill, and **2 GB of memory** if you want the scheduled ingest to have
+headroom — the server itself is comfortable in 1 GB. `--user` is fine; `/data` and
+`/var/log/nflmcp` are world-writable in the image.
+
+> **The image ships with data and keeps itself current.** A complete DuckDB database is baked into the image as a **seed**, so a new container is queryable in seconds instead of spending 10+ minutes ingesting on startup. At runtime, `entrypoint.sh` copies that seed into slot A and starts `supercronic`, which runs `update_db.sh` on a schedule: ingest into the **idle slot**, then atomically swap the `/data/nflread.duckdb` symlink. The server opens a fresh read-only connection per query, so new data appears on the next request — no restart, no downtime, and a failed ingest leaves the previous copy still serving.
+
+### How the container stays current
+
+| Path | What it does | Cadence |
+|---|---|---|
+| GitHub Actions build | Re-ingests the seed baked into the image, so **whoever pulls next gets recent data** | Weekly (Thu 08:00 UTC), on release, or manually |
+| In-container updater | `update_db.sh` refreshes the running container via the A/B slot swap | Sun/Mon/Wed 03:00 UTC (game-day) + Thu 06:00 UTC (corrections) |
+
+Notes on the updater:
+
+- **Watch `/var/log/nflmcp/nfl_update.log`.** It is the only place a failed refresh reports itself; the server keeps serving the last good copy regardless.
+- **The updater inherits the runtime memory caps** (`512MB`, 1 thread), so raise the container memory to 2 GB if that log shows the ingest being killed.
+- **Check what a running container actually holds** with the `nfl_status` tool: `last_refreshed` reports the newest `_ingest_metadata` timestamp.
+- **Run one container per database.** Every instance keeps its own `/data` slots, so scaling out replicates both the ingest work and the storage.
+
+**Publishing and pulling the image:**
+
+1. The [`Publish container image`](.github/workflows/docker.yml) workflow builds `Dockerfile` and pushes it to `ghcr.io/<owner>/<repo>` — the image path follows whichever repository the workflow runs in. It runs weekly, on each GitHub release, or manually via *Actions → Run workflow*. The build ingests every default dataset, so it takes considerably longer than a normal image build.
+2. To `docker pull` without credentials, make the GHCR package **public**: repo → *Packages* → `nfl-mcp` → *Package settings* → *Change visibility → Public*. Scheduled builds are **disabled on forks by default** — enable them under *Actions* if you want the weekly refresh there.
 
 ## Prerequisites
 
@@ -149,25 +179,43 @@ Ingest is **idempotent** — re-running skips completed seasons already in the d
 
 ## Datasets
 
-All data is sourced from [nflverse](https://github.com/nflverse/nflverse-data) via nflreadpy and stored locally in DuckDB. **Every dataset below is ingested by default** — `nfl-mcp ingest` loads the full nflverse family so any data a client might need is already there.
+All data is ingested over HTTPS at ingest time (never at query time) from three upstream
+projects, via [nflreadpy](https://github.com/nflverse/nflreadpy), and stored locally in
+DuckDB:
 
-> **Season coverage: 2013 onward.** Season-based tables are ingested from **2013** — the window where every nflverse source is complete and consistent — through the current season. Datasets that begin later (e.g. Next Gen Stats 2016, FTN charting 2022) start at their first available season. Non-seasonal reference tables (draft picks, combine, contracts, players) carry their full historical record.
+| Upstream | What it supplies |
+|---|---|
+| [nflverse-data](https://github.com/nflverse/nflverse-data) | play-by-play, schedules, rosters, stats, injuries, snap counts, depth charts, officials, participation, Next Gen Stats, PFR advanced stats, FTN charting, teams, players, contracts, trades, draft picks, combine |
+| [DynastyProcess](https://github.com/dynastyprocess/data) | fantasy player IDs and draft/weekly rankings |
+| [ffverse](https://github.com/ffverse/ffopportunity) | fantasy opportunity model |
+
+**Every dataset below is ingested by default** — `nfl-mcp ingest` loads the full family so
+any data a client might need is already there.
+
+> **Season coverage: 1970 onward by default, deeper on request.** The default backfill
+> starts at **1970** and each dataset is then clipped to its own first available season (the
+> `min_season` in `nfl_mcp/registry.py`), so a fresh install loads rosters from 1970 while
+> play-by-play and the stats tables start at their 1999 source floor and Next Gen Stats at
+> 2016. Pass `--start` to go deeper — `--start 1920` adds the pre-merger rosters, and no
+> dataset ever requests a season its source never published. `nfl-mcp ingest --list` prints
+> the window for every dataset. Non-seasonal reference tables (draft picks, combine,
+> contracts, players) carry their full historical record.
 
 | Table | Loaded range |
 |---|---|
-| `plays` | 2013–present |
-| `schedules` | 2013–present |
-| `rosters` | 2013–present |
-| `player_stats` | 2013–present |
-| `team_stats_raw` | 2013–present |
-| `injuries` | 2013–present |
+| `rosters` | 1970–present (1920 with `--start 1920`) |
+| `plays` | 1999–present |
+| `schedules` | 1999–present |
+| `player_stats` | 1999–present |
+| `team_stats_raw` | 1999–present |
+| `depth_charts` | 2001–present |
+| `rosters_weekly` | 2002–present |
+| `ff_opportunity` | 2006–present |
+| `injuries` | 2009–present |
 | `snap_counts` | 2013–present |
-| `depth_charts` | 2013–present |
-| `rosters_weekly` | 2013–present |
-| `ff_opportunity` | 2013–present |
 | `officials` | 2015–present |
 | `nextgen_stats_*` | 2016–present |
-| `participation` | 2016–2024 |
+| `participation` | 2016–present |
 | `pfr_advstats_*` | 2018–present |
 | `ftn_charting` | 2022–present |
 | `teams` | current |
@@ -179,6 +227,12 @@ All data is sourced from [nflverse](https://github.com/nflverse/nflverse-data) v
 | `ff_playerids` | current |
 | `ff_rankings_draft` | current |
 | `ff_rankings_week` | current |
+
+> Older seasons are thinner than modern ones. Play-by-play carries `epa`, `wp`, and
+> `shotgun` from 1999, but tracking-derived data (Next Gen Stats, FTN charting), snap
+> counts, and weekly depth only exist from their respective start years above — so any
+> query that spans decades mixes eras of very different column coverage. Pre-1970 rosters
+> are available but cover the pre-merger leagues.
 
 ```bash
 nfl-mcp ingest                 # load the full nflverse family (default)
@@ -201,7 +255,7 @@ nfl-mcp ingest --dataset pbp   # load just one dataset
 | `nfl_roster` | Team roster by season and position |
 | `nfl_injuries` | Player injury report status by team, week, and designation |
 | `nfl_snap_counts` | Offensive, defensive, and special teams snap counts per player |
-| `nfl_fantasy_opportunity` | Target share, air yards share, carry share, and expected fantasy points per player per week (2013–present) |
+| `nfl_fantasy_opportunity` | Target share, air yards share, carry share, and expected fantasy points per player per week (2006–present) |
 | `nfl_fantasy_rankings` | Expert consensus rankings (ECR) — draft/dynasty/best-ball (`scope=draft`) or current-week start/sit (`scope=week`) |
 | `nfl_ftn_charting` | Aggregated FTN charting tendencies (2022–present) over scrimmage plays — play-action, RPO, screen, no-huddle, motion, trick-play rates, plus box/pass-rush/blitz counts |
 | `nfl_td_luck` | Actual vs expected touchdowns per player-season — surfaces TD-regression candidates (most "unlucky" first) |
@@ -241,7 +295,8 @@ pytest -m integration  # integration tests (requires loaded DB)
 - If tools return database errors, run `nfl-mcp ingest` to ensure data is loaded.
 - You can override the DB location with `NFL_MCP_DB_PATH=/path/to/nflread.duckdb`.
 - Re-running `nfl-mcp ingest` is safe — it skips completed seasons and re-fetches only the current season and static tables.
-- Stats for a game usually appear in nflverse within a few hours; play-by-play is rebuilt overnight and official stat corrections land midweek. Run `nfl-mcp ingest` (or wait for the container cron) after that.
+- Stats for a game usually appear in nflverse within a few hours; play-by-play is rebuilt overnight and official stat corrections land midweek. Locally, run `nfl-mcp ingest` after that; in the container, the scheduled updater does it (log: `/var/log/nflmcp/nfl_update.log`).
+- In the container, `nfl_status`'s `last_refreshed` shows which data the endpoint is serving. If it never advances, the updater is not running — check that `ENTRYPOINT` is `/entrypoint.sh` and that `/data/nflread.duckdb` is a symlink.
 
 ## License
 
