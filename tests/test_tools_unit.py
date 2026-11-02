@@ -279,28 +279,132 @@ def test_team_stats_uses_parameterized_team_and_season(monkeypatch):
     assert all(2024 in params for _, params in calls)
 
 
+def player_stats_column_rows(drop=()):
+    """Answer the tool's information_schema lookup with every player_stats column the tool
+    knows how to sum, less the ones this test wants missing."""
+    cols = {col for metrics in tools._PLAYER_STATS_METRICS.values()
+            for formula in metrics.values()
+            for col in tools._STAT_SOURCE_COLUMNS.findall(formula)}
+    return [{"column_name": col} for col in sorted(cols - set(drop))]
+
+
+def fake_player_stats_execute(calls, rows, *, drop=(), cpoe_rows=()):
+    """Record every query, answer the column lookup, hand back `rows` for the sum and
+    `cpoe_rows` for the one plays query."""
+    def _fake(sql, params=None):
+        calls.append((sql, params))
+        if "information_schema.columns" in sql:
+            return player_stats_column_rows(drop=drop)
+        return list(cpoe_rows) if "FROM plays" in sql else rows
+    return _fake
+
+
 def test_player_stats_filters_by_resolved_id(monkeypatch):
-    captured = {}
+    calls = []
 
-    def fake_execute(sql, params=None):
-        captured["sql"] = sql
-        captured["params"] = params
-        return []
-
-    monkeypatch.setattr(tools, "_execute", fake_execute)
+    monkeypatch.setattr(tools, "_execute", fake_player_stats_execute(calls, []))
     stub_resolver(monkeypatch)
     tools.nfl_player_stats(player_name="P.Mahomes", stat_type="passing", season_type="REG")
 
-    assert "passer_player_id = ?" in captured["sql"]
-    assert "ILIKE" not in captured["sql"]
-    assert captured["params"][0] == "00-0036322"
-    assert captured["params"][1] == "pass"
-    assert captured["params"][-1] == "REG"
-    assert "GROUP BY player_id, season, season_type" in captured["sql"]
+    assert "information_schema.columns" in calls[0][0]      # the column check runs first
+    sql, params = calls[1]                                   # the player_stats sum
+    assert "FROM player_stats" in sql
+    assert "play_type" not in sql                           # no play counting left in the sums
+    assert "player_id = ?" in sql
+    assert "ILIKE" not in sql
+    assert params[0] == "00-0036322"
+    assert params[-1] == "REG"
+    assert "GROUP BY player_id, season, season_type" in sql
+
+
+def test_player_stats_sums_every_metric_of_the_stat_type(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tools, "_execute", fake_player_stats_execute(calls, []))
+    stub_resolver(monkeypatch)
+    tools.nfl_player_stats(player_name="P.Mahomes", stat_type="passing")
+
+    sql = calls[1][0]
+    for key, formula in tools._PLAYER_STATS_METRICS["passing"].items():
+        assert f"{formula} AS {key}" in sql
+    assert "COUNT(*) AS attempts" not in sql               # sacks are no longer attempts
+
+
+def test_passing_avg_cpoe_asks_plays_for_the_callers_own_window(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tools, "_execute", fake_player_stats_execute(
+        calls, [{"season": 2024, "season_type": "REG", "attempts": 581}],
+        cpoe_rows=[{"season": 2024, "season_type": "REG", "avg_cpoe": 2.563, "cpoe_plays": 553}]))
+    stub_resolver(monkeypatch)
+    result = tools.nfl_player_stats(player_name="P.Mahomes", season_from=2020, season_to=2024,
+                                    season_type="REG", stat_type="passing")
+
+    cpoe_sql, cpoe_params = calls[-1]
+    assert "FROM plays" in cpoe_sql and "AVG(cpoe)" in cpoe_sql and "cpoe IS NOT NULL" in cpoe_sql
+    assert "passer_player_id = ?" in cpoe_sql and "postseason" not in cpoe_sql
+    assert all(clause in cpoe_sql for clause in ("season >= ?", "season <= ?", "season_type = ?"))
+    assert cpoe_params == calls[1][1]        # the same window as the summed row, exactly
+    assert (result["metric_sources"]["avg_cpoe"], result["metric_sources"]["cpoe_plays"]) == (
+        tools._CPOE_MEAN_SOURCE, tools._CPOE_COUNT_SOURCE)
+    assert (result["seasons"][0]["avg_cpoe"], result["seasons"][0]["cpoe_plays"]) == (2.563, 553)
+
+
+def test_player_stats_names_the_source_of_every_metric_it_returns(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tools, "_execute", fake_player_stats_execute(
+        calls, [{"player_id": "x", "season": 2024, "season_type": "REG", "carries": 58}]))
+    stub_resolver(monkeypatch)
+    result = tools.nfl_player_stats("P.Mahomes", season=2024, stat_type="rushing")
+
+    assert result["source"] == tools._PLAYER_STATS_SOURCE
+    assert result["unavailable"] == {}                     # this database has every column
+    assert len(calls) == 2 and "avg_cpoe" not in result["metric_sources"]  # no plays query
+    sql = calls[-1][0]
+    assert sql.count(" AS ") == len(result["metric_sources"])   # nothing asked for goes unnamed
+    assert all(f"{formula} AS {key}" in sql
+               for key, formula in result["metric_sources"].items())
+    assert all("player_stats." in src for src in result["metric_sources"].values())
+
+
+@pytest.mark.parametrize("dropped,missing", [
+    (["sack_yards_lost"], {"sack_yards", "net_yards", "net_yards_per_attempt"}),
+    (["sacks_suffered"], {"sacks", "sack_rate", "avg_epa", "net_yards_per_attempt"}),
+])
+def test_a_dropped_metric_is_named_with_the_column_it_misses(monkeypatch, dropped, missing):
+    calls = []
+    monkeypatch.setattr(tools, "_execute", fake_player_stats_execute(
+        calls, [{"season": 2024}], drop=dropped))
+    stub_resolver(monkeypatch)
+    result = tools.nfl_player_stats("P.Mahomes", stat_type="passing")
+
+    assert set(result["unavailable"]) == missing
+    assert all(result["unavailable"][key] == dropped for key in missing)
+    assert not set(result["metric_sources"]) & missing       # nothing kept that cannot be summed
+    assert all(col not in calls[1][0] for col in dropped)    # and never asked for
+
+
+def test_every_player_stat_metric_names_a_player_stats_column_and_divides_sums():
+    """Two rules hold for every metric of every stat type: the text names at least one real
+    player_stats column, and no weekly rate is averaged - a rate divides SUM() totals."""
+    for stat_type, metrics in tools._PLAYER_STATS_METRICS.items():
+        for key, formula in metrics.items():
+            assert tools._STAT_SOURCE_COLUMNS.findall(formula), f"{stat_type}.{key} names no column"
+            if "/" in formula:
+                assert "SUM(" in formula.split("/", 1)[1], f"{stat_type}.{key} divides by a raw column"
+    assert not [f for metrics in tools._PLAYER_STATS_METRICS.values() for f in metrics.values()
+                if "AVG(" in f]
+    assert not [f for metrics in tools._PLAYER_STATS_METRICS.values() for f in metrics.values()
+                if "COUNT(*)" in f]
+
+
+def test_player_stats_reports_a_table_with_none_of_its_columns(monkeypatch):
+    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [])
+    stub_resolver(monkeypatch)
+    assert "player_stats has none of the columns" in tools.nfl_player_stats("P.Mahomes")["error"]
 
 
 def test_player_stats_labels_rows_with_the_resolved_player(monkeypatch):
-    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [{"season": 2024}])
+    calls = []
+    monkeypatch.setattr(tools, "_execute", fake_player_stats_execute(calls, [{"season": 2024, "receptions": 8}]))
     stub_resolver(monkeypatch)
     result = tools.nfl_player_stats("Justin Jefferson", stat_type="receiving")
     assert result["player"]["label"] == "Justin Jefferson (WR, MIN)"
@@ -587,18 +691,15 @@ def test_team_stats_returns_error_on_timeout(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "stat_type,expected_play_type",
-    [("rushing", "run"), ("receiving", "pass")],
+    "stat_type,expected_sum",
+    [("rushing", "SUM(player_stats.carries) AS carries"),
+     ("receiving", "SUM(player_stats.targets) AS targets")],
 )
-def test_player_stats_other_stat_types(monkeypatch, stat_type, expected_play_type):
-    captured = {}
+def test_player_stats_other_stat_types(monkeypatch, stat_type, expected_sum):
+    calls = []
 
-    def fake_execute(sql, params=None):
-        captured["sql"] = sql
-        captured["params"] = params
-        return [{"season": 2024, "season_type": "REG"}]
-
-    monkeypatch.setattr(tools, "_execute", fake_execute)
+    monkeypatch.setattr(tools, "_execute", fake_player_stats_execute(
+        calls, [{"season": 2024, "season_type": "REG"}]))
     stub_resolver(monkeypatch)
     result = tools.nfl_player_stats(
         player_name="P.Mahomes",
@@ -607,9 +708,12 @@ def test_player_stats_other_stat_types(monkeypatch, stat_type, expected_play_typ
         season_to=2024,
     )
     assert result["stat_type"] == stat_type
-    assert captured["params"][1] == expected_play_type
-    assert "season >=" in captured["sql"]
-    assert "season <=" in captured["sql"]
+    assert expected_sum in calls[-1][0]
+    assert "player_id = ?" in calls[-1][0]
+    assert calls[-1][1][0] == "00-0036322"
+    assert "season >=" in calls[-1][0]
+    assert "season <=" in calls[-1][0]
+    assert 2020 in calls[-1][1] and 2024 in calls[-1][1]
 
 
 def test_player_stats_rejects_unknown_stat_type():
@@ -631,48 +735,83 @@ def test_player_stats_reports_failure_of_its_own_query(monkeypatch):
     assert tools.nfl_player_stats("P.Mahomes")["error"] == "stats timeout"
 
 
-def test_compare_player_path_only_includes_stats_with_attempts(monkeypatch):
+def test_only_a_non_zero_counting_stat_keeps_a_row(monkeypatch):
+    """Josh Allen 2024 REG receiving: 0 targets, 7 yards - a stat. Mahomes 2024 POST receiving:
+    3 games, nothing else, and Curtis Samuel's playoff row with only a derived epa figure are not.
+    Neither `games`, a rate, nor `epa` keeps a row."""
     calls = []
+    monkeypatch.setattr(tools, "_execute", fake_player_stats_execute(calls, [
+        {"season": 2024, "season_type": "REG", "targets": 0, "yards": 7, "catch_pct": 0.0},
+        {"season": 2024, "season_type": "POST", "games": 3, "targets": 0, "yards": 0},
+        {"season": 2024, "season_type": "OT", "games": 1, "targets": 0, "yards": 0, "epa": -0.947}]))
+    stub_resolver(monkeypatch)
+    result = tools.nfl_player_stats("Josh Allen", season=2024, stat_type="receiving")
+    assert [(row["season_type"], row["yards"]) for row in result["seasons"]] == [("REG", 7)]
 
-    def fake_execute(sql, params=None):
-        calls.append((sql, params))
-        if "COUNT(*) AS n" in sql and "passer_player_id" in sql:
-            return [{"n": 1}]
-        if "COUNT(*) AS n" in sql and "receiver_player_id" in sql:
-            return [{"n": 1}]
-        if "COUNT(*) AS n" in sql and "rusher_player_id" in sql:
-            return [{"n": 0}]
-        return []
 
-    monkeypatch.setattr(tools, "_execute", fake_execute)
+def test_the_keep_set_is_pinned_for_every_stat_type():
+    """`_counting_keys` reads the formula text, so a formula rewritten with a space, a COALESCE or
+    a ROUND would leave this set in silence and hide a row holding only that stat. These are the
+    keys, in metric-map order; change them on purpose, never by accident."""
+    assert {s: tools._counting_keys(m) for s, m in tools._PLAYER_STATS_METRICS.items()} == {
+        "passing": ["attempts", "completions", "yards", "touchdowns", "interceptions", "sacks", "sack_yards", "air_yards", "yards_after_catch", "first_downs", "pass_10_plus", "pass_20_plus", "pass_40_plus", "two_point_conversions"],
+        "rushing": ["carries", "yards", "touchdowns", "fumbles", "fumbles_lost", "first_downs", "rush_10_plus", "rush_20_plus", "rush_40_plus", "two_point_conversions"],
+        "receiving": ["targets", "receptions", "yards", "touchdowns", "yards_after_catch", "air_yards", "fumbles", "fumbles_lost", "first_downs", "rec_10_plus", "rec_20_plus", "rec_40_plus", "two_point_conversions"],
+    }
+
+
+def test_compare_player_blocks_come_from_one_stats_call_per_stat_type(monkeypatch):
+    stats_calls = []
+
+    def fake_player_stats(**kwargs):
+        stats_calls.append(kwargs)
+        stype = kwargs["stat_type"]
+        first = tools._counting_keys(tools._PLAYER_STATS_METRICS[stype])[0]
+        rows = [] if stype == "rushing" else [{first: 5}]   # no rows back, no block
+        return {"seasons": rows, "metric_sources": {first: f"SUM(player_stats.{first})"}}
+
+    monkeypatch.setattr(tools, "_execute", lambda *a, **k: pytest.fail(
+        "nfl_compare must not count plays for itself any more"))
     monkeypatch.setattr(
         tools,
         "nfl_resolve_player",
         lambda name, **kwargs: {"resolved": {"gsis_id": f"id-{name}", "label": name}},
     )
-    monkeypatch.setattr(
-        tools,
-        "nfl_player_stats",
-        lambda **kwargs: {"seasons": [{"player_id": kwargs["player_id"]}]},
-    )
+    monkeypatch.setattr(tools, "nfl_player_stats", fake_player_stats)
     result = tools.nfl_compare(
         entity1="P.Mahomes",
         entity2="J.Allen",
         compare_type="player",
-        season_from=2020,
-        season_to=2024,
+        season=2024,
         season_type="REG",
     )
     sides = result["players"]
     assert [s["requested"] for s in sides] == ["P.Mahomes", "J.Allen"]
-    assert "passing" in sides[0]
-    assert "receiving" in sides[0]
-    assert "rushing" not in sides[0]
-    assert "season_type = ?" in calls[0][0]
+    assert "passing" in sides[0] and "receiving" in sides[0]
+    assert "rushing" not in sides[0]                  # no rows back from nfl_player_stats, no block
+    assert sides[0]["source"] == tools._PLAYER_STATS_SOURCE
+    assert sides[0]["metric_sources"]["passing"] == {"attempts": "SUM(player_stats.attempts)"}
+    assert [c["season_type"] for c in stats_calls] == ["REG"] * 6   # never mixed, never dropped
+    assert [c["stat_type"] for c in stats_calls] == [
+        "passing", "rushing", "receiving"] * 2
+    assert {c["player_id"] for c in stats_calls} == {"id-P.Mahomes", "id-J.Allen"}
+    assert all("season" in c and c["season"] == 2024 for c in stats_calls)
+
+
+def test_compare_player_reports_a_stats_error_instead_of_an_empty_side(monkeypatch):
+    monkeypatch.setattr(
+        tools, "nfl_resolve_player",
+        lambda name, **kwargs: {"resolved": {"gsis_id": f"id-{name}", "label": name}},
+    )
+    monkeypatch.setattr(tools, "nfl_player_stats", lambda **kwargs: {"error": "stats unavailable"})
+    assert tools.nfl_compare("A", "B", compare_type="player") == {"error": "stats unavailable"}
 
 
 def test_compare_player_reports_the_resolver_result_per_entity(monkeypatch):
-    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [])
+    monkeypatch.setattr(
+        tools, "_execute",
+        lambda sql, params=None: player_stats_column_rows() if "information_schema" in sql else [],
+    )
     monkeypatch.setattr(
         tools,
         "nfl_resolve_player",
@@ -684,6 +823,7 @@ def test_compare_player_reports_the_resolver_result_per_entity(monkeypatch):
     result = tools.nfl_compare("Justin Jefferson", "Travis Kelce", compare_type="player")
     assert [(s["requested"], "ambiguous" in s, s.get("player", {}).get("gsis_id"))
             for s in result["players"]] == [("Justin Jefferson", True, None), ("Travis Kelce", False, "B")]
+    assert "source" not in result["players"][1]      # a side with no stats claims no source
 
 
 def test_compare_player_keeps_both_sides_when_the_names_are_identical(monkeypatch):
@@ -701,6 +841,7 @@ def test_compare_player_keeps_both_sides_when_the_names_are_identical(monkeypatc
     )
     assert [s["player"]["gsis_id"] for s in result["players"]] == ["00-0036322", "00-0041075"]
     assert all(s["requested"] == "Justin Jefferson" for s in result["players"])
+    assert all("source" not in s and "metric_sources" not in s for s in result["players"])
 
 
 def test_compare_rejects_unknown_type():

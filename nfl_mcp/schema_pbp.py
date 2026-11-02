@@ -31,6 +31,8 @@ Aggregate tables (faster for team-level queries):
   team_defense_stats  (team, season_year, yards_allowed, sacks, turnovers_forced, avg_epa_allowed, ...)
   situational_stats   (team, season_year, situation, plays, avg_epa, conversion_pct)
   formation_effectiveness (team, season_year, formation, play_type, avg_epa, ...)
+  player_stats        (player_id, season, season_type, week, attempts, carries, targets, ...) —
+                      official counting stats per player per game, what nfl_player_stats sums
   team_records        (season, team, source_team, games, wins, losses, ties, source) — final
                       regular-season record per franchise, 1970+ (1970-1998 needs the optional
                       'nfl-mcp ingest --pre1999'). `team` is the CURRENT abbreviation, so the
@@ -436,6 +438,27 @@ AGGREGATE TABLES  (pre-aggregated, much faster for team/season queries)
   formation_effectiveness
     (team, season_year, formation, play_type, plays, avg_yards, touchdowns, turnovers, avg_epa)
     -- formation values: 'SHOTGUN','UNDER CENTER','NO HUDDLE','SHOTGUN NO HUDDLE'
+
+  player_stats  (player_id, player_name, season, season_type, week, game_id, team, opponent_team)
+    -- nflreadpy's week-level stat table, one row per player per game: the official counting
+    -- stats, which is what nfl_player_stats sums per season and season_type.
+    -- passing: attempts, completions, passing_yards (gross), passing_tds, passing_interceptions,
+    --          sacks_suffered, sack_yards_lost (negative), passing_air_yards,
+    --          passing_yards_after_catch, passing_first_downs, passing_10 / _20 / _40
+    -- rushing: carries, rushing_yards, rushing_tds, rushing_fumbles, rushing_fumbles_lost,
+    --          rushing_first_downs, rushing_10 / _20 / _40
+    -- receiving: targets, receptions, receiving_yards, receiving_tds, receiving_fumbles,
+    --          receiving_fumbles_lost, receiving_yards_after_catch, receiving_air_yards,
+    --          receiving_first_downs, receiving_10 / _20 / _40
+    -- a sack is in NEITHER attempts NOR carries (sacks_suffered carries it and sack_yards_lost
+    --          its negative yardage); a kneel IS a carry; a spike IS a pass attempt; a two-point
+    --          play is in neither, and its conversions are passing_2pt_conversions /
+    --          rushing_2pt_conversions / receiving_2pt_conversions
+    -- team_stats_raw classifies the same way, so a team's attempts counts its spikes too
+    -- passing_epa, rushing_epa and receiving_epa are weekly TOTALS and include two-point plays,
+    --          which attempts, carries and targets do not, so avg_epa's top line counts plays its
+    --          bottom line leaves out; passing_cpoe is that week's MEAN and the table records no
+    --          play count for it, so nfl_player_stats takes the season mean from plays.cpoe
 """,
     "query_tips": """
 QUERY TIPS
@@ -443,6 +466,8 @@ QUERY TIPS
   • play_type is lowercase: 'pass', 'run', 'field_goal' — not uppercase
   • Player names are abbreviated: 'P.Mahomes', 'T.Hill', 'D.Henry', 'J.Jefferson'
   • Use aggregate tables for season-level team stats (much faster than raw plays)
+  • For a player's season stats, sum the player_stats columns above; counting plays rows is
+    wrong because it makes a sack a pass attempt and drops a qb_kneel from a QB's carries
   • Use plays table directly for play-level filtering or custom aggregations
   • Use ILIKE '%keyword%' for text search in the desc column
   • Exclude non-play rows: WHERE play_type NOT IN ('no_play','qb_spike','qb_kneel')

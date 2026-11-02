@@ -1,6 +1,7 @@
 """Tests for server error payload formatting."""
 
 import asyncio
+import inspect
 import json
 
 from mcp.types import ListToolsRequest
@@ -129,6 +130,24 @@ def test_create_app_lifespan_runs(monkeypatch):
 def test_team_records_is_exposed_with_its_arguments():
     tool = next(tool for tool in server_module.TOOLS if tool.name == "nfl_team_records")
     assert set(tool.inputSchema["properties"]) == {"team", "season", "from_season", "to_season"}
+
+
+def test_player_stats_schema_lists_exactly_the_arguments_the_function_takes():
+    """A parameter added to the tool without its TOOLS entry is invisible to the client."""
+    tool = next(tool for tool in server_module.TOOLS if tool.name == "nfl_player_stats")
+    assert set(tool.inputSchema["properties"]) == set(
+        inspect.signature(server_module.nfl_player_stats).parameters)
+
+
+def test_player_stat_tools_name_the_table_the_numbers_come_from():
+    """Group B rule: the text the model reads says where a metric comes from."""
+    described = {tool.name: tool.description for tool in server_module.TOOLS
+                 if tool.name in ("nfl_player_stats", "nfl_compare")}
+    assert set(described) == {"nfl_player_stats", "nfl_compare"}
+    for name, text in described.items():
+        assert "player_stats" in text, name
+        assert "season_type" in text, name
+    assert "sack" in described["nfl_player_stats"]      # the definition the old count got wrong
 
 
 def test_call_tool_dispatches_team_records(monkeypatch):

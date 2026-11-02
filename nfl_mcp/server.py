@@ -226,9 +226,19 @@ TOOLS = [
     Tool(
         name="nfl_player_stats",
         description=(
-            "PREFERRED for any player stats question. Returns season-by-season "
-            "aggregates for passing, rushing, or receiving. Always use this instead "
-            "of nfl_query for questions about a player's performance, stats, or trends."
+            "PREFERRED for any player stats question. Returns one player's official season "
+            "counting stats - the numbers ESPN and Pro Football Reference show - summed from "
+            "the week-level player_stats table, one row per season and season_type. A sack is "
+            "in neither attempts nor carries, a kneel is a carry, a spike is a pass attempt, "
+            "and a two-point play is in neither. Passing yards are gross and sack_yards is "
+            "negative, so net_yards is their sum. Every rate divides summed totals, and "
+            "metric_sources names the table and column behind every metric; avg_cpoe is the "
+            "mean of plays.cpoe over the plays that carry a value, because player_stats stores "
+            "only a weekly mean. `unavailable` lists metrics this database cannot provide, and "
+            "a rate with a zero denominator is null. avg_epa divides an EPA total that counts "
+            "two-point plays by attempts plus sacks, carries or targets, which do not. A season "
+            "whose counting stats are all zero is left out, and nfl_compare shows the same rows. "
+            "Always use this instead of nfl_query for a player's performance or stats."
         ),
         inputSchema={
             "type": "object",
@@ -256,7 +266,7 @@ TOOLS = [
                 "season_type": {
                     "type": "string",
                     "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs)",
+                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Rows are grouped per season type either way, so omitting it does not add the two together.",
                 },
                 "stat_type": {
                     "type": "string",
@@ -276,8 +286,11 @@ TOOLS = [
             "rank, or contrast two teams or two players against each other. Team mode "
             "returns one entry per abbreviation; player mode returns {'players': [side1, "
             "side2]} in the order requested, each side carrying 'requested' plus 'player' "
-            "with its gsis_id. Two players who share a name are two separate sides, and a "
-            "side whose name matches several players returns 'candidates' instead of stats."
+            "with its gsis_id. Each player stat block is nfl_player_stats' rows, summed from "
+            "the week-level player_stats table per season and season_type, and each side names "
+            "those columns in 'metric_sources'. Two players who share a name are two separate "
+            "sides, and a side whose name matches several players returns 'candidates' instead "
+            "of stats."
         ),
         inputSchema={
             "type": "object",
@@ -319,7 +332,7 @@ TOOLS = [
                 "season_type": {
                     "type": "string",
                     "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs)",
+                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Player mode applies it and keeps the two season types in separate rows; team mode ignores it.",
                 },
             },
             "required": ["entity1", "entity2"],

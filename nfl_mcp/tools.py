@@ -5,7 +5,7 @@ NFL MCP Server tools:
   nfl_query         → read-only SELECT with safety guardrails
   nfl_search_plays  → structured play search
   nfl_team_stats    → pre-aggregated team stats
-  nfl_player_stats  → player stats by season
+  nfl_player_stats  → official season counting stats, summed from the week-level player_stats table
   nfl_compare       → side-by-side comparison
 """
 
@@ -723,6 +723,150 @@ def nfl_team_stats(
         return {"error": str(e)}
 
 
+# ── Official player counting stats ─────────────────────────────────────────────
+#
+# nfl_player_stats sums the week-level `player_stats` table (registry.py loads it with
+# nflreadpy's load_player_stats, one row per player per game) instead of counting `plays`
+# rows, because nflverse already applies the official definitions a play count gets wrong:
+#   - a sack is in neither `attempts` nor `carries`: `sacks_suffered` carries it and
+#     `sack_yards_lost` its negative yardage
+#   - a kneel is a carry, a scramble is a rush, a spike IS a pass attempt, and a two-point
+#     play is in neither `attempts` nor `carries` (Mahomes 2024: 619 plays rows carry
+#     pass_attempt = 1, and 581 = 619 less his 36 sacks less his 2 two-point plays, with his
+#     2 spikes inside the 581; team_stats_raw counts spikes the same way)
+# Counting `plays` rows with play_type = 'pass' handed Patrick Mahomes 617 attempts in 2024
+# where the official count is 581 (his 36 sacks), and counting play_type = 'run' handed him
+# 38 carries where the official count is 58 (his 20 kneels).
+#
+# Every value below is one SQL expression over the week rows, written against the qualified
+# column name - valid for the single table in its FROM clause - and the same string is what
+# the tool returns in `metric_sources`. The response therefore names the table and column of
+# every metric, and the text cannot drift from the query. The grouping keys (player_id,
+# season, season_type) are not metrics and carry no source.
+#
+# Every rate divides summed totals; no weekly rate is averaged. `avg_cpoe` is the one metric
+# that does not come from this table: `player_stats.passing_cpoe` is a weekly mean and the
+# table does not record how many plays carry a cpoe value, so there is no sound weight for
+# it. The season mean is read from `plays.cpoe` over the caller's own window instead.
+
+_STAT_SOURCE_COLUMNS = re.compile(r"player_stats\.([a-z0-9_]+)")
+
+_PLAYER_STATS_SOURCE = (
+    "player_stats (week level, one row per player per game), summed per season and season_type"
+)
+
+# The one metric player_stats cannot give, and the count of plays it covers, so a caller can
+# see the window it was taken over.
+_CPOE_MEAN_SOURCE = (
+    "AVG(plays.cpoe) over the plays that carry a value, by plays.passer_player_id, over the "
+    "same season and season_type window as the rest of the row"
+)
+_CPOE_COUNT_SOURCE = (
+    "COUNT(plays.cpoe), the number of plays that carry a value behind avg_cpoe"
+)
+
+_PLAYER_STATS_METRICS: dict[str, dict[str, str]] = {
+    "passing": {
+        "games": "COUNT(DISTINCT player_stats.game_id)",
+        "attempts": "SUM(player_stats.attempts)",
+        "completions": "SUM(player_stats.completions)",
+        "comp_pct": ("ROUND(100.0 * SUM(player_stats.completions)"
+                     " / NULLIF(SUM(player_stats.attempts), 0), 1)"),
+        "yards": "SUM(player_stats.passing_yards)",
+        "touchdowns": "SUM(player_stats.passing_tds)",
+        "interceptions": "SUM(player_stats.passing_interceptions)",
+        "td_pct": ("ROUND(100.0 * SUM(player_stats.passing_tds)"
+                   " / NULLIF(SUM(player_stats.attempts), 0), 1)"),
+        "int_pct": ("ROUND(100.0 * SUM(player_stats.passing_interceptions)"
+                    " / NULLIF(SUM(player_stats.attempts), 0), 1)"),
+        "sacks": "SUM(player_stats.sacks_suffered)",
+        "sack_yards": "SUM(player_stats.sack_yards_lost)",
+        "sack_rate": ("ROUND(SUM(player_stats.sacks_suffered)"
+                      " / NULLIF(SUM(player_stats.attempts) + SUM(player_stats.sacks_suffered), 0), 3)"),
+        "yards_per_attempt": ("ROUND(SUM(player_stats.passing_yards)"
+                              " / NULLIF(SUM(player_stats.attempts), 0), 1)"),
+        "net_yards": "SUM(player_stats.passing_yards) + SUM(player_stats.sack_yards_lost)",
+        "net_yards_per_attempt": (
+            "ROUND((SUM(player_stats.passing_yards) + SUM(player_stats.sack_yards_lost))"
+            " / NULLIF(SUM(player_stats.attempts) + SUM(player_stats.sacks_suffered), 0), 1)"),
+        "air_yards": "SUM(player_stats.passing_air_yards)",
+        "avg_air_yards": ("ROUND(SUM(player_stats.passing_air_yards)"
+                          " / NULLIF(SUM(player_stats.attempts), 0), 1)"),
+        "yards_after_catch": "SUM(player_stats.passing_yards_after_catch)",
+        "first_downs": "SUM(player_stats.passing_first_downs)",
+        "pass_10_plus": "SUM(player_stats.passing_10)",
+        "pass_20_plus": "SUM(player_stats.passing_20)",
+        "pass_40_plus": "SUM(player_stats.passing_40)",
+        "two_point_conversions": "SUM(player_stats.passing_2pt_conversions)",
+        "epa": "SUM(player_stats.passing_epa)",
+        "avg_epa": ("ROUND(SUM(player_stats.passing_epa)"
+                    " / NULLIF(SUM(player_stats.attempts) + SUM(player_stats.sacks_suffered), 0), 3)"),
+    },
+    "rushing": {
+        "games": "COUNT(DISTINCT player_stats.game_id)",
+        "carries": "SUM(player_stats.carries)",
+        "yards": "SUM(player_stats.rushing_yards)",
+        "yards_per_carry": ("ROUND(SUM(player_stats.rushing_yards)"
+                            " / NULLIF(SUM(player_stats.carries), 0), 1)"),
+        "touchdowns": "SUM(player_stats.rushing_tds)",
+        "fumbles": "SUM(player_stats.rushing_fumbles)",
+        "fumbles_lost": "SUM(player_stats.rushing_fumbles_lost)",
+        "first_downs": "SUM(player_stats.rushing_first_downs)",
+        "rush_10_plus": "SUM(player_stats.rushing_10)",
+        "rush_20_plus": "SUM(player_stats.rushing_20)",
+        "rush_40_plus": "SUM(player_stats.rushing_40)",
+        "two_point_conversions": "SUM(player_stats.rushing_2pt_conversions)",
+        "epa": "SUM(player_stats.rushing_epa)",
+        "avg_epa": ("ROUND(SUM(player_stats.rushing_epa)"
+                    " / NULLIF(SUM(player_stats.carries), 0), 3)"),
+    },
+    "receiving": {
+        "games": "COUNT(DISTINCT player_stats.game_id)",
+        "targets": "SUM(player_stats.targets)",
+        "receptions": "SUM(player_stats.receptions)",
+        "catch_pct": ("ROUND(100.0 * SUM(player_stats.receptions)"
+                      " / NULLIF(SUM(player_stats.targets), 0), 1)"),
+        "yards": "SUM(player_stats.receiving_yards)",
+        "touchdowns": "SUM(player_stats.receiving_tds)",
+        "yards_per_reception": ("ROUND(SUM(player_stats.receiving_yards)"
+                                " / NULLIF(SUM(player_stats.receptions), 0), 1)"),
+        "yards_per_target": ("ROUND(SUM(player_stats.receiving_yards)"
+                             " / NULLIF(SUM(player_stats.targets), 0), 1)"),
+        "yards_after_catch": "SUM(player_stats.receiving_yards_after_catch)",
+        "avg_yac": ("ROUND(SUM(player_stats.receiving_yards_after_catch)"
+                     " / NULLIF(SUM(player_stats.receptions), 0), 1)"),
+        "air_yards": "SUM(player_stats.receiving_air_yards)",
+        "avg_air_yards": ("ROUND(SUM(player_stats.receiving_air_yards)"
+                          " / NULLIF(SUM(player_stats.targets), 0), 1)"),
+        "fumbles": "SUM(player_stats.receiving_fumbles)",
+        "fumbles_lost": "SUM(player_stats.receiving_fumbles_lost)",
+        "first_downs": "SUM(player_stats.receiving_first_downs)",
+        "rec_10_plus": "SUM(player_stats.receiving_10)",
+        "rec_20_plus": "SUM(player_stats.receiving_20)",
+        "rec_40_plus": "SUM(player_stats.receiving_40)",
+        "two_point_conversions": "SUM(player_stats.receiving_2pt_conversions)",
+        "epa": "SUM(player_stats.receiving_epa)",
+        "avg_epa": ("ROUND(SUM(player_stats.receiving_epa)"
+                    " / NULLIF(SUM(player_stats.targets), 0), 3)"),
+    },
+}
+
+# A season row is real when at least one official counting stat in it is non-zero: they do not move
+# together, so one column cannot decide. Josh Allen 2024 REG receiving has 0 targets, 7 yards and a
+# touchdown. A counting stat sums a player_stats column as it is - not a rate, not `games`, which a
+# kneel-only roster spot has too (Mahomes 2024 POST receiving: 3 games, all zero), and not `epa`:
+# every row `epa` alone keeps alive here is one failed two-point try, which sits outside attempts,
+# carries and targets by design. nfl_player_stats drops those rows; nfl_compare gets them from it.
+_PLAYER_STATS_COUNTING_METRIC = re.compile(r"^SUM\(player_stats\.[a-z0-9_]+\)$")
+
+
+def _counting_keys(metrics: dict[str, str]) -> list[str]:
+    """The official metrics that sum a player_stats column as it is: the ones that say a play of
+    this kind happened. `epa` is derived, so it keeps no row."""
+    return [key for key, formula in metrics.items()
+            if _PLAYER_STATS_COUNTING_METRIC.match(formula) and key != "epa"]
+
+
 def nfl_player_stats(
     player_name: str | None = None,
     player_id: str | None = None,
@@ -732,8 +876,12 @@ def nfl_player_stats(
     season_type: str | None = None,
     stat_type: str = "passing",
 ) -> Dict[str, Any]:
-    """Aggregate one player's stats by season, filtered and grouped by gsis_id."""
-    if stat_type not in ("passing", "rushing", "receiving"):
+    """Official season counting stats for one player, summed from the week-level player_stats
+    table by the resolved gsis_id. Returns one row per season and season_type, dropping a season
+    whose counting stats are all zero, names the column behind every metric in `metric_sources`,
+    and lists metrics this database cannot provide in `unavailable`. Only `avg_cpoe` and the play
+    count behind it come from plays."""
+    if stat_type not in _PLAYER_STATS_METRICS:
         return {"error": f"Unknown stat_type: {stat_type}. Use 'passing', 'rushing', or 'receiving'."}
 
     res = _player_filter(player=player_name, player_id=player_id, season=season,
@@ -741,71 +889,66 @@ def nfl_player_stats(
     if "identity" not in res:
         return res
     identity = res["identity"]
-    gsis_id = identity["gsis_id"]
-    params: list[Any] = []
-
-    if stat_type == "passing":
-        sql = """
-            SELECT passer_player_id AS player_id, season, season_type, COUNT(*) AS attempts,
-                SUM(CASE WHEN complete_pass = 1 THEN 1 ELSE 0 END) AS completions,
-                ROUND(100.0 * SUM(CASE WHEN complete_pass = 1 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS comp_pct,
-                SUM(COALESCE(passing_yards, 0)) AS yards,
-                SUM(CASE WHEN pass_touchdown = 1 THEN 1 ELSE 0 END) AS touchdowns,
-                SUM(CASE WHEN interception = 1 THEN 1 ELSE 0 END) AS interceptions,
-                ROUND(AVG(epa), 3) AS avg_epa,
-                ROUND(AVG(cpoe), 3) AS avg_cpoe,
-                SUM(COALESCE(air_yards, 0)) AS air_yards,
-                ROUND(AVG(air_yards), 1) AS avg_air_yards
-            FROM plays
-            WHERE passer_player_id = ? AND play_type = ?
-        """
-        params.extend([gsis_id, "pass"])
-    elif stat_type == "rushing":
-        sql = """
-            SELECT rusher_player_id AS player_id, season, season_type, COUNT(*) AS carries,
-                SUM(COALESCE(rushing_yards, 0)) AS yards,
-                ROUND(AVG(yards_gained), 1) AS yards_per_carry,
-                SUM(CASE WHEN rush_touchdown = 1 THEN 1 ELSE 0 END) AS touchdowns,
-                SUM(CASE WHEN fumble_lost = 1 THEN 1 ELSE 0 END) AS fumbles_lost,
-                ROUND(AVG(epa), 3) AS avg_epa,
-                SUM(CASE WHEN yards_gained >= 10 THEN 1 ELSE 0 END) AS explosive_runs
-            FROM plays
-            WHERE rusher_player_id = ? AND play_type = ?
-        """
-        params.extend([gsis_id, "run"])
-    else:
-        sql = """
-            SELECT receiver_player_id AS player_id, season, season_type, COUNT(*) AS targets,
-                SUM(CASE WHEN complete_pass = 1 THEN 1 ELSE 0 END) AS receptions,
-                SUM(COALESCE(receiving_yards, 0)) AS yards,
-                ROUND(AVG(yards_after_catch), 1) AS avg_yac,
-                SUM(CASE WHEN pass_touchdown = 1 THEN 1 ELSE 0 END) AS touchdowns,
-                ROUND(AVG(epa), 3) AS avg_epa,
-                SUM(CASE WHEN yards_gained >= 20 THEN 1 ELSE 0 END) AS explosive_plays
-            FROM plays
-            WHERE receiver_player_id = ? AND play_type = ?
-        """
-        params.extend([gsis_id, "pass"])
-
-    if season:
-        sql += " AND season = ?"
-        params.append(int(season))
-    if season_from:
-        sql += " AND season >= ?"
-        params.append(int(season_from))
-    if season_to:
-        sql += " AND season <= ?"
-        params.append(int(season_to))
-    if season_type:
-        sql += " AND season_type = ?"
-        params.append(season_type)
-    sql += " GROUP BY player_id, season, season_type ORDER BY season, season_type"
 
     try:
-        rows = _execute(sql, params)
+        # nflverse renamed columns across versions, so ask this database what it has and keep
+        # the metrics whose columns are there, instead of failing the whole call on one rename.
+        have = {str(row.get("column_name")) for row in _execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'player_stats'")}
+        metrics = {key: formula for key, formula in _PLAYER_STATS_METRICS[stat_type].items()
+                   if all(col in have for col in _STAT_SOURCE_COLUMNS.findall(formula))}
+        if not metrics:
+            return {"error": f"player_stats has none of the columns behind {stat_type} stats."}
+        unavailable = {key: sorted({col for col in _STAT_SOURCE_COLUMNS.findall(formula)} - have)
+                       for key, formula in _PLAYER_STATS_METRICS[stat_type].items()
+                       if key not in metrics}
+        sources = dict(metrics)
+
+        window = ""
+        params: list[Any] = [identity["gsis_id"]]
+        if season:
+            window += " AND season = ?"
+            params.append(int(season))
+        if season_from:
+            window += " AND season >= ?"
+            params.append(int(season_from))
+        if season_to:
+            window += " AND season <= ?"
+            params.append(int(season_to))
+        if season_type:
+            window += " AND season_type = ?"
+            params.append(season_type)
+
+        sql = ("SELECT player_id, season, season_type, "
+               + ", ".join(f"{formula} AS {key}" for key, formula in metrics.items())
+               + " FROM player_stats WHERE player_id = ?" + window
+               + " GROUP BY player_id, season, season_type ORDER BY season, season_type")
+
+        counting = _counting_keys(metrics)
+        rows = [row for row in _execute(sql, params) if any(row.get(key) for key in counting)]
+        if stat_type == "passing":
+            # The same window, so this metric cannot quietly cover a different span than the
+            # row it sits on. plays carries season_type here, so filter on it, not postseason.
+            sources["avg_cpoe"] = _CPOE_MEAN_SOURCE
+            sources["cpoe_plays"] = _CPOE_COUNT_SOURCE
+            by_window = {(row.get("season"), row.get("season_type")): row for row in _execute(
+                "SELECT season, season_type, ROUND(AVG(cpoe), 3) AS avg_cpoe, COUNT(cpoe) AS cpoe_plays"
+                " FROM plays WHERE passer_player_id = ? AND cpoe IS NOT NULL" + window
+                + " GROUP BY season, season_type", params)}
+            for row in rows:
+                got = by_window.get((row.get("season"), row.get("season_type")), {})
+                row["avg_cpoe"] = got.get("avg_cpoe")
+                row["cpoe_plays"] = got.get("cpoe_plays", 0)
         for row in rows:
             row["label"] = identity["label"]
-        return {"player": identity, "stat_type": stat_type, "seasons": rows}
+        return {
+            "player": identity,
+            "stat_type": stat_type,
+            "source": _PLAYER_STATS_SOURCE,
+            "metric_sources": sources,
+            "unavailable": unavailable,
+            "seasons": rows,
+        }
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -829,7 +972,9 @@ def nfl_compare(
     players who share a name (the two Justin Jeffersons) stay two entries. Each side
     carries 'requested' (the text typed) and 'player' with its gsis_id plus the stat
     blocks; a side the name cannot settle carries the resolver's ambiguous or not_found
-    answer in place of 'player'.
+    answer in place of 'player'. Each stat block is nfl_player_stats' rows, summed from the
+    week-level player_stats table per season and season_type, with 'metric_sources' naming
+    the player_stats column behind every metric on that side.
     """
     e1, e2 = entity1, entity2
 
@@ -871,21 +1016,6 @@ def nfl_compare(
             }
 
         elif compare_type == "player":
-            season_filter = ""
-            season_params: list[Any] = []
-            if season:
-                season_filter += " AND season = ?"
-                season_params.append(int(season))
-            if season_from:
-                season_filter += " AND season >= ?"
-                season_params.append(int(season_from))
-            if season_to:
-                season_filter += " AND season <= ?"
-                season_params.append(int(season_to))
-            if season_type:
-                season_filter += " AND season_type = ?"
-                season_params.append(season_type)
-
             sides: list[dict[str, Any]] = []
             for name, pid, requested in [
                 (e1, player_id1, entity1), (e2, player_id2, entity2)
@@ -898,26 +1028,24 @@ def nfl_compare(
                     continue
                 identity = res["identity"]
                 stats: dict[str, Any] = {"requested": requested, "player": identity}
-                for stype, col, ptype in [
-                    ("passing", "passer_player_id", "pass"),
-                    ("rushing", "rusher_player_id", "run"),
-                    ("receiving", "receiver_player_id", "pass"),
-                ]:
-                    count_sql = (
-                        f"SELECT COUNT(*) AS n FROM plays "
-                        f"WHERE {col} = ? AND play_type = ?{season_filter}"
+                sources: dict[str, Any] = {}
+                for stype in ("passing", "rushing", "receiving"):
+                    # One nfl_player_stats call per stat type, so the sums and the row rule read
+                    # the same player_stats rows. The emptiness test this replaced counted plays
+                    # rows instead, and a block with no rows left is dropped here.
+                    player_result = nfl_player_stats(
+                        player_id=identity["gsis_id"], season=season,
+                        season_from=season_from, season_to=season_to,
+                        season_type=season_type, stat_type=stype,
                     )
-                    count_row = _execute(
-                        count_sql, [identity["gsis_id"], ptype, *season_params]
-                    )
-                    if count_row and count_row[0].get("n", 0) > 0:
-                        player_result = nfl_player_stats(
-                            player_id=identity["gsis_id"], season=season,
-                            season_from=season_from, season_to=season_to,
-                            season_type=season_type, stat_type=stype,
-                        )
-                        if "seasons" in player_result:
-                            stats[stype] = player_result["seasons"]
+                    if "error" in player_result:
+                        return {"error": player_result["error"]}
+                    if player_result["seasons"]:
+                        stats[stype] = player_result["seasons"]
+                        sources[stype] = player_result["metric_sources"]
+                if sources:
+                    stats["source"] = _PLAYER_STATS_SOURCE
+                    stats["metric_sources"] = sources
                 sides.append(stats)
 
             return {"players": sides}

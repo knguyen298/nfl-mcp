@@ -3,6 +3,7 @@
 import pytest
 import duckdb
 from unittest.mock import patch
+from nfl_mcp import tools
 from nfl_mcp.tools import (
     nfl_schema, nfl_status, nfl_search_plays, nfl_team_stats,
     nfl_player_stats, nfl_compare, nfl_query,
@@ -174,6 +175,24 @@ class TestNflTeamStats:
 @pytest.mark.integration
 @pytest.mark.usefixtures("require_db")
 class TestNflPlayerStats:
+    """The numbers must be nflverse's official counting stats, read from the week-level
+    `player_stats` table and summed per season, not counts of `plays` rows."""
+
+    MAHOMES = "00-0033873"
+    JEFFERSON = "00-0036322"
+    HENRY = "00-0032764"
+
+    @staticmethod
+    def player_stats_totals(player_id, columns, season=None, season_type=None):
+        """Ground truth: the same columns summed straight out of player_stats."""
+        where = f"player_id = '{player_id}'"
+        if season:
+            where += f" AND season = {int(season)}"
+        if season_type:
+            where += f" AND season_type = '{season_type}'"
+        select = ", ".join(f"COALESCE(SUM({col}), 0) AS {col}" for col in columns)
+        return nfl_query(f"SELECT {select} FROM player_stats WHERE {where}")["rows"][0]
+
     def test_passing_stats(self):
         result = nfl_player_stats(player_name="P.Mahomes", stat_type="passing")
         assert "error" not in result
@@ -183,16 +202,188 @@ class TestNflPlayerStats:
         assert "completions" in season
         assert "avg_epa" in season
 
-    def test_rushing_stats(self):
-        result = nfl_player_stats(player_name="D.Henry", stat_type="rushing", season=2024)
-        assert "error" not in result
-        assert len(result["seasons"]) > 0
-        assert "carries" in result["seasons"][0]
+    def test_passing_counts_match_player_stats_for_a_qb_with_many_sacks(self):
+        """Mahomes 2024: counting pass plays gave 617 attempts, his official count is 581."""
+        result = nfl_player_stats(player_name="Patrick Mahomes", season=2024, season_type="REG",
+                                  stat_type="passing")
+        season = result["seasons"][0]
+        expected = self.player_stats_totals(
+            self.MAHOMES,
+            ["attempts", "completions", "passing_yards", "passing_tds", "passing_interceptions",
+             "sacks_suffered", "sack_yards_lost", "passing_air_yards", "passing_first_downs",
+             "passing_10", "passing_20", "passing_40", "passing_2pt_conversions",
+             "passing_yards_after_catch"],
+            season=2024, season_type="REG")
 
-    def test_receiving_stats(self):
-        result = nfl_player_stats(player_name="Justin Jefferson", season=2024, stat_type="receiving")
-        assert "error" not in result
-        assert len(result["seasons"]) > 0
+        assert (season["attempts"], season["completions"]) == (581, 392)
+        assert season["attempts"] == expected["attempts"]
+        assert season["yards"] == expected["passing_yards"] == 3928
+        assert season["touchdowns"] == expected["passing_tds"] == 26
+        assert season["interceptions"] == expected["passing_interceptions"] == 11
+        assert season["sacks"] == expected["sacks_suffered"] == 36
+        assert season["sack_yards"] == expected["sack_yards_lost"] == -239
+        assert season["air_yards"] == expected["passing_air_yards"]
+        assert season["first_downs"] == expected["passing_first_downs"]
+        assert season["pass_10_plus"] == expected["passing_10"]
+        assert season["pass_20_plus"] == expected["passing_20"]
+        assert season["pass_40_plus"] == expected["passing_40"]
+        assert season["two_point_conversions"] == expected["passing_2pt_conversions"]
+        assert season["yards_after_catch"] == expected["passing_yards_after_catch"]
+        assert season["games"] == 16
+        # the gap the fix closes: attempts + sacks is the number counting plays produced
+        assert season["attempts"] + season["sacks"] == 617
+
+    def test_rushing_counts_include_kneels_that_plays_row_counts_miss(self):
+        """Mahomes 2024: 38 `play_type = 'run'` rows, 58 official carries, the 20 others kneels."""
+        result = nfl_player_stats(player_name="Patrick Mahomes", season=2024, season_type="REG",
+                                  stat_type="rushing")
+        season = result["seasons"][0]
+        expected = self.player_stats_totals(
+            self.MAHOMES, ["carries", "rushing_yards", "rushing_tds", "rushing_fumbles",
+                           "rushing_fumbles_lost", "rushing_first_downs", "rushing_10",
+                           "rushing_20", "rushing_40", "rushing_2pt_conversions"],
+            season=2024, season_type="REG")
+        run_rows = nfl_query(
+            "SELECT COUNT(*) AS n FROM plays WHERE rusher_player_id = "
+            f"'{self.MAHOMES}' AND season = 2024 AND season_type = 'REG' AND play_type = 'run'"
+        )["rows"][0]["n"]
+        kneel_rows = nfl_query(
+            "SELECT COUNT(*) AS n FROM plays WHERE rusher_player_id = "
+            f"'{self.MAHOMES}' AND season = 2024 AND season_type = 'REG' AND play_type = 'qb_kneel'"
+        )["rows"][0]["n"]
+
+        assert season["carries"] == expected["carries"] == 58
+        assert kneel_rows == 20 and run_rows == 38
+        assert season["carries"] == run_rows + kneel_rows
+        assert season["yards"] == expected["rushing_yards"] == 307
+        assert season["touchdowns"] == expected["rushing_tds"] == 2
+        assert season["fumbles"] == expected["rushing_fumbles"]
+        assert season["fumbles_lost"] == expected["rushing_fumbles_lost"]
+        assert season["first_downs"] == expected["rushing_first_downs"]
+        assert season["rush_10_plus"] == expected["rushing_10"]
+        assert season["yards_per_carry"] == round(307 / 58, 1)
+
+    def test_rushing_counts_match_player_stats_for_a_running_back(self):
+        result = nfl_player_stats(player_name="D.Henry", season=2024, season_type="REG",
+                                  stat_type="rushing")
+        season = result["seasons"][0]
+        expected = self.player_stats_totals(
+            self.HENRY, ["carries", "rushing_yards", "rushing_tds", "rushing_fumbles",
+                         "rushing_fumbles_lost"], season=2024, season_type="REG")
+
+        assert season["carries"] == expected["carries"] == 325
+        assert season["yards"] == expected["rushing_yards"] == 1921
+        assert season["touchdowns"] == expected["rushing_tds"] == 16
+        assert season["fumbles_lost"] == expected["rushing_fumbles_lost"]
+        # 2024 playoff games are a separate row, not extra carries on this one
+        assert season["games"] == 17
+
+    def test_receiving_counts_match_player_stats(self):
+        result = nfl_player_stats(player_name="Justin Jefferson", season=2024, season_type="REG",
+                                  stat_type="receiving")
+        season = result["seasons"][0]
+        expected = self.player_stats_totals(
+            self.JEFFERSON, ["targets", "receptions", "receiving_yards", "receiving_tds",
+                             "receiving_yards_after_catch", "receiving_air_yards",
+                             "receiving_first_downs", "receiving_fumbles", "receiving_10",
+                             "receiving_20", "receiving_40"], season=2024, season_type="REG")
+
+        assert (season["targets"], season["receptions"]) == (154, 103)
+        assert season["targets"] == expected["targets"]
+        assert season["yards"] == expected["receiving_yards"] == 1533
+        assert season["touchdowns"] == expected["receiving_tds"] == 10
+        assert season["yards_after_catch"] == expected["receiving_yards_after_catch"]
+        assert season["air_yards"] == expected["receiving_air_yards"]
+        assert season["first_downs"] == expected["receiving_first_downs"]
+        assert season["rec_10_plus"] == expected["receiving_10"]
+        assert season["rec_20_plus"] == expected["receiving_20"]
+        assert season["rec_40_plus"] == expected["receiving_40"]
+        assert season["yards_per_reception"] == round(1533 / 103, 1)
+        assert season["yards_per_target"] == round(1533 / 154, 1)
+
+    def test_avg_yac_divides_receptions_and_not_targets(self):
+        """Ja'Marr Chase 2024: 787 yards after catch over 127 receptions is 6.2; over his 175
+        targets it would be 4.5. Only the first is yards after catch per reception."""
+        season = nfl_player_stats(player_name="Ja'Marr Chase", season=2024, season_type="REG",
+                                  stat_type="receiving")["seasons"][0]
+        totals = self.player_stats_totals(
+            "00-0036900", ["targets", "receptions", "receiving_yards_after_catch"],
+            season=2024, season_type="REG")
+
+        assert totals == {"targets": 175, "receptions": 127, "receiving_yards_after_catch": 787}
+        assert (season["targets"], season["receptions"], season["yards_after_catch"]) == (175, 127, 787)
+        assert season["avg_yac"] == round(787 / 127, 1) == 6.2 != round(787 / 175, 1)
+
+    def test_every_rate_divides_summed_totals_and_no_weekly_rate_is_averaged(self):
+        result = nfl_player_stats(player_name="Patrick Mahomes", season=2024, season_type="REG",
+                                  stat_type="passing")
+        season = result["seasons"][0]
+        att, comp, yds = season["attempts"], season["completions"], season["yards"]
+        sacks, sack_yds = season["sacks"], season["sack_yards"]
+
+        assert season["comp_pct"] == round(100.0 * comp / att, 1) == 67.5
+        assert season["yards_per_attempt"] == round(yds / att, 1)
+        assert season["net_yards"] == yds + sack_yds == 3689
+        assert season["net_yards_per_attempt"] == round((yds + sack_yds) / (att + sacks), 1)
+        assert season["sack_rate"] == round(sacks / (att + sacks), 3)
+        assert season["td_pct"] == round(100.0 * season["touchdowns"] / att, 1)
+        assert season["int_pct"] == round(100.0 * season["interceptions"] / att, 1)
+        assert season["avg_air_yards"] == round(season["air_yards"] / att, 1)
+        assert abs(season["epa"] - 71.133) < 1e-3
+        assert season["avg_epa"] == round(season["epa"] / (att + sacks), 3)
+
+    def test_avg_cpoe_covers_exactly_the_window_of_the_row_it_sits_on(self):
+        """player_stats.passing_cpoe is a weekly mean and the table records no play count for it,
+        so the season mean comes from plays, over the caller's own window. Drop the season_type
+        filter there and the answer is 2.298 over 634 plays, which is neither value below; drop
+        the grouping and every row comes back with no partner to match."""
+        calls = [nfl_player_stats(player_name="Patrick Mahomes", season=2024, season_type=stype)
+                 for stype in ("POST", "REG")]
+        truth = nfl_query(
+            "SELECT season_type, ROUND(AVG(cpoe), 3) AS cpoe, COUNT(cpoe) AS n FROM plays"
+            f" WHERE passer_player_id = '{self.MAHOMES}' AND season = 2024 AND cpoe IS NOT NULL"
+            " GROUP BY season_type ORDER BY season_type")["rows"]
+
+        assert [(r["season_type"], r["cpoe"], r["n"]) for r in truth] == [
+            ("POST", 0.486, 81), ("REG", 2.563, 553)]
+        assert {(row["season_type"], row["cpoe_plays"]): row["avg_cpoe"]
+                for call in calls for row in call["seasons"]} == {
+                    ("REG", 553): 2.563, ("POST", 81): 0.486}
+        assert calls[1]["metric_sources"]["avg_cpoe"] == tools._CPOE_MEAN_SOURCE
+
+    def test_a_season_range_gives_one_row_per_season_and_each_matches_the_table(self):
+        """One row per season, each equal to that season's own sum. The seasons come from the
+        database, so this also passes on a single-season database."""
+        seasons = [row["season"] for row in nfl_query(
+            "SELECT DISTINCT season FROM player_stats WHERE player_id = "
+            f"'{self.MAHOMES}' AND season_type = 'REG' ORDER BY season")["rows"]]
+        result = nfl_player_stats(player_name="Patrick Mahomes", season_from=seasons[0],
+                                  season_to=seasons[-1], season_type="REG", stat_type="passing")
+        totals = nfl_query(
+            "SELECT season, SUM(attempts) AS attempts FROM player_stats WHERE player_id = "
+            f"'{self.MAHOMES}' AND season_type = 'REG' GROUP BY season ORDER BY season")["rows"]
+
+        assert [row["season"] for row in result["seasons"]] == seasons
+        assert [row["attempts"] for row in result["seasons"]] == [t["attempts"] for t in totals]
+        if seasons[0] == 2024:                       # the 2024-only CI database starts here too
+            assert result["seasons"][0]["attempts"] == 581
+
+    def test_regular_season_row_excludes_playoff_games(self):
+        result = nfl_player_stats(player_name="Patrick Mahomes", season=2024, stat_type="passing")
+        by_type = {row["season_type"]: row for row in result["seasons"]}
+        assert sorted(by_type) == ["POST", "REG"]
+        assert by_type["REG"]["attempts"] == 581 and by_type["POST"]["attempts"] == 83
+        assert by_type["REG"]["games"] == 16 and by_type["POST"]["games"] == 3
+
+    def test_the_response_names_the_source_of_every_metric(self):
+        result = nfl_player_stats(player_name="Patrick Mahomes", season=2024, stat_type="rushing")
+        assert "player_stats" in result["source"] and "week" in result["source"]
+        assert result["unavailable"] == {}              # this database has every column
+        assert set(result["metric_sources"]) == {
+            key for key in result["seasons"][0]
+            if key not in ("player_id", "season", "season_type", "label")}
+        assert all("player_stats." in src for src in result["metric_sources"].values())
+        assert result["metric_sources"]["carries"] == "SUM(player_stats.carries)"
 
     def test_unknown_player_is_not_found(self):
         result = nfl_player_stats(player_name="ZZZZNOTAPLAYER", stat_type="passing")
@@ -222,6 +413,72 @@ class TestNflCompare:
         assert [s["requested"] for s in sides] == ["Patrick Mahomes", "Justin Herbert"]
         assert [s["player"]["gsis_id"] for s in sides] == ["00-0033873", "00-0036355"]
         assert "passing" in sides[0] and "passing" in sides[1]
+
+    def test_compare_players_uses_the_official_player_stats_rows(self):
+        """Player mode follows nfl_player_stats: same numbers, one row per season type."""
+        result = nfl_compare(entity1="Patrick Mahomes", entity2="Justin Herbert",
+                             compare_type="player", season=2024, season_type="REG")
+        sides = result["players"]
+        assert [s["passing"][0]["season_type"] for s in sides] == ["REG", "REG"]
+        for side in sides:
+            assert "player_stats" in side["source"] and "summed per season" in side["source"]
+            assert side["metric_sources"]["passing"]["attempts"] == "SUM(player_stats.attempts)"
+            assert set(side["metric_sources"]) <= {k for k in side if k in
+                                                  ("passing", "rushing", "receiving")}
+            for block in ("passing", "rushing", "receiving"):
+                for row in side.get(block, []):
+                    assert row["season_type"] == "REG"
+                    assert row["player_id"] == side["player"]["gsis_id"]
+        assert sides[0]["passing"][0]["attempts"] == 581      # Mahomes, 36 sacks excluded
+        assert sides[0]["passing"][0]["sacks"] == 36
+
+    def test_compare_players_without_a_season_type_keeps_the_rows_apart(self):
+        result = nfl_compare(entity1="Patrick Mahomes", entity2="Justin Herbert",
+                             compare_type="player", season=2024)
+        side = result["players"][0]
+        post, reg = side["passing"]                      # one row per season type, never one sum
+        assert (post["season_type"], reg["season_type"]) == ("POST", "REG")
+        assert (reg["attempts"], post["attempts"]) == (581, 83)
+        assert side["passing"][0]["label"] == side["player"]["label"]
+
+    def test_a_season_whose_counting_stats_are_all_zero_is_gone_from_both_tools(self):
+        """Jefferson's 1 playoff game of passing zeros, Mahomes' 3 of receiving zeros and
+        Jefferson's 1 of rushing zeros are the same case: `games` alone is no stat, and neither is
+        a derived epa figure - Curtis Samuel's 3 playoff rushing games are carries 0, yards 0 and
+        epa -0.947, while his 6 receptions that same postseason stay."""
+        both = nfl_compare("Patrick Mahomes", "Justin Jefferson", compare_type="player", season=2024)
+        post = nfl_compare("Patrick Mahomes", "Justin Jefferson", compare_type="player",
+                           season=2024, season_type="POST")["players"]
+        assert [(r["season_type"], r["attempts"]) for r in both["players"][1]["passing"]] == [("REG", 1)]
+        assert "receiving" not in post[0] and post[0]["rushing"][0]["carries"] == 22
+        assert "rushing" not in post[1] and post[1]["receiving"][0]["targets"] == 8
+        samuel = nfl_player_stats(player_id="00-0033282", season=2024, season_type="POST",
+                                  stat_type="rushing")
+        assert samuel["seasons"] == [] and samuel["unavailable"] == {}
+        side = nfl_compare(entity1="", entity2="", compare_type="player", player_id1="00-0033282",
+                           season=2024, season_type="POST")["players"][0]
+        assert "rushing" not in side and side["receiving"][0]["receptions"] == 6
+
+    # A zero count that leads a block does not empty it: Josh Allen's 7-yard receiving touchdown
+    # off 0 targets, Justin Watson's 2 two-point conversions and Penei Sewell's sack off 0 of them.
+    @pytest.mark.parametrize("player_id,season,season_type,stat_type,expect", [
+        ("00-0034857", 2024, "REG", "receiving", {"targets": 0, "yards": 7, "touchdowns": 1}),
+        ("00-0034386", 2024, "POST", "receiving", {"targets": 0, "two_point_conversions": 2}),
+        ("00-0032701", 2024, "REG", "receiving", {"targets": 0, "yards": 2}),
+        ("00-0036880", 2024, "REG", "passing", {"attempts": 0, "sacks": 1, "sack_yards": -1}),
+        ("00-0035250", 2025, "REG", "passing", {"attempts": 0, "two_point_conversions": 1}),
+    ])
+    def test_a_block_stays_visible_when_any_counting_stat_is_not_zero(
+            self, player_id, season, season_type, stat_type, expect):
+        with tools.get_db_connection() as con:
+            if not con.execute(f"SELECT 1 FROM player_stats WHERE season = {season} LIMIT 1").fetchone():
+                pytest.skip(f"season {season} is not in this database")   # 2025 is not in the CI DB
+        rows = nfl_player_stats(player_id=player_id, season=season, season_type=season_type,
+                                stat_type=stat_type)["seasons"]
+        assert len(rows) == 1 and {key: rows[0][key] for key in expect} == expect
+        side = nfl_compare(entity1="", entity2="", compare_type="player", player_id1=player_id,
+                           season=season, season_type=season_type)["players"][0]
+        assert side[stat_type] == rows       # nfl_compare shows the same row nfl_player_stats gave
 
     def test_compare_players_gives_the_side_it_cannot_settle_to_the_caller(self):
         # 'Lamar Jackson' is the Ravens QB and an Falcons CB in 2024, so that side
