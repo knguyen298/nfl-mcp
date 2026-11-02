@@ -138,7 +138,11 @@ TOOLS = [
                 },
                 "player": {
                     "type": "string",
-                    "description": "Player name (partial match, e.g. 'Mahomes', 'J.Jefferson')",
+                    "description": "Player full name or nflverse short name ('Justin Jefferson' or 'J.Jefferson'). Matches passer, rusher, or receiver by gsis_id.",
+                },
+                "player_id": {
+                    "type": "string",
+                    "description": "Player gsis_id (e.g. '00-0036322'). Overrides player. Use it when a name returns ambiguous candidates.",
                 },
                 "season": {
                     "type": "integer",
@@ -231,7 +235,11 @@ TOOLS = [
             "properties": {
                 "player_name": {
                     "type": "string",
-                    "description": "Player name (partial match, e.g. 'Mahomes', 'D.Henry', 'J.Jefferson')",
+                    "description": "Player full name or nflverse short name ('Justin Jefferson' or 'J.Jefferson'). Omit when player_id is given.",
+                },
+                "player_id": {
+                    "type": "string",
+                    "description": "Player gsis_id (e.g. '00-0036322'). Overrides player_name. A name that matches several players returns ambiguous plus the candidates, never merged stats.",
                 },
                 "season": {
                     "type": "integer",
@@ -257,7 +265,6 @@ TOOLS = [
                     "default": "passing",
                 },
             },
-            "required": ["player_name"],
         },
     ),
     Tool(
@@ -266,24 +273,36 @@ TOOLS = [
             "PREFERRED for any comparison question. Side-by-side stats for two teams "
             "or two players in a single call. Always use this instead of calling "
             "nfl_team_stats or nfl_player_stats twice when the user asks to compare, "
-            "rank, or contrast two teams or two players against each other."
+            "rank, or contrast two teams or two players against each other. Team mode "
+            "returns one entry per abbreviation; player mode returns {'players': [side1, "
+            "side2]} in the order requested, each side carrying 'requested' plus 'player' "
+            "with its gsis_id. Two players who share a name are two separate sides, and a "
+            "side whose name matches several players returns 'candidates' instead of stats."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "entity1": {
                     "type": "string",
-                    "description": "First team abbreviation or player name",
+                    "description": "First team abbreviation or player name (full or short form)",
                 },
                 "entity2": {
                     "type": "string",
-                    "description": "Second team abbreviation or player name",
+                    "description": "Second team abbreviation or player name (full or short form)",
                 },
                 "compare_type": {
                     "type": "string",
                     "enum": ["team", "player"],
                     "description": "Whether comparing teams or players (default: team)",
                     "default": "team",
+                },
+                "player_id1": {
+                    "type": "string",
+                    "description": "gsis_id for entity1 (player mode only). Overrides the name in entity1.",
+                },
+                "player_id2": {
+                    "type": "string",
+                    "description": "gsis_id for entity2 (player mode only). Overrides the name in entity2.",
                 },
                 "season": {
                     "type": "integer",
@@ -365,7 +384,11 @@ TOOLS = [
                 },
                 "player": {
                     "type": "string",
-                    "description": "Player name (partial match, e.g. 'Mahomes')",
+                    "description": "Player full name or nflverse short name ('Patrick Mahomes' or 'P.Mahomes')",
+                },
+                "player_id": {
+                    "type": "string",
+                    "description": "Player gsis_id (e.g. '00-0036322'). Overrides player. Use it when a name returns ambiguous candidates.",
                 },
                 "report_status": {
                     "type": "string",
@@ -416,7 +439,11 @@ TOOLS = [
             "properties": {
                 "player": {
                     "type": "string",
-                    "description": "Player name (partial match, e.g. 'Kelce')",
+                    "description": "Player full name or nflverse short name ('Travis Kelce' or 'T.Kelce'). snap_counts rows are keyed by PFR id, mapped through the players table.",
+                },
+                "player_id": {
+                    "type": "string",
+                    "description": "Player gsis_id (e.g. '00-0030506'). Overrides player.",
                 },
                 "team": {
                     "type": "string",
@@ -450,7 +477,11 @@ TOOLS = [
             "properties": {
                 "player": {
                     "type": "string",
-                    "description": "Player name (partial match, e.g. 'Jefferson')",
+                    "description": "Player full name or nflverse short name ('Justin Jefferson' or 'J.Jefferson')",
+                },
+                "player_id": {
+                    "type": "string",
+                    "description": "Player gsis_id (e.g. '00-0036322'). Overrides player.",
                 },
                 "team": {
                     "type": "string",
@@ -486,7 +517,11 @@ TOOLS = [
             "properties": {
                 "player": {
                     "type": "string",
-                    "description": "Player name (partial match, e.g. 'Jefferson')",
+                    "description": "Player full name or nflverse short name ('Justin Jefferson' or 'J.Jefferson'). Resolved to a gsis_id, then matched to the FantasyPros id in ff_playerids.",
+                },
+                "player_id": {
+                    "type": "string",
+                    "description": "Player gsis_id (e.g. '00-0036322'). Overrides player.",
                 },
                 "position": {
                     "type": "string",
@@ -538,7 +573,11 @@ TOOLS = [
                 },
                 "player": {
                     "type": "string",
-                    "description": "Player name (partial match) — matches passer, rusher, or receiver.",
+                    "description": "Player full name or nflverse short name — matches passer, rusher, or receiver by gsis_id.",
+                },
+                "player_id": {
+                    "type": "string",
+                    "description": "Player gsis_id (e.g. '00-0036322'). Overrides player.",
                 },
                 "season": {
                     "type": "integer",
@@ -577,7 +616,8 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "player": {"type": "string", "description": "Player full name (partial match)."},
+                "player": {"type": "string", "description": "Player full name or nflverse short name."},
+                "player_id": {"type": "string", "description": "Player gsis_id (e.g. '00-0036322'). Overrides player."},
                 "position": {"type": "string", "description": "Position filter (e.g. WR, RB, TE)."},
                 "team": {"type": "string", "description": "Team abbreviation (e.g. KC)."},
                 "season": {"type": "integer", "description": "Exact season year."},
@@ -597,7 +637,8 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "player": {"type": "string", "description": "Player full name (partial match)."},
+                "player": {"type": "string", "description": "Player full name or nflverse short name."},
+                "player_id": {"type": "string", "description": "Player gsis_id (e.g. '00-0036322'). Overrides player."},
                 "position": {"type": "string", "description": "Position filter (e.g. WR, RB)."},
                 "team": {"type": "string", "description": "Team abbreviation."},
                 "season": {"type": "integer", "description": "Exact season year."},
@@ -619,7 +660,8 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "player": {"type": "string", "description": "Player full name (partial match)."},
+                "player": {"type": "string", "description": "Player full name or nflverse short name."},
+                "player_id": {"type": "string", "description": "Player gsis_id (e.g. '00-0036322'). Overrides player."},
                 "position": {"type": "string", "description": "Position filter (e.g. WR, TE)."},
                 "team": {"type": "string", "description": "Team abbreviation."},
                 "season": {"type": "integer", "description": "Exact season year (2016+)."},
@@ -637,13 +679,15 @@ TOOLS = [
             "PREFERRED for drops / catchable-target reliability questions (2022–present). "
             "Returns share of catchable targets dropped per receiver-season from FTN charting, "
             "plus contested targets and created receptions. Use for 'who drops the most passes' "
-            "or 'what is player X's drop rate'. Player names are short form ('J.Jefferson'). "
+            "or 'what is player X's drop rate'. Player names work in full form or the "
+            "nflverse short form ('Justin Jefferson' or 'J.Jefferson'). "
             "Default sort is highest drop rate first."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "player": {"type": "string", "description": "Player name (partial match, short form)."},
+                "player": {"type": "string", "description": "Player full name or nflverse short name."},
+                "player_id": {"type": "string", "description": "Player gsis_id (e.g. '00-0036322'). Overrides player."},
                 "team": {"type": "string", "description": "Team abbreviation."},
                 "season": {"type": "integer", "description": "Exact season year (2022+)."},
                 "min_targets": {"type": "integer", "description": "Minimum catchable targets to qualify."},
@@ -663,7 +707,8 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "player": {"type": "string", "description": "Player full name (partial match)."},
+                "player": {"type": "string", "description": "Player full name or nflverse short name."},
+                "player_id": {"type": "string", "description": "Player gsis_id (e.g. '00-0036322'). Overrides player."},
                 "position": {"type": "string", "description": "Position filter (e.g. RB, WR)."},
                 "team": {"type": "string", "description": "Team abbreviation."},
                 "season": {"type": "integer", "description": "Exact season year."},

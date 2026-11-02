@@ -12,6 +12,10 @@ Key columns for common queries:
   cp, cpoe, xpass, pass_oe
 
 Player names are abbreviated: 'P.Mahomes', 'J.Allen', 'D.Henry'
+Names are not unique: 'J.Jefferson' is four different players in the players table.
+Raw SQL filters and groups by the matching `*_player_id` column, never by a name.
+A short name can carry a 2-3 letter prefix ('Mi.Wilson', 'Cas.Washington'), and one short name can
+stand for several players. Filter by `gsis_id`, obtained from a player tool, not by the name.
 Team abbreviations: KC, BUF, BAL, PHI, SF, DAL, DET, etc.
 
 Column names are literal — do not invent one. Per-play EPA is `epa`, not `play_epa`.

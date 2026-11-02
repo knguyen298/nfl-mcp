@@ -9,11 +9,235 @@ import pytest
 import nfl_mcp.tools as tools
 
 
-def test_normalize_player_name_handles_full_short_and_last_name_inputs():
-    assert tools._normalize_player_name("Mahomes") == "Mahomes"
-    assert tools._normalize_player_name("J.Jefferson") == "J.Jefferson"
-    assert tools._normalize_player_name("Justin Jefferson") == "J.Jefferson"
-    assert tools._normalize_player_name("J. Jefferson") == "J. Jefferson"
+def test_name_tokens_folds_punctuation_accents_and_suffixes():
+    assert tools._name_tokens("Justin Jefferson") == ["justin", "jefferson"]
+    assert tools._name_tokens("J.Jefferson") == ["j", "jefferson"]
+    assert tools._name_tokens("J. Jefferson") == ["j", "jefferson"]
+    assert tools._name_tokens("Kenneth Walker III") == ["kenneth", "walker"]
+    assert tools._name_tokens("Willie Jefferson Jr.") == ["willie", "jefferson"]
+    assert tools._name_tokens("D'vonta Smith-Sr.") == ["d", "vonta", "smith"]
+    assert tools._name_tokens("Audric Estimé") == ["audric", "estime"]
+    assert tools._name_tokens("  ") == []
+
+
+def test_first_name_matches_full_preferred_and_initial_forms():
+    row = {"first_name": "David", "football_name": None, "common_first_name": "D.J."}
+    assert tools._first_name_matches(["david"], row)          # full first name
+    assert not tools._first_name_matches(["d"], row, initial=False)  # one letter is an initial
+    assert tools._first_name_matches(["d", "j"], row)         # 'D.J.' as two tokens
+    assert tools._first_name_matches(["dj"], row)             # 'DJ' squeezed
+    assert tools._first_name_matches(["d", "j"], {"first_name": "David"})  # initial, second pass
+    assert not tools._first_name_matches(["d", "j"], {"first_name": "David"}, initial=False)
+    assert tools._first_name_matches([], row)                 # surname-only query
+    assert not tools._first_name_matches(["justin"], row)
+    assert not tools._first_name_matches(["d"], {})           # nothing to compare
+
+
+def test_spelled_out_pass_refuses_every_one_letter_form():
+    """A stored given name of 'B.' joins to 'b', so the guard is needed twice."""
+    stored_initial = {"first_name": "B.", "football_name": None, "common_first_name": None}
+    assert not tools._first_name_matches(["b"], stored_initial, initial=False)  # joined form
+    assert not tools._first_name_matches(["b"], {"first_name": "Brian"}, initial=False)  # first token
+    assert tools._first_name_matches(["b"], stored_initial)      # the initial pass still may
+    assert tools._first_name_matches(["b"], {"first_name": "Brian"})
+    # the token-length guard: a 2-letter head token must not borrow another player's initial
+    assert not tools._first_name_matches(["a", "st"], {"first_name": "A.J."}, initial=False)
+    assert tools._first_name_matches(["a", "st"], {"first_name": "Amon-Ra"})
+
+
+def test_initial_pass_accepts_the_prefix_forms_plays_writes():
+    assert tools._first_name_matches(["mi"], {"first_name": "Michael"})
+    assert tools._first_name_matches(["ja"], {"first_name": "Jameson"})
+    assert tools._first_name_matches(["cas"], {"first_name": "Casey"})
+    assert not tools._first_name_matches(["mi"], {"first_name": "Mecus"})
+    assert not tools._first_name_matches(["mi"], {"first_name": "Michael"}, initial=False)
+    assert not tools._first_name_matches(["mi", "x"], {"first_name": "Mecus"})  # two-token head
+
+
+def test_suffix_token_reads_a_generational_suffix_on_both_sides():
+    assert tools._suffix_token("Marvin Harrison Jr.") == "jr"
+    assert tools._suffix_token("Robert Griffin III") == "iii"
+    assert tools._suffix_token("Michael Pittman JR") == "jr"
+    assert tools._suffix_token("Justin Jefferson") is None
+    assert tools._suffix_token("") is None
+    assert tools._name_tokens("Marvin Harrison Jr.") == ["marvin", "harrison"]
+
+
+def test_resolve_player_prefers_spelled_out_names_over_initial_matches(monkeypatch):
+    rows = [
+        {"gsis_id": "EXACT", "display_name": "DJ Moore", "first_name": "DJ",
+         "football_name": None, "common_first_name": None, "last_name": "Moore",
+         "suffix": None, "position": "WR", "latest_team": "BUF",
+         "rookie_season": 2022, "last_season": 2026, "pfr_id": None},
+        {"gsis_id": "INITIAL", "display_name": "David Moore", "first_name": "David",
+         "football_name": None, "common_first_name": None, "last_name": "Moore",
+         "suffix": None, "position": "WR", "latest_team": "CAR",
+         "rookie_season": 2021, "last_season": 2026, "pfr_id": None},
+    ]
+    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: list(rows))
+    # 'D.J.' is DJ Moore's name spelled out, so David Moore drops out of the candidates.
+    assert tools.nfl_resolve_player("D.J. Moore")["resolved"]["gsis_id"] == "EXACT"
+    # 'D. Moore' is only an initial, so both men stay in the candidate list.
+    assert [c["gsis_id"] for c in tools.nfl_resolve_player("D. Moore")["candidates"]] == [
+        "EXACT", "INITIAL"]
+
+
+def test_label_players_shows_position_and_team_to_separate_same_names():
+    rows = [
+        {"full_name": "Justin Jefferson", "position": "WR", "team": "MIN"},
+        {"full_name": "Justin Jefferson", "position": "LB", "team": "CLE"},
+    ]
+    assert [r["label"] for r in tools._label_players(rows)] == [
+        "Justin Jefferson (WR, MIN)",
+        "Justin Jefferson (LB, CLE)",
+    ]
+    (bare,) = tools._label_players([{"full_name": "Nobody Here"}], team_key="posteam")
+    assert bare["label"] == "Nobody Here"
+
+
+def test_resolve_player_reports_ambiguity_instead_of_merging(monkeypatch):
+    def fake_execute(sql, params=None):
+        return [
+            {"gsis_id": "A", "display_name": "Justin Jefferson", "first_name": "Justin",
+             "football_name": "Justin", "common_first_name": None, "last_name": "Jefferson",
+             "suffix": None, "position": "WR", "latest_team": "MIN",
+             "rookie_season": 2020, "last_season": 2026, "pfr_id": "JeffJu00"},
+            {"gsis_id": "B", "display_name": "Justin Jefferson", "first_name": "Justin",
+             "football_name": "Justin", "common_first_name": None, "last_name": "Jefferson",
+             "suffix": None, "position": "LB", "latest_team": "CLE",
+             "rookie_season": 2026, "last_season": 2026, "pfr_id": "JeffJu01"},
+        ]
+
+    monkeypatch.setattr(tools, "_execute", fake_execute)
+    result = tools.nfl_resolve_player("Justin Jefferson")
+    assert result["ambiguous"] is True
+    assert result["count"] == 2
+    assert [c["label"] for c in result["candidates"]] == [
+        "Justin Jefferson (WR, MIN)", "Justin Jefferson (LB, CLE)",
+    ]
+    assert [c["first_season"] for c in result["candidates"]] == [2020, 2026]
+
+
+def test_resolve_player_builds_id_name_and_filter_sql(monkeypatch):
+    captured = []
+
+    def fake_execute(sql, params=None):
+        captured.append((sql, params))
+        return [{"gsis_id": "A", "display_name": "Justin Jefferson", "first_name": "Justin",
+                 "football_name": None, "common_first_name": None, "last_name": "Jefferson",
+                 "suffix": "III", "position": "WR", "latest_team": "MIN",
+                 "rookie_season": 2020, "last_season": 2026, "pfr_id": "JeffJu00"}]
+
+    monkeypatch.setattr(tools, "_execute", fake_execute)
+    resolved = tools.nfl_resolve_player(
+        "ignored", player_id="00-0036322",
+    )["resolved"]
+    assert "gsis_id = ?" in captured[0][0]
+    assert captured[0][1] == ["00-0036322"]      # the id wins, the name is ignored
+    assert resolved["full_name"] == "Justin Jefferson III"   # suffix stays in the name
+    assert resolved["label"] == "Justin Jefferson III (WR, MIN)"
+
+    tools.nfl_resolve_player(
+        "Justin Jefferson", team="min", season=2026, season_from=2020,
+        season_to=2026, position="wr",
+    )
+    sql, params = captured[1]
+    assert "rookie_season <= ? AND last_season >= ?" in sql
+    assert "last_season >= ?" in sql and "rookie_season <= ?" in sql
+    assert "position ILIKE ?" in sql
+    assert "SELECT gsis_id FROM rosters WHERE team IN (?) AND season = ?" in sql
+    assert "SELECT gsis_id FROM rosters_weekly WHERE team IN (?) AND season = ?" in sql
+    assert params == ["jefferson", 2026, 2026, 2020, 2026, "WR",
+                      "MIN", "MIN", 2026, "MIN", 2026]
+
+    tools.nfl_resolve_player("Brock Bowers", team="oak", season=2024)   # a club that moved
+    sql, params = captured[2]
+    assert "COALESCE(latest_team, '') IN (?, ?)" in sql
+    assert "SELECT gsis_id FROM rosters WHERE team IN (?, ?) AND season = ?" in sql
+    assert "SELECT gsis_id FROM rosters_weekly WHERE team IN (?, ?) AND season = ?" in sql
+    assert params == ["bowers", 2024, 2024, "OAK", "LV", "OAK", "LV", 2024, "OAK", "LV", 2024]
+
+
+def test_team_filter_binds_every_code_of_a_moved_club():
+    conditions: list[str] = []
+    params: list = []
+    tools._team_filter(conditions, params, "posteam", "oak")   # a club that moved
+    tools._team_filter(conditions, params, "team", "KC")       # one code, the plain form
+    tools._team_filter(conditions, params, "defteam", "   ")   # spaces filter nothing
+    assert conditions == ["posteam IN (?, ?)", "team = ?"]
+    assert params == ["OAK", "LV", "KC"]
+    assert "OAK" in tools._team_codes("LV")        # the era direction, which fix 1 added
+    assert tools._team_codes("LA") == ["LA", "STL", "LAR", "RAM"]
+
+
+@pytest.mark.parametrize("typed, codes", [
+    ("LV", ["LV", "OAK"]), ("OAK", ["OAK", "LV"]), ("SD", ["SD", "LAC"]), ("LA", ["LA", "STL", "LAR", "RAM"]),
+    ("WAS", ["WAS", "WSH", "TFN"]), ("KC", ["KC"]), ("HOU", ["HOU"]), ("zzz", ["ZZZ"]),
+])
+def test_team_codes_list_the_typed_code_then_the_current_one_then_the_aliases(typed, codes):
+    assert tools._team_codes(typed) == codes
+
+
+def test_four_codes_get_four_placeholders(monkeypatch):
+    """A hardcoded two-mark list would be a parameter-count crash with 'LA'."""
+    captured = []
+    monkeypatch.setattr(tools, "_execute",
+                        lambda sql, params=None: captured.append((sql, params)) or [])
+    conditions: list[str] = []
+    params: list = []
+    tools._team_filter(conditions, params, "team", "LA")
+    assert conditions == ["team IN (?, ?, ?, ?)"]
+    tools.nfl_search_plays(team="LA", season=2024, max_rows=1)
+    sql, bound = captured[0]
+    assert sql.count("?") == len(bound)                        # marks and values agree
+    assert bound[:4] == ["LA", "STL", "LAR", "RAM"]
+
+
+def test_resolve_player_needs_a_name_or_id():
+    assert tools.nfl_resolve_player()["not_found"] is True
+    assert tools.nfl_resolve_player("  ")["did_you_mean"] == []
+
+
+def test_resolve_player_reports_nearest_names_when_nothing_matches(monkeypatch):
+    calls = []
+
+    def fake_execute(sql, params=None):
+        calls.append((sql, params))
+        if "SELECT display_name FROM players" in sql:
+            return [{"display_name": "Justin Jefferson"}]
+        return []
+
+    monkeypatch.setattr(tools, "_execute", fake_execute)
+    result = tools.nfl_resolve_player("Justin Jeffersonn")
+    assert result["not_found"] is True
+    assert result["did_you_mean"] == ["justin jefferson"]   # _nearest lowercases
+    assert calls[-1][1] == ["jeff%"]      # the surname prefix feeds the suggestion search
+
+
+def test_resolve_player_swallows_lookup_errors(monkeypatch):
+    monkeypatch.setattr(
+        tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("lookup timeout"))
+    )
+    assert tools.nfl_resolve_player("Justin Jefferson")["error"] == "lookup timeout"
+
+
+RESOLVED_JEFFERSON = {
+    "gsis_id": "00-0036322",
+    "full_name": "Justin Jefferson",
+    "pfr_id": "JeffJu00",
+    "position": "WR",
+    "team": "MIN",
+    "first_season": 2020,
+    "last_season": 2026,
+    "label": "Justin Jefferson (WR, MIN)",
+}
+
+
+def stub_resolver(monkeypatch, identity=None):
+    """Let every name lookup succeed without a database, so these tests read SQL only."""
+    player = identity or RESOLVED_JEFFERSON
+    monkeypatch.setattr(tools, "nfl_resolve_player", lambda *a, **k: {"resolved": player})
+    return player
 
 
 def test_search_plays_uses_parameterized_filters(monkeypatch):
@@ -25,15 +249,18 @@ def test_search_plays_uses_parameterized_filters(monkeypatch):
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
+    stub_resolver(monkeypatch)
     result = tools.nfl_search_plays(team="KC", player="Mahomes", season=2024, max_rows=5)
 
     assert result["row_count"] == 0
     assert "posteam = ?" in captured["sql"]
-    assert "ILIKE ?" in captured["sql"]
+    assert "passer_player_id = ? OR rusher_player_id = ? OR receiver_player_id = ?" in captured["sql"]
+    assert "ILIKE" not in captured["sql"]
     assert "LIMIT 5" in captured["sql"]
     assert captured["params"][0] == "KC"
-    assert "%Mahomes%" in captured["params"]
+    assert captured["params"][1:4] == ["00-0036322"] * 3
     assert 2024 in captured["params"]
+    assert result["player"]["gsis_id"] == "00-0036322"
 
 
 def test_team_stats_uses_parameterized_team_and_season(monkeypatch):
@@ -52,7 +279,7 @@ def test_team_stats_uses_parameterized_team_and_season(monkeypatch):
     assert all(2024 in params for _, params in calls)
 
 
-def test_player_stats_uses_parameterized_player_name(monkeypatch):
+def test_player_stats_filters_by_resolved_id(monkeypatch):
     captured = {}
 
     def fake_execute(sql, params=None):
@@ -61,26 +288,29 @@ def test_player_stats_uses_parameterized_player_name(monkeypatch):
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
+    stub_resolver(monkeypatch)
     tools.nfl_player_stats(player_name="P.Mahomes", stat_type="passing", season_type="REG")
 
-    assert "ILIKE ?" in captured["sql"]
-    assert captured["params"][0] == "%P.Mahomes%"
+    assert "passer_player_id = ?" in captured["sql"]
+    assert "ILIKE" not in captured["sql"]
+    assert captured["params"][0] == "00-0036322"
     assert captured["params"][1] == "pass"
     assert captured["params"][-1] == "REG"
+    assert "GROUP BY player_id, season, season_type" in captured["sql"]
 
 
-def test_player_stats_normalizes_full_player_name(monkeypatch):
-    captured = {}
+def test_player_stats_labels_rows_with_the_resolved_player(monkeypatch):
+    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [{"season": 2024}])
+    stub_resolver(monkeypatch)
+    result = tools.nfl_player_stats("Justin Jefferson", stat_type="receiving")
+    assert result["player"]["label"] == "Justin Jefferson (WR, MIN)"
+    assert result["seasons"][0]["label"] == "Justin Jefferson (WR, MIN)"
 
-    def fake_execute(sql, params=None):
-        captured["sql"] = sql
-        captured["params"] = params
-        return []
 
-    monkeypatch.setattr(tools, "_execute", fake_execute)
-    tools.nfl_player_stats(player_name="Justin Jefferson", stat_type="passing")
-
-    assert captured["params"][0] == "%J.Jefferson%"
+def test_player_stats_returns_the_resolver_verbatim(monkeypatch):
+    monkeypatch.setattr(tools, "nfl_resolve_player", lambda *a, **k: {"ambiguous": True, "candidates": []})
+    result = tools.nfl_player_stats("Justin Jefferson", season=2026)
+    assert result == {"ambiguous": True, "candidates": []}
 
 
 def test_compare_team_does_not_interpolate_user_input(monkeypatch):
@@ -369,6 +599,7 @@ def test_player_stats_other_stat_types(monkeypatch, stat_type, expected_play_typ
         return [{"season": 2024, "season_type": "REG"}]
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
+    stub_resolver(monkeypatch)
     result = tools.nfl_player_stats(
         player_name="P.Mahomes",
         stat_type=stat_type,
@@ -392,24 +623,37 @@ def test_player_stats_returns_error_on_timeout(monkeypatch):
     assert "error" in result
 
 
+def test_player_stats_reports_failure_of_its_own_query(monkeypatch):
+    stub_resolver(monkeypatch)
+    monkeypatch.setattr(
+        tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("stats timeout"))
+    )
+    assert tools.nfl_player_stats("P.Mahomes")["error"] == "stats timeout"
+
+
 def test_compare_player_path_only_includes_stats_with_attempts(monkeypatch):
     calls = []
 
     def fake_execute(sql, params=None):
         calls.append((sql, params))
-        if "COUNT(*) AS n" in sql and "passer_player_name" in sql:
+        if "COUNT(*) AS n" in sql and "passer_player_id" in sql:
             return [{"n": 1}]
-        if "COUNT(*) AS n" in sql and "receiver_player_name" in sql:
+        if "COUNT(*) AS n" in sql and "receiver_player_id" in sql:
             return [{"n": 1}]
-        if "COUNT(*) AS n" in sql and "rusher_player_name" in sql:
+        if "COUNT(*) AS n" in sql and "rusher_player_id" in sql:
             return [{"n": 0}]
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
     monkeypatch.setattr(
         tools,
+        "nfl_resolve_player",
+        lambda name, **kwargs: {"resolved": {"gsis_id": f"id-{name}", "label": name}},
+    )
+    monkeypatch.setattr(
+        tools,
         "nfl_player_stats",
-        lambda player_name, **kwargs: {"seasons": [{"player": player_name, **kwargs}]},
+        lambda **kwargs: {"seasons": [{"player_id": kwargs["player_id"]}]},
     )
     result = tools.nfl_compare(
         entity1="P.Mahomes",
@@ -419,10 +663,44 @@ def test_compare_player_path_only_includes_stats_with_attempts(monkeypatch):
         season_to=2024,
         season_type="REG",
     )
-    assert "passing" in result["P.Mahomes"]
-    assert "receiving" in result["P.Mahomes"]
-    assert "rushing" not in result["P.Mahomes"]
+    sides = result["players"]
+    assert [s["requested"] for s in sides] == ["P.Mahomes", "J.Allen"]
+    assert "passing" in sides[0]
+    assert "receiving" in sides[0]
+    assert "rushing" not in sides[0]
     assert "season_type = ?" in calls[0][0]
+
+
+def test_compare_player_reports_the_resolver_result_per_entity(monkeypatch):
+    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [])
+    monkeypatch.setattr(
+        tools,
+        "nfl_resolve_player",
+        lambda name, **kwargs: (
+            {"ambiguous": True, "count": 2, "candidates": []}
+            if name == "Justin Jefferson" else {"resolved": {"gsis_id": "B", "label": "B"}}
+        ),
+    )
+    result = tools.nfl_compare("Justin Jefferson", "Travis Kelce", compare_type="player")
+    assert [(s["requested"], "ambiguous" in s, s.get("player", {}).get("gsis_id"))
+            for s in result["players"]] == [("Justin Jefferson", True, None), ("Travis Kelce", False, "B")]
+
+
+def test_compare_player_keeps_both_sides_when_the_names_are_identical(monkeypatch):
+    """Two players who share a name must not overwrite each other in the result."""
+    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [])
+    monkeypatch.setattr(
+        tools,
+        "nfl_resolve_player",
+        lambda name, **kwargs: {"resolved": {"gsis_id": kwargs["player_id"], "label": name}},
+    )
+    monkeypatch.setattr(tools, "nfl_player_stats", lambda **kwargs: {"seasons": []})
+    result = tools.nfl_compare(
+        "Justin Jefferson", "Justin Jefferson", compare_type="player",
+        player_id1="00-0036322", player_id2="00-0041075", season=2026,
+    )
+    assert [s["player"]["gsis_id"] for s in result["players"]] == ["00-0036322", "00-0041075"]
+    assert all(s["requested"] == "Justin Jefferson" for s in result["players"])
 
 
 def test_compare_rejects_unknown_type():
@@ -515,9 +793,10 @@ def test_injuries_builds_filters_and_wildcards(monkeypatch):
     def fake_execute(sql, params=None):
         captured["sql"] = sql
         captured["params"] = params
-        return [{"full_name": "P.Mahomes"}]
+        return [{"full_name": "Justin Jefferson", "position": "WR", "team": "MIN"}]
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
+    stub_resolver(monkeypatch)
     result = tools.nfl_injuries(
         team="kc",
         season=2024,
@@ -527,8 +806,10 @@ def test_injuries_builds_filters_and_wildcards(monkeypatch):
     )
     assert result["count"] == 1
     assert "team = ?" in captured["sql"]
+    assert "gsis_id = ?" in captured["sql"]
     assert "report_status ILIKE ?" in captured["sql"]
-    assert captured["params"] == ["KC", 2024, 1, "%Mahomes%", "%Out%"]
+    assert captured["params"] == ["KC", 2024, 1, "00-0036322", "%Out%"]
+    assert result["injuries"][0]["label"] == "Justin Jefferson (WR, MIN)"
 
 
 def test_injuries_returns_error_on_timeout(monkeypatch):
@@ -565,9 +846,10 @@ def test_snap_counts_builds_filters(monkeypatch):
     def fake_execute(sql, params=None):
         captured["sql"] = sql
         captured["params"] = params
-        return [{"player": "T.Kelce"}]
+        return [{"player": "J.Jefferson", "position": "WR", "team": "MIN"}]
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
+    stub_resolver(monkeypatch)
     result = tools.nfl_snap_counts(
         player="Kelce",
         team="kc",
@@ -576,10 +858,20 @@ def test_snap_counts_builds_filters(monkeypatch):
         position="te",
     )
     assert result["count"] == 1
-    assert "player ILIKE ?" in captured["sql"]
+    assert "pfr_player_id = ?" in captured["sql"]
     assert "team = ?" in captured["sql"]
     assert "position ILIKE ?" in captured["sql"]
-    assert captured["params"] == ["%Kelce%", "KC", 2024, 1, "TE"]
+    assert captured["params"] == ["JeffJu00", "KC", 2024, 1, "TE"]
+    assert result["snap_counts"][0]["label"] == "J.Jefferson (WR, MIN)"
+
+
+def test_snap_counts_without_pfr_id_is_not_found(monkeypatch):
+    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [{"player": "X"}])
+    no_pfr = dict(RESOLVED_JEFFERSON, pfr_id=None)
+    stub_resolver(monkeypatch, no_pfr)
+    result = tools.nfl_snap_counts(player="Some Rookie")
+    assert result["not_found"] is True
+    assert "PFR id" in result["reason"]
 
 
 def test_snap_counts_returns_error_on_timeout(monkeypatch):
@@ -676,21 +968,23 @@ def test_ftn_charting_builds_all_filters(monkeypatch):
         }]
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
+    stub_resolver(monkeypatch)
     result = tools.nfl_ftn_charting(
         team="kc", opponent="phi", player="Mahomes",
         season_from=2022, season_to=2024, week=3, season_type="reg",
     )
     sql, params = captured["sql"], captured["params"]
     assert "p.posteam = ?" in sql and "p.defteam = ?" in sql
-    assert "p.passer_player_name ILIKE ?" in sql
+    assert "p.passer_player_id = ?" in sql
     assert "p.season >= ?" in sql and "p.season <= ?" in sql
     assert "p.week = ?" in sql and "p.season_type = ?" in sql
     assert params[:2] == ["KC", "PHI"]
-    assert params[2:5] == ["%Mahomes%"] * 3
+    assert params[2:5] == ["00-0036322"] * 3
     assert params[5:7] == [2022, 2024]
     assert params[-2:] == [3, "REG"]
     assert result["charting"]["play_action"]["pct"] == 40.0
     assert result["charting"]["motion"]["plays"] == 5
+    assert result["player"]["gsis_id"] == "00-0036322"
 
 
 def test_ftn_charting_exact_season_filter(monkeypatch):
@@ -727,6 +1021,14 @@ def test_ftn_charting_empty_rows(monkeypatch):
     assert result == {"charting": {}, "total_plays": 0}
 
 
+def test_ftn_charting_echoes_the_player_on_an_empty_result(monkeypatch):
+    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [])
+    stub_resolver(monkeypatch)
+    result = tools.nfl_ftn_charting(player="Justin Jefferson")
+    assert result["total_plays"] == 0
+    assert result["player"]["gsis_id"] == "00-0036322"
+
+
 def test_ftn_charting_returns_error_on_db_error(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(duckdb.Error("ftn boom")))
     result = tools.nfl_ftn_charting(team="KC")
@@ -749,13 +1051,14 @@ def _capture_execute(monkeypatch, rows):
 
 def test_td_luck_builds_filters(monkeypatch):
     captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
+    stub_resolver(monkeypatch)
     result = tools.nfl_td_luck(player="Jefferson", position="wr", team="min", season=2024, limit=10)
     assert result["count"] == 1
-    assert "full_name ILIKE ?" in captured["sql"]
+    assert "player_id = ?" in captured["sql"]
     assert "position ILIKE ?" in captured["sql"]
     assert "team = ?" in captured["sql"]
     assert "total_td_luck_score ASC" in captured["sql"]
-    assert captured["params"] == ["%Jefferson%", "WR", "MIN", 2024]
+    assert captured["params"] == ["00-0036322", "WR", "MIN", 2024]
 
 
 def test_td_luck_invalid_limit_falls_back(monkeypatch):
@@ -772,11 +1075,12 @@ def test_td_luck_returns_error_on_timeout(monkeypatch):
 
 def test_role_trend_builds_filters(monkeypatch):
     captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
+    stub_resolver(monkeypatch)
     tools.nfl_role_trend(player="Kelce", position="te", team="kc", season=2024, week=8, min_snap_pct=50)
-    assert "full_name ILIKE ?" in captured["sql"]
+    assert "player_id = ?" in captured["sql"]
     assert "snap_pct >= ?" in captured["sql"]
     assert "snap_pct_delta DESC" in captured["sql"]
-    assert captured["params"] == ["%Kelce%", "TE", "KC", 2024, 8, 50.0]
+    assert captured["params"] == ["00-0036322", "TE", "KC", 2024, 8, 50.0]
 
 
 def test_role_trend_invalid_limit_falls_back(monkeypatch):
@@ -792,10 +1096,12 @@ def test_role_trend_returns_error_on_timeout(monkeypatch):
 
 def test_separation_opportunity_builds_filters(monkeypatch):
     captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
+    stub_resolver(monkeypatch)
     tools.nfl_separation_opportunity(player="Aiyuk", position="wr", team="sf", season=2024, regression_candidate=True)
+    assert "player_id = ?" in captured["sql"]
     assert "regression_candidate = ?" in captured["sql"]
     assert "fp_diff_per_game ASC" in captured["sql"]
-    assert captured["params"] == ["%Aiyuk%", "WR", "SF", 2024, True]
+    assert captured["params"] == ["00-0036322", "WR", "SF", 2024, True]
 
 
 def test_separation_opportunity_guards_pre_2016():
@@ -816,11 +1122,12 @@ def test_separation_opportunity_returns_error_on_timeout(monkeypatch):
 
 def test_drop_rate_builds_filters(monkeypatch):
     captured = _capture_execute(monkeypatch, [{"player": "T.Pollard"}])
+    stub_resolver(monkeypatch)
     tools.nfl_drop_rate(player="Pollard", team="ten", season=2024, min_targets=30)
-    assert "player ILIKE ?" in captured["sql"]
+    assert "player_id = ?" in captured["sql"]
     assert "catchable_targets >= ?" in captured["sql"]
     assert "drop_rate_pct DESC" in captured["sql"]
-    assert captured["params"] == ["%Pollard%", "TEN", 2024, 30]
+    assert captured["params"] == ["00-0036322", "TEN", 2024, 30]
 
 
 def test_drop_rate_guards_pre_2022():
@@ -841,11 +1148,13 @@ def test_drop_rate_returns_error_on_timeout(monkeypatch):
 
 def test_contract_value_builds_filters(monkeypatch):
     captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
+    stub_resolver(monkeypatch)
     tools.nfl_contract_value(player="Gibbs", position="rb", team="det", season=2024, min_apy=2, max_apy=10)
+    assert "player_id = ?" in captured["sql"]
     assert "apy >= ?" in captured["sql"]
     assert "apy <= ?" in captured["sql"]
     assert "fp_per_million DESC" in captured["sql"]
-    assert captured["params"] == ["%Gibbs%", "RB", "DET", 2024, 2.0, 10.0]
+    assert captured["params"] == ["00-0036322", "RB", "DET", 2024, 2.0, 10.0]
 
 
 def test_contract_value_invalid_limit_falls_back(monkeypatch):

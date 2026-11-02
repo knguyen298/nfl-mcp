@@ -858,6 +858,117 @@ class TestAggregateAndIndexBuilders:
         assert _table_exists(conn, "does_not_exist") is False
 
 
+class TestFantasyTablesJoinById:
+    """player_role_trend and injury_return_curve must key on ids, not on names.
+
+    Both tables used to join snap_counts by name. That lost every row where the
+    fantasy name differed from the PFR name, and it let two players who share a
+    name share one baseline.
+    """
+
+    @staticmethod
+    def _write_sources(conn, snap_rows):
+        # ff_opportunity calls the tight end "Terry Kelce"; snap_counts (PFR) and the
+        # players table both use "Travis Kelce" for the same pfr id.
+        _write_df_to_table(conn, "ff_opportunity", pl.DataFrame({
+            "player_id": ["00-1", "00-1", "00-2"],
+            "full_name": ["Terry Kelce", "Terry Kelce", "Justin Jefferson"],
+            "position": ["TE", "TE", "WR"],
+            "posteam": ["KC", "KC", "MIN"],
+            "season": ["2024", "2024", "2024"],
+            "week": [1.0, 2.0, 1.0],
+            "rec_attempt": [4.0, 6.0, 8.0],
+            "rec_attempt_team": [10.0, 10.0, 20.0],
+            "rush_attempt": [0.0, 0.0, 0.0],
+            "rush_attempt_team": [10.0, 10.0, 20.0],
+            "rec_air_yards": [40.0, 60.0, 80.0],
+            "rec_air_yards_team": [100.0, 100.0, 200.0],
+            "rec_touchdown": [0.0, 1.0, 0.0],
+            "rec_touchdown_exp": [0.5, 0.5, 0.5],
+            "rec_touchdown_diff": [-0.5, 0.5, -0.5],
+            "rush_touchdown": [0.0, 0.0, 0.0],
+            "rush_touchdown_exp": [0.0, 0.0, 0.0],
+            "rush_touchdown_diff": [0.0, 0.0, 0.0],
+        }), replace=True)
+        _write_df_to_table(conn, "players", pl.DataFrame({
+            "gsis_id": ["00-1", "00-2"],
+            "pfr_id": ["KelcTr00", "JeffJu00"],
+        }), replace=True)
+        _write_df_to_table(conn, "snap_counts", pl.DataFrame({
+            "pfr_player_id": [r[0] for r in snap_rows],
+            "player": [r[1] for r in snap_rows],
+            "team": [r[2] for r in snap_rows],
+            "season": [r[3] for r in snap_rows],
+            "week": [r[4] for r in snap_rows],
+            "offense_pct": [r[5] for r in snap_rows],
+        }), replace=True)
+
+    def test_role_trend_uses_the_id_mapping_when_the_names_differ(self, conn):
+        self._write_sources(conn, [
+            ("KelcTr00", "Travis Kelce", "KC", 2024, 1, 0.80),
+            ("KelcTr00", "Travis Kelce", "KC", 2024, 2, 0.60),
+            ("JeffJu00", "Justin Jefferson", "MIN", 2024, 1, 0.90),
+        ])
+        _create_fantasy_tables(conn)
+
+        rows = conn.execute(
+            "SELECT player_id, week, snap_pct FROM player_role_trend ORDER BY player_id, week"
+        ).fetchall()
+        assert [r[2] for r in rows] == [80.0, 60.0, 90.0]   # no nulls, right player each row
+
+    def test_role_trend_has_no_snap_when_the_id_maps_to_nothing(self, conn):
+        # The only snap row belongs to a third player, pfr JeffJu99, who happens to carry
+        # the same name and team as ff row 00-2. The name join handed him those snaps;
+        # the id join finds no snap row for JeffJu00 and leaves the share null.
+        self._write_sources(conn, [
+            ("JeffJu99", "Justin Jefferson", "MIN", 2024, 1, 0.90),
+        ])
+        _create_fantasy_tables(conn)
+
+        rows = conn.execute(
+            "SELECT player_id, snap_pct FROM player_role_trend ORDER BY player_id, week"
+        ).fetchall()
+        assert [r[1] for r in rows] == [None, None, None]
+
+    def test_injury_return_curve_gives_same_name_players_their_own_baseline(self, conn):
+        # Two players named 'Justin Jefferson'. Only the first (00-1, JeffJu00) sat out
+        # weeks 3-4; the other kept playing at a flat 20% share.
+        _write_df_to_table(conn, "players", pl.DataFrame({
+            "gsis_id": ["00-1", "00-2"],
+            "pfr_id": ["JeffJu00", "JeffJu01"],
+        }), replace=True)
+        _write_df_to_table(conn, "injuries", pl.DataFrame({
+            "gsis_id": ["00-1", "00-1"],
+            "full_name": ["Justin Jefferson", "Justin Jefferson"],
+            "position": ["TE", "TE"],
+            "season": [2024, 2024],
+            "week": [3, 4],
+            "report_status": ["Out", "Out"],
+            "report_primary_injury": ["hamstring", "hamstring"],
+            "practice_primary_injury": [None, None],
+        }), replace=True)
+        _write_df_to_table(conn, "snap_counts", pl.DataFrame({
+            "pfr_player_id": ["JeffJu00", "JeffJu00", "JeffJu00", "JeffJu00",
+                              "JeffJu01", "JeffJu01", "JeffJu01", "JeffJu01"],
+            "player": ["Justin Jefferson"] * 8,
+            "team": ["MIN"] * 8,
+            "season": [2024] * 8,
+            "week": [1, 2, 5, 6, 1, 2, 5, 6],
+            "offense_pct": [0.8, 0.4, 0.6, 0.3, 0.2, 0.2, 0.2, 0.2],
+        }), replace=True)
+
+        _create_fantasy_tables(conn)
+
+        curve = conn.execute(
+            "SELECT week_post_return, avg_snap_pct_recovery, sample_size "
+            "FROM injury_return_curve ORDER BY week_post_return"
+        ).fetchall()
+        # The baseline is the injured player's own pre-injury snaps (0.8, 0.4 → 0.6), so
+        # +1 is his own usage and +2 is half of it, one sample each. The old name join
+        # pooled both players: it gave every bucket sample_size 2 and +2 as 62.5%.
+        assert curve == [(1, 100.0, 1), (2, 50.0, 1)]
+
+
 # ── run_ingest_datasets orchestration ──────────────────────────────────────────
 
 class TestRunIngestOrchestration:

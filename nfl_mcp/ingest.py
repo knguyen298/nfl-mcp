@@ -667,7 +667,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
 
     # 2. Rolling 3-week role trend — snap / target / carry / air-yards share with
     #    a trailing 3-week average and the current-week delta vs that average.
-    ("player_role_trend", ["ff_opportunity", "snap_counts"], """
+    ("player_role_trend", ["ff_opportunity", "snap_counts", "players"], """
         WITH base AS (
             SELECT
                 o.player_id,
@@ -681,8 +681,10 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
                 ROUND(100.0 * o.rush_attempt / NULLIF(o.rush_attempt_team, 0), 2)  AS carry_share_pct,
                 ROUND(100.0 * o.rec_air_yards / NULLIF(o.rec_air_yards_team, 0), 2) AS air_yards_share_pct
             FROM ff_opportunity o
+            LEFT JOIN players pl
+              ON pl.gsis_id = o.player_id
             LEFT JOIN snap_counts s
-              ON s.player  = o.full_name
+              ON s.pfr_player_id = pl.pfr_id
              AND s.team    = o.posteam
              AND s.season  = CAST(o.season AS INTEGER)
              AND s.week    = CAST(o.week AS INTEGER)
@@ -813,19 +815,21 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
 
     # 6. Injury return curve — post-return snap-share recovery (as % of pre-injury
     #    baseline) at +1..+8 weeks, bucketed by normalized injury type and position.
-    ("injury_return_curve", ["injuries", "snap_counts"], """
+    ("injury_return_curve", ["injuries", "snap_counts", "players"], """
         WITH outs AS (
             SELECT
-                gsis_id,
-                full_name,
-                position,
-                CAST(season AS INTEGER) AS season,
-                CAST(week AS INTEGER)   AS week,
-                LOWER(TRIM(COALESCE(report_primary_injury, practice_primary_injury))) AS injury_raw
-            FROM injuries
-            WHERE report_status = 'Out'
-              AND gsis_id IS NOT NULL
-              AND COALESCE(report_primary_injury, practice_primary_injury) IS NOT NULL
+                i.gsis_id,
+                pl.pfr_id,
+                i.full_name,
+                i.position,
+                CAST(i.season AS INTEGER) AS season,
+                CAST(i.week AS INTEGER)   AS week,
+                LOWER(TRIM(COALESCE(i.report_primary_injury, i.practice_primary_injury))) AS injury_raw
+            FROM injuries i
+            LEFT JOIN players pl ON pl.gsis_id = i.gsis_id
+            WHERE i.report_status = 'Out'
+              AND i.gsis_id IS NOT NULL
+              AND COALESCE(i.report_primary_injury, i.practice_primary_injury) IS NOT NULL
         ),
         typed AS (
             SELECT *,
@@ -862,6 +866,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
         spells AS (
             SELECT
                 gsis_id,
+                ANY_VALUE(pfr_id)    AS pfr_id,
                 ANY_VALUE(full_name) AS full_name,
                 ANY_VALUE(position)  AS position,
                 season,
@@ -873,15 +878,15 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
         ),
         baseline AS (
             SELECT
-                sp.gsis_id, sp.full_name, sp.position, sp.season,
+                sp.gsis_id, sp.pfr_id, sp.full_name, sp.position, sp.season,
                 sp.injury_type, sp.first_out_week, sp.last_out_week,
                 AVG(sn.offense_pct) AS baseline_pct
             FROM spells sp
             JOIN snap_counts sn
-              ON sn.player = sp.full_name
+              ON sn.pfr_player_id = sp.pfr_id
              AND sn.season = sp.season
              AND sn.week   < sp.first_out_week
-            GROUP BY sp.gsis_id, sp.full_name, sp.position, sp.season,
+            GROUP BY sp.gsis_id, sp.pfr_id, sp.full_name, sp.position, sp.season,
                      sp.injury_type, sp.first_out_week, sp.last_out_week
         ),
         curve AS (
@@ -892,7 +897,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
                 100.0 * sn.offense_pct / NULLIF(b.baseline_pct, 0) AS recovery_pct
             FROM baseline b
             JOIN snap_counts sn
-              ON sn.player = b.full_name
+              ON sn.pfr_player_id = b.pfr_id
              AND sn.season = b.season
              AND sn.week   > b.last_out_week
              AND sn.week  <= b.last_out_week + 8

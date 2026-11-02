@@ -190,13 +190,15 @@ class TestNflPlayerStats:
         assert "carries" in result["seasons"][0]
 
     def test_receiving_stats(self):
-        result = nfl_player_stats(player_name="J.Jefferson", stat_type="receiving")
+        result = nfl_player_stats(player_name="Justin Jefferson", season=2024, stat_type="receiving")
         assert "error" not in result
+        assert len(result["seasons"]) > 0
 
-    def test_unknown_player_returns_empty(self):
+    def test_unknown_player_is_not_found(self):
         result = nfl_player_stats(player_name="ZZZZNOTAPLAYER", stat_type="passing")
         assert "error" not in result
-        assert len(result["seasons"]) == 0
+        assert result["not_found"] is True
+        assert isinstance(result["did_you_mean"], list)
 
 
 @pytest.mark.integration
@@ -212,12 +214,28 @@ class TestNflCompare:
 
     def test_compare_players(self):
         result = nfl_compare(
-            entity1="P.Mahomes", entity2="L.Jackson",
+            entity1="Patrick Mahomes", entity2="Justin Herbert",
             compare_type="player", season=2024
         )
         assert "error" not in result
-        assert "P.Mahomes" in result
-        assert "L.Jackson" in result
+        sides = result["players"]
+        assert [s["requested"] for s in sides] == ["Patrick Mahomes", "Justin Herbert"]
+        assert [s["player"]["gsis_id"] for s in sides] == ["00-0033873", "00-0036355"]
+        assert "passing" in sides[0] and "passing" in sides[1]
+
+    def test_compare_players_gives_the_side_it_cannot_settle_to_the_caller(self):
+        # 'Lamar Jackson' is the Ravens QB and an Falcons CB in 2024, so that side
+        # answers with candidates while the other side still gets its stats.
+        result = nfl_compare(
+            entity1="P.Mahomes", entity2="Lamar Jackson",
+            compare_type="player", season=2024
+        )
+        sides = result["players"]
+        assert sides[0]["player"]["gsis_id"] == "00-0033873"
+        assert "passing" in sides[0]
+        assert sides[1]["ambiguous"] is True
+        assert {c["full_name"] for c in sides[1]["candidates"]} == {"Lamar Jackson"}
+        assert {c["team"] for c in sides[1]["candidates"]} == {"BAL", "ATL"}
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("require_db")

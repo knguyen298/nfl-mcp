@@ -223,7 +223,7 @@ Rules:
 
 - **Claude Desktop can't access `~/Desktop`** due to macOS sandboxing. The Claude Desktop venv must be outside Desktop — currently `~/nfl-mcp-venv`. Any code changes require `pip install --force-reinstall` into that venv.
 - **DuckDB write lock**: the server opens read-only connections. Ingest opens a write connection. Don't run ingest while the server is running against the same DB file.
-- **Player names are abbreviated**: `'P.Mahomes'`, `'T.Hill'` — use `ILIKE '%name%'` for fuzzy matching.
+- **Player names are abbreviated** (`'P.Mahomes'`, `'T.Hill'`) and are not unique: resolve a name with `nfl_resolve_player` and filter rows by `gsis_id` (`pfr_id` in `snap_counts`), never with `ILIKE '%name%'`. A name that covers several players returns `ambiguous` plus labelled candidates. Keep `ILIKE` only as the fallback in a raw `nfl_query` over a table that has no id column.
 - **Team codes are historical**: `plays` and `schedules` carry the code of the era (`OAK`, `SD`, `STL`). Normalize with `franchises.canonical_team()` instead of comparing raw codes across decades, or a Raiders-through-2024 query silently returns two franchises' worth of gaps.
 - **Pre-1999 game results are not in the database**, and ESPN's archived scores for 1970–2001 are not a substitute: the Monday-night game of every week is filed `0-0` with no box score. Only ESPN's cumulative per-club record is trustworthy for those years — see `espn.py`.
 - **Boolean columns are `DOUBLE PRECISION` 0/1** in the plays table — filter with `= 1`, not `IS TRUE`.
