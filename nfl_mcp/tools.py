@@ -788,20 +788,28 @@ _TEAM_STAT_SOURCES = {
 
 
 def _stale_derived_tables(tables: Sequence[str]) -> dict[str, Any] | None:
-    """Return an error naming the rebuild command when one of these tables predates its columns.
+    """Return an error naming both rebuild paths when a derived table predates its columns.
 
     None means every table here can be read. A database ingested before this change has derived
     tables - the ones the ingest builds rather than the ones nflverse publishes - with no season_type
     column, so the tools that read them fail on a DuckDB binder error about a column the caller never
     typed. A table the database does not have at all reports no columns and is left to the query, so
     a database that was never ingested still hears that its tables are missing.
+
+    The command has to reach a DuckDB writer. `nfl-mcp ingest --dataset teams` is wrong here: it
+    takes a write lock on the file this server is reading and re-fetches plays over the network.
+    `nfl-mcp rebuild` rebuilds from rows already loaded, but it still needs the write lock, so the
+    server must be stopped first. In a container the server never stops, so there the path is
+    /update_db.sh, which builds the idle slot and swaps the symlink.
     """
     for table in tables:
         columns = {str(row.get("column_name")) for row in _execute(
             "SELECT column_name FROM information_schema.columns WHERE table_name = ?", [table])}
         if columns and "season_type" not in columns:
             return {"error": f"{table} has no season_type column. "
-                             "Rebuild the derived tables: nfl-mcp ingest --dataset teams"}
+                             "Rebuild the derived tables: nfl-mcp rebuild with the server "
+                             "stopped, or /update_db.sh in a container (builds the idle slot "
+                             "and swaps the symlink)"}
     return None
 
 

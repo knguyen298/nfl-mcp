@@ -11,6 +11,7 @@ NFL MCP — command-line entry point
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -133,6 +134,56 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999):
         fresh=fresh,
         skip_views=skip_views,
     )
+
+
+# ── rebuild ────────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option("--check", "check_only", is_flag=True,
+              help="Print 'current' or 'stale' and exit 0 or 1; write nothing.")
+def rebuild(check_only):
+    """Rebuild the derived tables from rows already in the database: no network.
+
+    --check needs no write lock, so it is safe while the server runs. A missing
+    database answers --check as stale: there is nothing in it to rebuild from,
+    and exit 1 lets the caller say so with a real message, not a lock error.
+    """
+    import duckdb
+
+    from .config import get_duckdb_path
+    from .ingest import derived_shape_is_stale, rebuild_derived_tables
+
+    db_path = str(get_duckdb_path())
+    if check_only:
+        if not Path(db_path).exists():
+            click.echo("stale")
+            raise SystemExit(1)
+        try:
+            conn = duckdb.connect(db_path, read_only=True)
+        except duckdb.Error as exc:
+            click.echo(f"error: cannot open {db_path} read-only ({exc})", err=True)
+            raise SystemExit(2)
+        try:
+            stale = derived_shape_is_stale(conn)
+        finally:
+            conn.close()
+        click.echo("stale" if stale else "current")
+        raise SystemExit(1 if stale else 0)
+
+    if not Path(db_path).exists():
+        click.echo(f"error: no database at {db_path} to rebuild from", err=True)
+        raise SystemExit(2)
+    try:
+        conn = duckdb.connect(db_path)
+    except duckdb.Error as exc:
+        click.echo(f"error: cannot open {db_path} for write ({exc})", err=True)
+        raise SystemExit(2)
+    try:
+        started = time.monotonic()
+        rebuild_derived_tables(conn, db_path)
+    finally:
+        conn.close()
+    click.echo(f"Rebuilt derived tables in {time.monotonic() - started:.1f}s")
 
 
 # ── init ───────────────────────────────────────────────────────────────────────

@@ -155,6 +155,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (Claude
 nfl-mcp init               Interactive setup wizard
 nfl-mcp serve              Start the MCP server (Streamable HTTP, default port 8000)
 nfl-mcp ingest             Load NFL data into the database
+nfl-mcp rebuild            Rebuild derived tables from local data (no network)
 nfl-mcp setup-client       Configure IDE MCP clients
 nfl-mcp doctor             Health check
 ```

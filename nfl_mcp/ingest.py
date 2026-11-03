@@ -1280,6 +1280,65 @@ def _create_team_records(conn: duckdb.DuckDBPyConnection):
     print(f"    team_records ✓ ({row_count:,} rows)")
 
 
+# Raise this integer whenever a derived table changes columns, and add a test
+# that a database stamped one version back reads as stale. The column probe in
+# derived_shape_is_stale stays independent of this stamp: a database written
+# before the stamp exists has no row to compare.
+DERIVED_SHAPE_VERSION = 1
+
+# Tables that gained season_type together; probing all four catches every
+# database written before that change.
+_PROBE_TABLES = ("team_offense_stats", "team_defense_stats",
+                 "situational_stats", "player_separation_opportunity")
+
+
+def derived_shape_is_stale(conn: duckdb.DuckDBPyConnection) -> bool:
+    """True when the derived tables need a rebuild for the current code.
+
+    The stamp is the cheap check; the column probe is the one that sees a
+    database written before stamps existed. Keep both, not either alone. A
+    probe table the database does not have passes: absent tables are
+    nfl_status's job, not a reason to rebuild on every partial database.
+    """
+    try:
+        row = conn.execute(
+            "SELECT row_count FROM _ingest_metadata "
+            "WHERE dataset_id = 'derived_shape' AND season IS NULL"
+        ).fetchone()
+        stamp = int(row[0]) if row and row[0] is not None else None
+    except (duckdb.CatalogException, duckdb.BinderException):
+        stamp = None
+    if stamp is None or stamp < DERIVED_SHAPE_VERSION:
+        return True
+    placeholders = ", ".join(["?"] * len(_PROBE_TABLES))
+    stale = conn.execute(
+        f"SELECT DISTINCT table_name FROM information_schema.columns"
+        f" WHERE table_name IN ({placeholders})"
+        f"   AND table_name NOT IN (SELECT table_name FROM information_schema.columns"
+        f"     WHERE table_name IN ({placeholders}) AND column_name = 'season_type')",
+        [*list(_PROBE_TABLES), *list(_PROBE_TABLES)],
+    ).fetchall()
+    return bool(stale)
+
+
+def rebuild_derived_tables(conn: duckdb.DuckDBPyConnection, db_path: str) -> None:
+    """Rebuild every derived table from rows already in the database: no network.
+
+    Stamps _ingest_metadata with the version these builders produce. The only
+    integer columns there are row_count and season, and season stays NULL
+    because the shape covers every season, so the version rides in row_count.
+    """
+    print("Rebuilding derived tables (no network)...")
+    _apply_duckdb_pragmas(conn, db_path)
+    _ensure_metadata_table(conn)
+    _create_aggregate_tables(conn)
+    _create_fantasy_tables(conn)
+    _create_team_records(conn)
+    _record_loaded(conn, dataset_id="derived_shape", table_name="derived_shape",
+                   loader_fn="nfl_mcp.ingest.rebuild_derived_tables",
+                   row_count=DERIVED_SHAPE_VERSION)
+
+
 def _create_indexes(conn: duckdb.DuckDBPyConnection):
     print("\n  Creating indexes…")
     for idx_sql in [

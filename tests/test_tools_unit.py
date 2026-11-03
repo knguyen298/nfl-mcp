@@ -1288,7 +1288,8 @@ def test_separation_opportunity_says_what_to_rebuild(monkeypatch):
     stub_resolver(monkeypatch)
     assert tools.nfl_separation_opportunity() == {
         "error": "player_separation_opportunity has no season_type column. "
-                 "Rebuild the derived tables: nfl-mcp ingest --dataset teams"}
+                 "Rebuild the derived tables: nfl-mcp rebuild with the server stopped, or "
+                 "/update_db.sh in a container (builds the idle slot and swaps the symlink)"}
 
 
 def test_separation_opportunity_guards_pre_2016():

@@ -174,6 +174,83 @@ def test_update_scripts_parse_as_posix_shell():
         assert result.returncode == 0, f"{script_name}: {result.stderr.strip()}"
 
 
+# ── rebuild on start ──────────────────────────────────────────────────────────
+
+class TestRebuildGuardWiring:
+    """A new image over an existing /data volume keeps the old slot, so the derived
+    tables it serves can predate the image's shape. entrypoint.sh must ask the
+    read-only --check question and rebuild locally before serving - and a failed
+    rebuild must not abort the start under set -eu.
+    """
+
+    def test_rebuild_block_sits_after_the_symlink_and_before_serving(self):
+        entrypoint = _read("entrypoint.sh")
+        assert "if ! nfl-mcp rebuild --check > /dev/null 2>&1; then" in entrypoint
+        assert "nfl-mcp rebuild ||" in entrypoint
+        assert "Rebuild failed; tools will answer with a rebuild message." in entrypoint
+        link = entrypoint.index('ln -sfn "$(basename "$SLOT_A")" "$SYMLINK"')
+        guard = entrypoint.index("nfl-mcp rebuild --check")
+        serve = entrypoint.index("exec nfl-mcp serve")
+        assert link < guard < serve
+
+    @staticmethod
+    def _stub_nfl_mcp(bin_dir, behaviour):
+        stub = bin_dir / "nfl-mcp"
+        stub.write_text("#!/bin/sh\n" + behaviour)
+        stub.chmod(0o755)
+
+    def test_a_failed_rebuild_still_starts_the_server(self, tmp_path):
+        # Stub nfl-mcp: --check says stale, rebuild dies on a lock. Under set -eu
+        # that must still print the notice and exec serve.
+        entrypoint, _, _, bin_dir = _sim(tmp_path)
+        self._stub_nfl_mcp(
+            bin_dir,
+            'if [ "$2" = "--check" ]; then echo stale; exit 1; fi\n'
+            'if [ "$1" = "rebuild" ]; then echo "stub: lock held" >&2; exit 1; fi\n'
+            'echo "[serve started]"\n',
+        )
+        env = _child_env(bin_dir)
+        result = subprocess.run(["sh", str(entrypoint)], capture_output=True, text=True, env=env, check=False)
+
+        assert result.returncode == 0, result.stderr
+        assert "Derived tables are stale; rebuilding" in result.stdout
+        assert "Rebuild failed; tools will answer with a rebuild message." in result.stdout
+        assert "[serve started]" in result.stdout
+
+    def test_current_slot_a_skips_the_rebuild(self, tmp_path):
+        # The stub's --check exits 0, so the rebuild must not run at all.
+        entrypoint, _, _, bin_dir = _sim(tmp_path)
+        marker = tmp_path / "rebuilt"
+        self._stub_nfl_mcp(
+            bin_dir,
+            f'if [ "$2" = "--check" ]; then echo current; exit 0; fi\n'
+            f'if [ "$1" = "rebuild" ]; then touch "{marker}"; fi\n'
+            'echo "[serve started]"\n',
+        )
+        env = _child_env(bin_dir)
+        result = subprocess.run(["sh", str(entrypoint)], capture_output=True, text=True, env=env, check=False)
+
+        assert result.returncode == 0, result.stderr
+        assert "rebuilding" not in result.stdout
+        assert not marker.exists()
+        assert "[serve started]" in result.stdout
+
+
+def _child_env(bin_dir):
+    """Environment for a simulated container run.
+
+    The nfl-mcp stub writes the text INGESTED to $NFL_MCP_DB_PATH, and the entrypoint's
+    rebuild call does not set that variable itself. Left inherited, one lifecycle test
+    overwrites the database file the rest of the suite is reading, and every later
+    integration test answers 'exists, but it is not a valid DuckDB database file'. The
+    branches that must write do so with an explicit assignment in entrypoint.sh, so the
+    simulated run gets no path from the caller.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "NFL_MCP_DB_PATH"}
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    return env
+
+
 # ── functional simulation of the container lifecycle ───────────────────────────
 #
 # The init branches above are asserted as text, but the real failure modes are runtime
@@ -185,6 +262,7 @@ _NFL_MCP_STUB = (
     '#!/bin/sh\n'
     'echo "[stub nfl-mcp $*]"\n'
     'if [ -n "${NFL_MCP_DB_PATH:-}" ]; then printf INGESTED > "$NFL_MCP_DB_PATH"; fi\n'
+    'if [ "$1" = "rebuild" ]; then exit 0; fi\n'
 )
 
 
@@ -227,7 +305,7 @@ def _sim(tmp_path, *, with_seed=True, existing_baked=False):
 
 
 def _run(script, bin_dir):
-    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    env = _child_env(bin_dir)
     result = subprocess.run(["sh", str(script)], capture_output=True, text=True, env=env)
     assert result.returncode == 0, result.stderr
     return result.stdout
@@ -282,7 +360,7 @@ class TestContainerLifecycle:
 
     def test_updater_refuses_to_run_without_the_symlink(self, tmp_path):
         _, updater, data, bin_dir = _sim(tmp_path)
-        env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+        env = _child_env(bin_dir)
         result = subprocess.run(["sh", str(updater)], capture_output=True, text=True, env=env)
 
         assert result.returncode != 0

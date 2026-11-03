@@ -35,6 +35,18 @@ fi
 ln -sfn "$(basename "$SLOT_A")" "$SYMLINK"
 echo "[init] Active DB: $(readlink "$SYMLINK")"
 
+# A new image over an existing /data volume keeps the old slot, whose derived
+# tables can predate the current shape. Rebuilding them is local work: measured
+# with /usr/bin/time -v, 1.36s / 165MB peak (191MB db, 110,710 plays) and 1.30s
+# / 200MB peak (582MB db, 521,905 plays). The cost tracks the plays scan; the
+# seed holds plays from 1999, so ~3s is expected there. That is why a rebuild
+# at start is allowed where a 10-minute cold ingest is not. Both commands are
+# conditions, so set -eu cannot abort the start when a rebuild fails.
+if ! nfl-mcp rebuild --check > /dev/null 2>&1; then
+    echo "[init] Derived tables are stale; rebuilding (no network)..."
+    nfl-mcp rebuild || echo "[init] Rebuild failed; tools will answer with a rebuild message."
+fi
+
 cat > /tmp/crontab << 'EOF'
 # Thursday 6AM UTC: corrected weekly data and all default datasets.
 0 6 * * 4     /update_db.sh >> /var/log/nflmcp/nfl_update.log 2>&1

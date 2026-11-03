@@ -235,15 +235,16 @@ def _team_tables_db(tmp_path, monkeypatch, *, season_type: bool) -> None:
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(db))
 
 
-_REBUILD = "Rebuild the derived tables: nfl-mcp ingest --dataset teams"
+_REBUILD = ("Rebuild the derived tables: nfl-mcp rebuild with the server stopped, or "
+            "/update_db.sh in a container (builds the idle slot and swaps the symlink)")
 
 
 class TestStaleDerivedTables:
     """A database ingested before these derived tables gained season_type cannot serve these queries.
 
     The tools must say what to run, not hand back DuckDB's binder error about a column the caller
-    never typed. `teams` is the cheapest dataset that rebuilds the derived tables: it is static and
-    replace-style, so the run does one small fetch, no season loop, no play-by-play download.
+    never typed. The named command must reach a DuckDB writer without the network: `nfl-mcp
+    rebuild` with the server stopped, or /update_db.sh in a container.
     """
 
     def test_a_table_without_season_type_names_the_command_to_rebuild_it(self, tmp_path, monkeypatch):
