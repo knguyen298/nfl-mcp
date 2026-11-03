@@ -1514,10 +1514,10 @@ def run_ingest_datasets(
     # ── Derived tables (built from already-ingested sources) ────────────────
     if not skip_views:
         # After the datasets above: the team tables read team_stats_raw and schedules, so building
-        # them here means a run that ingests those two is reflected in the same run.
-        _create_aggregate_tables(conn)
-        _create_fantasy_tables(conn)
-        _create_team_records(conn)
+        # them here means a run that ingests those two is reflected in the same run. This call also
+        # stamps DERIVED_SHAPE_VERSION, so a database that a plain ingest has just refreshed answers
+        # `nfl-mcp rebuild --check` as current instead of asking for a rebuild it no longer needs.
+        rebuild_derived_tables(conn, path)
 
     conn.close()
     print("\n" + "=" * 60)

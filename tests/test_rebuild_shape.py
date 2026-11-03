@@ -262,3 +262,43 @@ class TestRebuildCli:
         separation = nfl_separation_opportunity(season=2024)
         assert "error" not in separation, separation
         assert separation["separation_opportunity"], separation
+
+
+@pytest.mark.integration
+class TestIngestStampsTheShape:
+    def test_a_plain_ingest_stamps_the_shape_it_just_built(self, tmp_path, monkeypatch):
+        """`nfl-mcp ingest` must leave the database answering current, not stale.
+
+        run_ingest_datasets ends by rebuilding the derived tables, and that call is what
+        stamps DERIVED_SHAPE_VERSION. Without the stamp, a database a normal ingest had just
+        refreshed answered `nfl-mcp rebuild --check` as stale, so entrypoint.sh rebuilt it at
+        every container start. No dataset ids here, so the ingest loops are skipped and only
+        the tail runs, which is the part under test and needs no network.
+        """
+        import shutil
+
+        from nfl_mcp.config import get_duckdb_path
+        from nfl_mcp.ingest import run_ingest_datasets, shape_stamp
+
+        source = get_duckdb_path()
+        if not source.exists():
+            pytest.skip(f"no database at {source}")
+        db = tmp_path / "ingest_stamp.duckdb"
+        shutil.copyfile(source, db)
+        conn = duckdb.connect(str(db))
+        try:
+            _ensure_metadata_table(conn)
+            conn.execute("DELETE FROM _ingest_metadata WHERE dataset_id = 'derived_shape'")
+            assert shape_stamp(conn) is None
+        finally:
+            conn.close()
+
+        monkeypatch.setenv("NFL_MCP_DB_PATH", str(db))
+        run_ingest_datasets([], db_path=str(db))
+
+        conn = duckdb.connect(str(db), read_only=True)
+        try:
+            assert shape_stamp(conn) == DERIVED_SHAPE_VERSION
+            assert not derived_shape_is_stale(conn)
+        finally:
+            conn.close()

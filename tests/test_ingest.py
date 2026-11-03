@@ -1353,16 +1353,8 @@ class TestRunIngestOrchestration:
         )
         monkeypatch.setattr("nfl_mcp.ingest._create_indexes", lambda c: calls.__setitem__("idx", calls["idx"] + 1))
         monkeypatch.setattr(
-            "nfl_mcp.ingest._create_aggregate_tables",
-            lambda c: calls.__setitem__("agg", calls["agg"] + 1),
-        )
-        monkeypatch.setattr(
-            "nfl_mcp.ingest._create_fantasy_tables",
-            lambda c: calls.__setitem__("fantasy", calls.get("fantasy", 0) + 1),
-        )
-        monkeypatch.setattr(
-            "nfl_mcp.ingest._create_team_records",
-            lambda c: calls.__setitem__("records", calls.get("records", 0) + 1),
+            "nfl_mcp.ingest.rebuild_derived_tables",
+            lambda c, p: calls.__setitem__("rebuild", calls.get("rebuild", 0) + 1),
         )
         monkeypatch.setattr(
             "nfl_mcp.ingest._ingest_generic_dataset",
@@ -1381,9 +1373,8 @@ class TestRunIngestOrchestration:
         assert calls["pbp"] == [2024]
         assert calls["record"] == [("pbp", "plays", "load_pbp", 11, 2024)]
         assert calls["idx"] == 1
-        assert calls["agg"] == 1
-        assert calls.get("fantasy") == 1
-        assert calls.get("records") == 1
+        # One call to the rebuild helper, which is what stamps DERIVED_SHAPE_VERSION.
+        assert calls["rebuild"] == 1
         assert calls["other"] and calls["other"][0][0] == "schedules"
         assert conn.closed is True
 
@@ -1401,7 +1392,8 @@ class TestRunIngestOrchestration:
         monkeypatch.setattr("nfl_mcp.ingest._create_plays_table", lambda c, df, fresh=False: None)
         monkeypatch.setattr("nfl_mcp.ingest._ingest_pbp_season", lambda c, season: pbp_calls.append(season) or 1)
         monkeypatch.setattr("nfl_mcp.ingest._create_indexes", lambda c: None)
-        monkeypatch.setattr("nfl_mcp.ingest._create_aggregate_tables", lambda c: agg_calls.append(True))
+        monkeypatch.setattr("nfl_mcp.ingest.rebuild_derived_tables",
+                            lambda c, p: agg_calls.append(True))
 
         run_ingest_datasets(
             dataset_ids=["pbp"],
@@ -1430,6 +1422,7 @@ class TestRunIngestOrchestration:
         monkeypatch.setattr("nfl_mcp.ingest._create_aggregate_tables", lambda c: None)
         monkeypatch.setattr("nfl_mcp.ingest._create_fantasy_tables", lambda c: None)
         monkeypatch.setattr("nfl_mcp.ingest._create_team_records", lambda c: None)
+        monkeypatch.setattr("nfl_mcp.ingest.rebuild_derived_tables", lambda c, p: None)
 
         run_ingest_datasets(
             dataset_ids=["schedules"],
