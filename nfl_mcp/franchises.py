@@ -72,7 +72,8 @@ FRANCHISES: dict[str, Franchise] = {f.key: f for f in (
     Franchise("HOU", "Houston Texans", 34, first_season=2002),
     Franchise("IND", "Indianapolis Colts", 11, first_season=1953,
               eras=((1953, "Baltimore Colts"), (1984, "Indianapolis Colts"))),
-    Franchise("JAX", "Jacksonville Jaguars", 30, first_season=1995),
+    # FantasyPros, the source of the fantasy ranking tables, spells the Jaguars 'JAC'.
+    Franchise("JAX", "Jacksonville Jaguars", 30, aliases=("JAC",), first_season=1995),
     Franchise("KC", "Kansas City Chiefs", 12, first_season=1960,
               eras=((1960, "Dallas Texans"), (1963, "Kansas City Chiefs"))),
     Franchise("LA", "Los Angeles Rams", 14, aliases=("STL", "LAR", "RAM"), first_season=1937,

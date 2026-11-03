@@ -489,10 +489,13 @@ class TestTeamFilterFollowsTrades:
         )["rows"][0]["n"]
         assert rows == 26
 
-    def test_a_team_code_the_franchise_table_does_not_know_finds_nothing(self):
-        # canonical_team() returns None for it, so the query keeps what the caller typed.
-        assert nfl_resolve_player("Davante Adams", team="ZZZ", season=2024)["not_found"] is True
-        assert nfl_injuries(team="ZZZ", season=2024)["count"] == 0
+    def test_a_team_code_the_franchise_table_does_not_know_is_named(self):
+        # Group C second pass, fix 4: the resolver used to narrow candidates to nothing and
+        # report the player as missing, so a bad club code looked like a bad player name.
+        assert nfl_resolve_player("Davante Adams", team="ZZZ", season=2024)["error"] \
+            == "Unknown team 'ZZZ'."
+        # Group C fix 3: a tool that filters rows on the code says so instead of returning 0.
+        assert nfl_injuries(team="ZZZ", season=2024)["error"] == "Unknown team 'ZZZ'."
 
 
 class TestPositionNarrowsCandidatesOnly:   # batch 2 fix 3

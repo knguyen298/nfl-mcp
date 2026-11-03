@@ -187,10 +187,11 @@ class TestNflTeamStats:
         assert "situational" in result
         assert len(result["situational"]) > 0
 
-    def test_invalid_team_returns_empty(self):
+    def test_unknown_team_names_the_code_instead_of_returning_nothing(self):
+        # Group C fix 3: a code no franchise uses is an answer, not an empty result set.
         result = nfl_team_stats(team="ZZZ", season=2024)
-        assert "error" not in result
-        assert len(result["offense"]) == 0
+        assert result["error"] == "Unknown team 'ZZZ'."
+        assert "current abbreviation" in result["hint"]
 
     def test_season_type_picks_one_of_the_two_rows(self):
         reg = nfl_team_stats(team="KC", season=2024, season_type="REG")
@@ -1117,10 +1118,9 @@ class TestNflRoster:
         for field in ("full_name", "position", "team", "season"):
             assert field in row
 
-    def test_unknown_team_returns_empty(self):
+    def test_unknown_team_is_reported_as_unknown(self):
         result = nfl_roster(team="ZZZ", season=2024)
-        assert "error" not in result
-        assert result["count"] == 0
+        assert result["error"] == "Unknown team 'ZZZ'."
 
 
 @pytest.mark.integration

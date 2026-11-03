@@ -256,7 +256,7 @@ def test_search_plays_uses_parameterized_filters(monkeypatch):
     assert "posteam = ?" in captured["sql"]
     assert "passer_player_id = ? OR rusher_player_id = ? OR receiver_player_id = ?" in captured["sql"]
     assert "ILIKE" not in captured["sql"]
-    assert "LIMIT 5" in captured["sql"]
+    assert "LIMIT 6" in captured["sql"]          # one row more finds out if more exist
     assert captured["params"][0] == "KC"
     assert captured["params"][1:4] == ["00-0036322"] * 3
     assert 2024 in captured["params"]
@@ -426,7 +426,7 @@ def test_player_stats_returns_the_resolver_verbatim(monkeypatch):
     assert result == {"ambiguous": True, "candidates": []}
 
 
-def test_compare_team_does_not_interpolate_user_input(monkeypatch):
+def test_compare_team_binds_the_code_and_refuses_a_non_code(monkeypatch):
     calls = []
 
     def fake_execute(sql, params=None):
@@ -434,13 +434,21 @@ def test_compare_team_does_not_interpolate_user_input(monkeypatch):
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
-    tools.nfl_compare(entity1="KC'; DROP TABLE plays; --", entity2="BAL", compare_type="team", season=2024)
+    result = tools.nfl_compare(entity1="KC'; DROP TABLE plays; --", entity2="BAL",
+                               compare_type="team", season=2024)
 
+    assert calls == []                              # no franchise: no query runs at all
+    assert "Unknown team" in result["error"]
+    assert "DROP TABLE" not in str(calls)           # the text never reached any SQL
+
+    tools.nfl_compare(entity1="oak", entity2="BAL", compare_type="team", season=2024)
     reads = _data_reads(calls)
-    assert len(calls) == 6
+    assert len(calls) == 6                          # 2 staleness lookups, then 4 data reads
     assert len(reads) == 4
-    assert all("DROP TABLE" not in sql for sql, _ in calls)
-    assert reads[0][1][0] == "KC'; DROP TABLE PLAYS; --"
+    assert "team IN (?, ?)" in reads[0][0]
+    assert reads[0][1][:2] == ["OAK", "LV"]         # the typed code binds, with its alias
+    assert "team = ?" in reads[2][0]                # a club that never moved needs one mark
+    assert reads[2][1] == ["BAL", 2024]
 
 
 def test_schema_table_returns_columns(monkeypatch):
@@ -670,7 +678,7 @@ def test_search_plays_applies_all_numeric_and_boolean_filters(monkeypatch):
     assert "touchdown = 1" in captured["sql"]
     assert "(interception = 1 OR fumble_lost = 1)" in captured["sql"]
     assert "yards_gained >= ?" in captured["sql"]
-    assert "LIMIT 500" in captured["sql"]
+    assert "LIMIT 501" in captured["sql"]      # max_rows is capped at _MAX_ROWS
     assert captured["params"] == ["BAL", 2020, 2021, 1, "REG", "pass", 7]
 
 
@@ -985,7 +993,7 @@ def test_schedule_builds_team_pair_filter_and_uppercases_season_type(monkeypatch
     monkeypatch.setattr(tools, "_execute", fake_execute)
     result = tools.nfl_schedule(team="kc", season=2024, week=1, season_type="reg")
     assert result["count"] == 1
-    assert "(home_team = ? OR away_team = ?)" in captured["sql"]
+    assert "(home_team IN (?) OR away_team IN (?))" in captured["sql"]
     assert "game_type = ?" in captured["sql"]
     assert captured["params"] == ["KC", "KC", 2024, 1, "REG"]
 
@@ -1224,7 +1232,7 @@ def test_td_luck_builds_filters(monkeypatch):
 def test_td_luck_invalid_limit_falls_back(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
     tools.nfl_td_luck(limit="oops")
-    assert "LIMIT 50" in captured["sql"]
+    assert "LIMIT 51" in captured["sql"]           # the default 50, plus the probe row
     assert captured["params"] is None
 
 
@@ -1246,7 +1254,7 @@ def test_role_trend_builds_filters(monkeypatch):
 def test_role_trend_invalid_limit_falls_back(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
     tools.nfl_role_trend(limit="oops")
-    assert "LIMIT 50" in captured["sql"]
+    assert "LIMIT 51" in captured["sql"]           # the default 50, plus the probe row
 
 
 def test_role_trend_returns_error_on_timeout(monkeypatch):
@@ -1291,7 +1299,7 @@ def test_separation_opportunity_guards_pre_2016():
 def test_separation_opportunity_invalid_limit_falls_back(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
     tools.nfl_separation_opportunity(limit="oops")
-    assert "LIMIT 50" in captured["sql"]
+    assert "LIMIT 51" in captured["sql"]           # the default 50, plus the probe row
 
 
 def test_separation_opportunity_returns_error_on_timeout(monkeypatch):
@@ -1317,7 +1325,7 @@ def test_drop_rate_guards_pre_2022():
 def test_drop_rate_invalid_limit_falls_back(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
     tools.nfl_drop_rate(limit="oops")
-    assert "LIMIT 50" in captured["sql"]
+    assert "LIMIT 51" in captured["sql"]           # the default 50, plus the probe row
 
 
 def test_drop_rate_returns_error_on_timeout(monkeypatch):
@@ -1339,7 +1347,7 @@ def test_contract_value_builds_filters(monkeypatch):
 def test_contract_value_invalid_limit_falls_back(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
     tools.nfl_contract_value(limit="oops")
-    assert "LIMIT 50" in captured["sql"]
+    assert "LIMIT 51" in captured["sql"]           # the default 50, plus the probe row
 
 
 def test_contract_value_returns_error_on_timeout(monkeypatch):
@@ -1360,7 +1368,7 @@ def test_injury_return_builds_filters(monkeypatch):
 def test_injury_return_invalid_limit_falls_back(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
     tools.nfl_injury_return(limit="oops")
-    assert "LIMIT 50" in captured["sql"]
+    assert "LIMIT 51" in captured["sql"]           # the default 50, plus the probe row
     assert captured["params"] is None
 
 

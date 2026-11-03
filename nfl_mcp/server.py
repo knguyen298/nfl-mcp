@@ -155,7 +155,7 @@ TOOLS = [
                 },
                 "season": {
                     "type": "integer",
-                    "description": "Exact season year (2013 through the current season). Use season_from/season_to for ranges.",
+                    "description": "Exact season year (1999 through the current season). Use season_from/season_to for ranges.",
                 },
                 "season_from": {
                     "type": "integer",
@@ -172,7 +172,7 @@ TOOLS = [
                 "season_type": {
                     "type": "string",
                     "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs)",
+                    "description": "Filter by season type: REG (regular season) or POST (playoffs). plays stores only these two values, so a round name (WC, DIV, CON, SB) is an error here; use nfl_schedule to pick one round.",
                 },
                 "play_type": {
                     "type": "string",
@@ -286,7 +286,7 @@ TOOLS = [
                 "season_type": {
                     "type": "string",
                     "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Rows are grouped per season type either way, so omitting it does not add the two together.",
+                    "description": "Filter by season type: REG (regular season) or POST (playoffs). player_stats stores only these two values, so a round name (WC, DIV, CON, SB) is an error here; use nfl_schedule to pick one round. Rows are grouped per season type either way, so omitting it does not add the two together.",
                 },
                 "stat_type": {
                     "type": "string",
@@ -355,7 +355,7 @@ TOOLS = [
                 "season_type": {
                     "type": "string",
                     "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Both modes apply it and keep the two season types in separate rows.",
+                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Both modes apply it and keep the two season types in separate rows. Both tables store only these two values, so a round name (WC, DIV, CON, SB) is an error - use nfl_schedule to pick one round.",
                 },
             },
             "required": ["entity1", "entity2"],
@@ -457,8 +457,12 @@ TOOLS = [
                 },
                 "season_type": {
                     "type": "string",
-                    "enum": ["REG", "POST", "SB"],
-                    "description": "Season type filter: REG, POST, or SB (Super Bowl).",
+                    "enum": ["REG", "POST", "WC", "DIV", "CON", "SB"],
+                    "description": (
+                        "Season type filter: REG, or POST (any playoff round), or one round "
+                        "- WC (wild card), DIV (divisional), CON (conference championship), "
+                        "SB (Super Bowl)."
+                    ),
                 },
             },
         },
@@ -565,7 +569,11 @@ TOOLS = [
                 },
                 "team": {
                     "type": "string",
-                    "description": "Team abbreviation (e.g. KC, PHI).",
+                    "description": (
+                        "Team abbreviation (e.g. KC, PHI). Any code the club has used works, "
+                        "including 'JAC' for the Jaguars in these tables. 'FA' is accepted "
+                        "and filters the free agents these tables publish."
+                    ),
                 },
                 "scope": {
                     "type": "string",
@@ -634,7 +642,7 @@ TOOLS = [
                 "season_type": {
                     "type": "string",
                     "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG or POST.",
+                    "description": "Filter by season type: REG or POST. plays stores only these two values, so a round name (WC, DIV, CON, SB) is an error here; use nfl_schedule to pick one round.",
                 },
             },
         },

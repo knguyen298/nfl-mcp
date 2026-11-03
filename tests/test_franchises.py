@@ -23,6 +23,7 @@ class TestCanonicalTeam:
         ("STL", "LA"),          # St. Louis -> Los Angeles Rams
         ("LAR", "LA"),          # ESPN's modern Rams code
         ("WSH", "WAS"),         # ESPN's older Washington code
+        ("JAC", "JAX"),         # FantasyPros' Jaguars code, in the fantasy ranking tables
         (" HOU ", "HOU"),       # whitespace tolerated
     ])
     def test_resolves_source_codes(self, raw, expected):
