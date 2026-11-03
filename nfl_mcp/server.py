@@ -5,10 +5,13 @@ Tools: nfl_schema, nfl_status, nfl_query, nfl_search_plays, nfl_team_stats, nfl_
 """
 
 import contextlib
+import json
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
+import anyio
+import anyio.to_thread
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import TextContent, Tool
@@ -31,6 +34,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nfl-mcp")
 
 _mcp_server = Server("nfl-mcp")
+
+# DuckDB's memory_limit is per connection, so cap how many tools run at once.
+_MAX_CONCURRENT_TOOLS = 2
+_TOOL_LIMITER = anyio.CapacityLimiter(_MAX_CONCURRENT_TOOLS)
 
 
 def _tool_error_payload(tool_name: str, exc: Exception) -> dict[str, Any]:
@@ -93,11 +100,13 @@ TOOLS = [
     Tool(
         name="nfl_query",
         description=(
-            "LAST RESORT: Execute raw SQL only when nfl_search_plays, nfl_team_stats, "
+            "Execute raw read-only DuckDB SQL when nfl_search_plays, nfl_team_stats, "
             "nfl_player_stats, and nfl_compare cannot answer the question. "
+            "Accepts full read-only SQL: CTEs (WITH), window functions, subqueries, PIVOT, "
+            "DESCRIBE and SUMMARIZE. One statement per call; writes and file access are "
+            "rejected. "
             "Requires calling nfl_schema first, and column names must be copied from it, "
             "never guessed (per-play EPA is `epa`, not `play_epa`). "
-            "Read-only SELECT only. "
             "500 row cap. 10s timeout."
         ),
         inputSchema={
@@ -105,7 +114,7 @@ TOOLS = [
             "properties": {
                 "sql": {
                     "type": "string",
-                    "description": "A SQL SELECT query.",
+                    "description": "One read-only SQL statement.",
                 },
                 "max_rows": {
                     "type": "integer",
@@ -832,40 +841,43 @@ async def list_tools() -> list[Tool]:
     return TOOLS
 
 
+_DISPATCH = {
+    "nfl_schema":       nfl_schema,
+    "nfl_status":       nfl_status,
+    "nfl_query":        nfl_query,
+    "nfl_search_plays": nfl_search_plays,
+    "nfl_team_stats":   nfl_team_stats,
+    "nfl_player_stats": nfl_player_stats,
+    "nfl_compare":      nfl_compare,
+    "nfl_catalog":      nfl_catalog,
+    "nfl_roster":       nfl_roster,
+    "nfl_injuries":     nfl_injuries,
+    "nfl_schedule":     nfl_schedule,
+    "nfl_snap_counts":          nfl_snap_counts,
+    "nfl_fantasy_opportunity":  nfl_fantasy_opportunity,
+    "nfl_fantasy_rankings":     nfl_fantasy_rankings,
+    "nfl_ftn_charting":         nfl_ftn_charting,
+    "nfl_td_luck":              nfl_td_luck,
+    "nfl_role_trend":           nfl_role_trend,
+    "nfl_separation_opportunity": nfl_separation_opportunity,
+    "nfl_drop_rate":            nfl_drop_rate,
+    "nfl_contract_value":       nfl_contract_value,
+    "nfl_injury_return":        nfl_injury_return,
+    "nfl_team_records":         nfl_team_records,
+}
+
+
 @_mcp_server.call_tool()
 async def call_tool(name: str, arguments: Any) -> list[TextContent]:
-    import json
-
-    _DISPATCH = {
-        "nfl_schema":       nfl_schema,
-        "nfl_status":       nfl_status,
-        "nfl_query":        nfl_query,
-        "nfl_search_plays": nfl_search_plays,
-        "nfl_team_stats":   nfl_team_stats,
-        "nfl_player_stats": nfl_player_stats,
-        "nfl_compare":      nfl_compare,
-        "nfl_catalog":      nfl_catalog,
-        "nfl_roster":       nfl_roster,
-        "nfl_injuries":     nfl_injuries,
-        "nfl_schedule":     nfl_schedule,
-        "nfl_snap_counts":          nfl_snap_counts,
-        "nfl_fantasy_opportunity":  nfl_fantasy_opportunity,
-        "nfl_fantasy_rankings":     nfl_fantasy_rankings,
-        "nfl_ftn_charting":         nfl_ftn_charting,
-        "nfl_td_luck":              nfl_td_luck,
-        "nfl_role_trend":           nfl_role_trend,
-        "nfl_separation_opportunity": nfl_separation_opportunity,
-        "nfl_drop_rate":            nfl_drop_rate,
-        "nfl_contract_value":       nfl_contract_value,
-        "nfl_injury_return":        nfl_injury_return,
-        "nfl_team_records":         nfl_team_records,
-    }
-
     try:
-        fn = _DISPATCH.get(name)
+        fn: Any = _DISPATCH.get(name)
         if fn is None:
             raise ValueError(f"Unknown tool: {name}")
-        result = fn(**arguments) if arguments else fn()
+        # Each tool opens a blocking DuckDB connection, so run it off the event loop.
+        result = await anyio.to_thread.run_sync(
+            lambda: fn(**(arguments or {})),
+            limiter=_TOOL_LIMITER,
+        )
         return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
     except Exception as e:

@@ -2,7 +2,7 @@
 NFL MCP Server tools:
   nfl_schema        → returns column reference so the model knows what to query
   nfl_status        → database health: row counts, loaded seasons, tables
-  nfl_query         → read-only SELECT with safety guardrails
+  nfl_query         → one read-only SQL statement, guarded by the parser and a locked connection
   nfl_search_plays  → structured play search
   nfl_team_stats    → pre-aggregated team stats
   nfl_player_stats  → official season counting stats, summed from the week-level player_stats table
@@ -34,16 +34,23 @@ logger = logging.getLogger("nfl-mcp")
 
 # ── Safety guardrails ──────────────────────────────────────────────────────────
 
-_FORBIDDEN = re.compile(
-    r"\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|REPLACE|UPSERT"
-    r"|EXECUTE|EXEC|CALL|COPY|GRANT|REVOKE|VACUUM|ANALYZE|CLUSTER"
-    r"|REINDEX|COMMENT|SECURITY|OWNER|TABLESPACE|SCHEMA"
-    r"|SET|DO|LISTEN|NOTIFY|PREPARE|DEALLOCATE|LOAD|DISCARD|RESET"
-    r"|pg_read_file|pg_read_binary_file|pg_write_file|pg_sleep"
-    r"|lo_import|lo_export|dblink|current_setting"
-    r"|pg_terminate_backend|pg_cancel_backend)\b",
-    re.IGNORECASE,
-)
+# Statement types the parser reports for read queries. DuckDB 2.0.0 folds SELECT, WITH,
+# FROM-first, VALUES, SHOW, DESCRIBE and SUMMARIZE into SELECT.
+# MULTI is a shape the parser reports for PIVOT and for some write forms that wrap it
+# (CREATE TABLE ... AS PIVOT, INSERT INTO ... PIVOT, COPY (PIVOT ...) TO), so it lets a
+# few writes through this list; the read-only locked connection is what stops them. What
+# survives is session-scoped only: CREATE TEMP TABLE, CREATE TEMP MACRO, and EXPLAIN
+# ANALYZE of SET VARIABLE or CHECKPOINT. None of it touches the database file, and the
+# temp objects die with the per-call connection.
+# EXPLAIN admits any statement, because EXPLAIN ANALYZE executes it — the same lock, plus
+# the file lock on COPY ... TO, stops the write forms there.
+# Everything else the connection cannot run — file functions, ATTACH, COPY TO, INSTALL,
+# LOAD, DDL and DML — is caught here or by DuckDB.
+_READ_STATEMENT_TYPES = frozenset({
+    duckdb.StatementType.SELECT,
+    duckdb.StatementType.MULTI,
+    duckdb.StatementType.EXPLAIN,
+})
 
 _MAX_ROWS = 500
 _QUERY_TIMEOUT_SECONDS = 10
@@ -560,41 +567,39 @@ def _sql_error_detail(exc: Exception) -> Dict[str, Any]:
 
 def nfl_query(sql: str, max_rows: int = 100) -> Dict[str, Any]:
     """
-    Execute a read-only SQL SELECT against the nflread database.
+    Execute one read-only SQL statement against the nflread database.
 
-    Safety rules:
-      - Only SELECT statements allowed
-      - Forbidden mutation/system keywords are blocked
-      - Multiple statements (semicolons) blocked
-      - Results capped at max_rows (hard max 500)
-      - 10-second statement timeout
+    Full read-only DuckDB SQL: CTEs, window functions, PIVOT, DESCRIBE,
+    SUMMARIZE. One statement only; writes, DDL, COPY, INSTALL, LOAD, ATTACH
+    and file-table functions are rejected (the connection itself has file and
+    network access locked off). Results capped at max_rows (hard max 500),
+    fetched with the query's own ORDER BY intact. 10-second statement timeout.
 
     Unknown column/table failures also return `code`, the offending name,
     `did_you_mean` (ranked against the live schema) and a `hint`.
     """
-    sql = sql.strip()
+    try:
+        statements = duckdb.extract_statements(sql)
+    except (duckdb.Error, ValueError) as e:
+        return {"error": str(e), **_sql_error_detail(e)}
 
-    if not re.match(r"^\s*SELECT\b", sql, re.IGNORECASE):
-        return {"error": "Only SELECT queries are allowed."}
+    if len(statements) != 1:
+        return {"error": f"Exactly one SQL statement is required, got {len(statements)}."}
 
-    match = _FORBIDDEN.search(sql)
-    if match:
-        return {"error": f"Forbidden keyword: '{match.group()}'"}
+    statement = statements[0]
+    if statement.type not in _READ_STATEMENT_TYPES:
+        return {"error": f"Only read-only queries are allowed, not {statement.type.name}."}
 
-    sql_no_trailing = sql.rstrip(";")
-    if ";" in sql_no_trailing:
-        return {"error": "Multiple statements are not allowed."}
-
-    max_rows = min(max_rows, _MAX_ROWS)
-    safe_sql = f"SELECT * FROM ({sql_no_trailing}) AS _q LIMIT {max_rows + 1}"
+    max_rows = max(0, min(max_rows, _MAX_ROWS))
 
     try:
-        rows = _execute(safe_sql)
+        rows = _execute(statement.query, row_limit=max_rows + 1)
 
         truncated = len(rows) > max_rows
         rows = rows[:max_rows]
 
         return {
+            "sql":       statement.query.strip(),
             "rows":      rows,
             "row_count": len(rows),
             "truncated": truncated,
@@ -1123,11 +1128,29 @@ def nfl_compare(
         return {"error": str(e)}
 
 
-def _execute(sql: str, params: Sequence[Any] | None = None) -> list[dict]:
+def _execute(
+    sql: str,
+    params: Sequence[Any] | None = None,
+    row_limit: int | None = None,
+) -> list[dict]:
     """Execute SQL on DuckDB with timeout and cancellation.
 
     Runs in a worker thread with a dedicated connection, and interrupts
     the active query if it exceeds the timeout.
+
+    With `row_limit` and no parameters the cap rides on the relation, so DuckDB plans a
+    LIMIT and turns an ORDER BY that has none into a top-N sort. Fetching the cap in
+    Python instead makes DuckDB build and sort every row first: over 1.33 M plays rows
+    `SELECT * FROM plays ORDER BY epa DESC` hit the 10 s timeout that way and answers in
+    0.3 s this way. The cap only helps a lazy relation: on PIVOT and the other MULTI and
+    EXPLAIN forms, `conn.sql()` runs the statement at once and the limit then trims the
+    finished result, which is no worse than the old wrap.
+
+    The parameterized path below takes no cap. `conn.sql()` accepts parameters too, but
+    every caller that passes them wants the whole result, and none passes row_limit.
+
+    A worker that ignores the interrupt keeps its connection open until it finishes,
+    which can be after this raises and after the server's limiter slot is released.
     """
     result = [None]
     error = [None]
@@ -1137,12 +1160,14 @@ def _execute(sql: str, params: Sequence[Any] | None = None) -> list[dict]:
         try:
             with get_db_connection() as conn:
                 thread_conn[0] = conn
-                if params is None:
-                    rel = conn.execute(sql)
+                if params is None and row_limit is not None:
+                    rel = conn.sql(sql).limit(row_limit)
+                    fetched = rel.fetchall()
                 else:
-                    rel = conn.execute(sql, params)
+                    rel = conn.execute(sql) if params is None else conn.execute(sql, params)
+                    fetched = rel.fetchall()
                 columns = [desc[0] for desc in rel.description]
-                result[0] = [dict(zip(columns, row)) for row in rel.fetchall()]
+                result[0] = [dict(zip(columns, row)) for row in fetched]
         except Exception as e:
             error[0] = e
 

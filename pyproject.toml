@@ -18,7 +18,8 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=1.0,<2",
-    "duckdb>=1.0",
+    "anyio>=4.5",         # server.py runs each tool call in a worker thread
+    "duckdb>=2.0",         # 1.x splits PIVOT into CREATE + SELECT, and words file errors differently
     "pyarrow>=14.0",
     "nflreadpy>=0.1",
     "polars>=0.20",

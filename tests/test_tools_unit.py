@@ -515,7 +515,7 @@ def test_nfl_query_reports_truncation(monkeypatch):
     monkeypatch.setattr(
         tools,
         "_execute",
-        lambda sql, params=None: [{"x": 1}, {"x": 2}, {"x": 3}],
+        lambda sql, params=None, row_limit=None: [{"x": 1}, {"x": 2}, {"x": 3}],
     )
     result = tools.nfl_query("SELECT 1 AS x", max_rows=2)
     assert result["row_count"] == 2
@@ -551,7 +551,7 @@ PLAY_COLUMNS = [
 def _failing_query(exc, schema_rows):
     """Fake _execute: answers schema lookups, raises `exc` for the caller's SQL."""
 
-    def fake_execute(sql, params=None):
+    def fake_execute(sql, params=None, row_limit=None):
         if "information_schema" in sql:
             return schema_rows
         raise exc
@@ -587,7 +587,7 @@ def test_nfl_query_suggests_real_tables_for_an_invented_table(monkeypatch):
 
 
 def test_nfl_query_falls_back_to_duckdb_candidates_when_schema_lookup_fails(monkeypatch):
-    def fake_execute(sql, params=None):
+    def fake_execute(sql, params=None, row_limit=None):
         if "information_schema" in sql:
             raise duckdb.Error("schema unavailable")
         raise duckdb.BinderException(COLUMN_ERROR)

@@ -39,7 +39,7 @@ def test_list_tools_registered_with_mcp_server():
 
 
 def test_call_tool_success_with_arguments(monkeypatch):
-    monkeypatch.setattr(server_module, "nfl_query", lambda sql: {"rows": [{"sql": sql}]})
+    monkeypatch.setitem(server_module._DISPATCH, "nfl_query", lambda sql: {"rows": [{"sql": sql}]})
     result = asyncio.run(server_module.call_tool("nfl_query", {"sql": "SELECT 1"}))
     payload = json.loads(result[0].text)
     assert payload["rows"][0]["sql"] == "SELECT 1"
@@ -56,7 +56,7 @@ def test_call_tool_tool_exception_returns_execution_error(monkeypatch):
     def _boom():
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(server_module, "nfl_status", _boom)
+    monkeypatch.setitem(server_module._DISPATCH, "nfl_status", _boom)
     result = asyncio.run(server_module.call_tool("nfl_status", None))
     payload = json.loads(result[0].text)
     assert payload["ok"] is False
@@ -158,7 +158,7 @@ def test_call_tool_dispatches_team_records(monkeypatch):
         seen.update(team=team, season=season, from_season=from_season, to_season=to_season)
         return {"records": [{"season": 1996, "team": "GB", "wins": 13}], "count": 1}
 
-    monkeypatch.setattr(server_module, "nfl_team_records", fake)
+    monkeypatch.setitem(server_module._DISPATCH, "nfl_team_records", fake)
     result = asyncio.run(server_module.call_tool("nfl_team_records", {"team": "OAK", "season": 1996}))
     payload = json.loads(result[0].text)
     assert payload["count"] == 1
