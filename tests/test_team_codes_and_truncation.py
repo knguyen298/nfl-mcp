@@ -477,8 +477,14 @@ class TestJaguarsAndFreeAgentsOnRealData:
         stored = nfl_query(f"SELECT COUNT(*) AS n FROM {table} WHERE team = 'FA'")
         result = nfl_fantasy_rankings(team="FA", scope=scope, limit=tools._MAX_ROWS)
         assert "error" not in result
-        assert result["count"] == stored["rows"][0]["n"] > 0
-        assert {row["team"] for row in result["fantasy_rankings"]} == {"FA"}
+        assert result["count"] == stored["rows"][0]["n"]
+        assert all(row["team"] == "FA" for row in result["fantasy_rankings"])
+        if scope == "draft":
+            # The draft board always carries undrafted players: 136 in both databases this
+            # suite runs against. The weekly board is one week's snapshot and can hold none,
+            # so an empty answer there is the tool agreeing with the table, not a lost filter.
+            assert result["count"] > 0
+            assert {row["team"] for row in result["fantasy_rankings"]} == {"FA"}
 
     @pytest.mark.integration
     @pytest.mark.usefixtures("require_db")
