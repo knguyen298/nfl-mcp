@@ -27,9 +27,9 @@ The team identifier is named differently in every table: `posteam`/`defteam` in 
 column — `team_name` is 'Minnesota Vikings', `team_nick` is 'Vikings').
 
 Aggregate tables (faster for team-level queries):
-  team_offense_stats  (team, season_year, total_plays, total_yards, avg_epa, ...)
-  team_defense_stats  (team, season_year, yards_allowed, sacks, turnovers_forced, avg_epa_allowed, ...)
-  situational_stats   (team, season_year, situation, plays, avg_epa, conversion_pct)
+  team_offense_stats  (team, season_year, season_type, total_plays, total_yards, avg_epa, ...)
+  team_defense_stats  (team, season_year, season_type, yards_allowed, sacks, turnovers_forced, ...)
+  situational_stats   (team, season_year, season_type, situation, plays, avg_epa, conversion_pct)
   formation_effectiveness (team, season_year, formation, play_type, avg_epa, ...)
   player_stats        (player_id, season, season_type, week, attempts, carries, targets, ...) —
                       official counting stats per player per game, what nfl_player_stats sums
@@ -420,20 +420,98 @@ VEGAS / BETTING
 """,
     "aggregate_tables": """
 AGGREGATE TABLES  (pre-aggregated, much faster for team/season queries)
+  One row per team, season and season_type ('REG' or 'POST'): a playoff game is never added into
+  the regular season, and nfl_team_stats returns both as separate rows when you leave it out.
+  Counting stats come from team_stats_raw (the week-level team box, one row per team per game) and
+  points from schedules; what neither carries is built from plays over scrimmage plays only —
+  (pass = 1 OR rush = 1) AND epa IS NOT NULL AND two_point_attempt <> 1 AND play_type <> 'no_play'
+  — which keeps kickoffs, punts, field goals, extra points and spikes out and keeps sacks and
+  scrambles in. A two-point try carries pass or rush = 1, so it is excluded by flag; a play a penalty
+  nullified (play_type = 'no_play') is replayed, so the box counts the replay and not that attempt,
+  and it is excluded too. A kneel is a carry and a spike is a pass attempt, and both come from the
+  box, which counts them the way the league does. Every rate divides one summed total by another:
+  the three yards-per-play figures divide the box totals in the same row, so they agree with the
+  yards and the plays next to them.
+
   team_offense_stats
-    (team, season_year, total_plays, total_yards, yards_per_play,
-     rush_plays, pass_plays, rush_yards, pass_yards, yards_per_rush, yards_per_pass,
-     touchdowns, turnovers, third_down_pct, red_zone_td_pct, explosive_plays,
-     avg_epa, pass_epa, rush_epa)
+    (team, season_year, season_type,
+     total_plays, total_yards, yards_per_play,
+     rush_plays, pass_plays, completions, rush_yards, pass_yards, yards_per_rush, yards_per_pass,
+     touchdowns, passing_tds, rushing_tds, special_teams_tds,
+     turnovers, passing_interceptions, fumbles_lost, sacks_suffered, sack_yards,
+     third_down_conversions, third_down_attempts, third_down_pct,
+     red_zone_trips, red_zone_touchdowns, red_zone_td_pct,
+     first_downs, penalties, penalty_yards, explosive_plays,
+     avg_epa, pass_epa, rush_epa, points_for, points_against)
+    -- team_stats_raw: total_plays (attempts + sacks_suffered + carries), total_yards, rush_plays,
+    --   pass_plays (a sack is not an attempt), completions, rush_yards, pass_yards (net of
+    --   sack_yards), touchdowns (passing_tds + rushing_tds — a pick-six is not one), turnovers
+    --   (passing_interceptions + fumbles_lost_total), sacks_suffered, sack_yards, first_downs,
+    --   penalties, penalty_yards.  schedules: points_for, points_against.
+    --   plays: explosive_plays, avg_epa, pass_epa, rush_epa, red_zone_*, third_down_*.
+    -- yards_per_play = total_yards / total_plays, yards_per_rush = rush_yards / rush_plays,
+    --   yards_per_pass = pass_yards / (pass_plays + sacks_suffered) — all three divide the box
+    --   totals in this row, so the row holds one answer per question. An average of the scrimmage
+    --   plays is a different population and gives a different number (Kansas City 2024 regular
+    --   season: 5.11 yards per play from the box against 5.02 per scrimmage play).
+    -- third_down_pct = third_down_conversions / third_down_attempts, from third_down_converted and
+    --   third_down_failed (they handle penalties); it is not yards_gained >= ydstogo. The two counts
+    --   cover every play that carries one of those flags — kneels and spikes included, so a kneel
+    --   that fails to convert is an attempt — and not only the scrimmage plays above. A punt or a
+    --   field-goal attempt carries neither flag. One nullified play does — the Houston fake punt in
+    --   2024_15_MIA_HOU — so that 4th Down row counts 18 attempts over 17 plays.
+    -- red_zone_td_pct = red_zone_touchdowns / red_zone_trips. A trip is one drive — game_id plus
+    --   drive, since drive numbers restart weekly — that gets a football play (pass, run,
+    --   field_goal, qb_kneel, qb_spike, and never a two-point attempt) inside the opponent's 20. A
+    --   kick is not that proof: the extra point is spotted at the 15, so yardline_100 <= 20 alone
+    --   counted every scoring drive, including drives that never got inside the 20. A two-point try
+    --   is recorded as a pass or a run at the 2, so its own flag has to exclude it. The touchdown is
+    --   read only from plays inside the 20, so a drive pushed back before it scores counts as a trip
+    --   with no touchdown: 11 drives did that in the 2024 regular season. The standard
+    --   rate divides by trips, not by red zone plays, and a trip that ends in a field goal stays in
+    --   the denominator.
 
   team_defense_stats
-    (team, season_year, plays_against, yards_allowed, yards_per_play_allowed,
-     sacks, interceptions, turnovers_forced, third_down_stop_pct, avg_epa_allowed)
+    (team, season_year, season_type, plays_against, yards_allowed, yards_per_play_allowed,
+     sacks, interceptions, turnovers_forced, third_down_stops, third_down_attempts,
+     third_down_stop_pct, avg_epa_allowed, points_allowed)
+    -- team_stats_raw: sacks (def_sacks), interceptions (def_interceptions), and plays_against,
+    --   yards_allowed, turnovers_forced — the opponents' box rows grouped on opponent_team, so the
+    --   defence and the offence in front of it count the same game the same way. A defence faces
+    --   attempts + sacks_suffered + carries, gives up passing_yards + rushing_yards + sack_yards_lost,
+    --   and forces passing_interceptions + fumbles_lost_total.  schedules: points_allowed.
+    --   yards_per_play_allowed = yards_allowed / plays_against, the two box totals already in the
+    --   row. It used to be the mean of yards_gained over scrimmage plays, so the row held two
+    --   answers for one question: Kansas City 2024 regular season 5.37 against 5451 / 1026 = 5.31,
+    --   Baltimore's postseason 5.50 against 553 / 104 = 5.32 — all 46 rows of 2024 disagreed, by up
+    --   to 0.33. Null when plays_against is 0 or the box has no row for this defence.
+    --   plays: avg_epa_allowed (per scrimmage play against this defence) and the third-down columns,
+    --   which count every play that carries a conversion flag, kneels and spikes included. That
+    --   plays population is smaller than the box, not larger: Kansas City 2024 regular season 1,017
+    --   scrimmage plays against 1,026 plays against in the box, postseason 199 against 203,
+    --   Philadelphia 990 against 999. The league charges a quarterback kneel as a carry and a spike
+    --   as a pass attempt, and play_by_play flags neither with pass = 1 or rush = 1, so the scrimmage
+    --   filter drops them — 45 of those 46 rows close exactly on the kneel-and-spike count. The
+    --   nullified downs are out of both: play_by_play keeps 87 for Kansas City that season and the
+    --   box counts the replayed down, not the undone one. No box carries expected points, which is
+    --   why avg_epa_allowed alone stays on plays.
+    --   sacks is this defence's own def_sacks, so plays_against is not attempts + sacks + carries
+    --   read off this row: the two ends of the same sack are counted twice in the league's boxes,
+    --   and 9 of the 32 rows of the 2024 regular season differ by 1 or 2 (Dallas 51 def_sacks
+    --   against 52 sacks suffered by its opponents). interceptions agrees with the interception half
+    --   of turnovers_forced on all 124 rows in the data.
 
   situational_stats
-    (team, season_year, situation, plays, avg_yards, touchdowns, conversion_pct, avg_epa)
+    (team, season_year, season_type, situation, plays, avg_yards, touchdowns, conversions,
+     conversion_attempts, conversion_pct, avg_epa)
     -- situation values: '3rd & Long','3rd & Short','Red Zone','4th Down',
     --                   'Two Minute Drill','Standard'
+    -- conversion_pct = conversions / conversion_attempts, both from third_down_converted,
+    --   third_down_failed, fourth_down_converted and fourth_down_failed. Those two columns count
+    --   every play that carries a flag, kneels and spikes included, while plays, avg_yards,
+    --   touchdowns and avg_epa stay on the scrimmage population. Punts and field goals carry no
+    --   flag, so they no longer sit in the 4th Down denominator as failed conversions. A row with no
+    --   third- or fourth-down attempt has a null conversion_pct.
 
   formation_effectiveness
     (team, season_year, formation, play_type, plays, avg_yards, touchdowns, turnovers, avg_epa)

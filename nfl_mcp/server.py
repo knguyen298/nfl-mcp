@@ -200,7 +200,13 @@ TOOLS = [
         description=(
             "PREFERRED for any team-level question. Returns pre-aggregated offense, "
             "defense, and situational stats. Always use this instead of nfl_query "
-            "for questions like 'how did [team] do', team rankings, or team efficiency."
+            "for questions like 'how did [team] do', team rankings, or team efficiency. "
+            "Each row is one team, season and season_type: a playoff game is never added into "
+            "the regular season, so pass season_type='REG' or 'POST' for one of them or leave it "
+            "out to get both as separate rows. Counting stats come from the week-level team box "
+            "(team_stats_raw) and points from schedules; a per-play figure comes from plays over "
+            "scrimmage plays only. The response carries 'sources', which names the table, column "
+            "or flags behind every column."
         ),
         inputSchema={
             "type": "object",
@@ -212,6 +218,11 @@ TOOLS = [
                 "season": {
                     "type": "integer",
                     "description": "Season year. Omit for all available seasons.",
+                },
+                "season_type": {
+                    "type": "string",
+                    "enum": ["REG", "POST"],
+                    "description": "REG (regular season) or POST (playoffs). Omit to return both as separate rows - they are never summed together.",
                 },
                 "side": {
                     "type": "string",
@@ -288,7 +299,10 @@ TOOLS = [
             "side2]} in the order requested, each side carrying 'requested' plus 'player' "
             "with its gsis_id. Each player stat block is nfl_player_stats' rows, summed from "
             "the week-level player_stats table per season and season_type, and each side names "
-            "those columns in 'metric_sources'. Two players who share a name are two separate "
+            "those columns in 'metric_sources'. Team mode returns one entry per abbreviation, each "
+            "with 'offense' and 'defense' rows per season and season_type plus the 'sources' map, "
+            "and it honours season_type: pass 'REG' or 'POST' and a playoff game stays out of the "
+            "regular season. Two players who share a name are two separate "
             "sides, and a side whose name matches several players returns 'candidates' instead "
             "of stats."
         ),
@@ -332,7 +346,7 @@ TOOLS = [
                 "season_type": {
                     "type": "string",
                     "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Player mode applies it and keeps the two season types in separate rows; team mode ignores it.",
+                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Both modes apply it and keep the two season types in separate rows.",
                 },
             },
             "required": ["entity1", "entity2"],
@@ -667,7 +681,16 @@ TOOLS = [
             "PREFERRED for receiver regression / 'getting open but not producing' questions "
             "(2016–present). Joins Next Gen Stats separation and YAC-above-expected to fantasy "
             "opportunity per player-season. regression_candidate=true flags receivers creating "
-            "separation (>2.5 yds) who under-produced (fp_diff_per_game < -1.5, td_luck < -1.0). "
+            "separation (>2.5 yds) who under-produced (fp_diff_per_game < -1.5, td_luck < -1.0); it "
+            "is null on fallback rows, whose sample is too small to carry the claim. "
+            "Each row is one player, season and season_type - the regular season and the postseason "
+            "are separate rows and are never averaged together. season_type defaults to REG; pass "
+            "'ALL' for both scopes (a null is rejected by the schema, which types this as a string). "
+            "The Next Gen Stats figures are that "
+            "publisher's own season summary row (week = 0) where it published one; otherwise they "
+            "are a mean of the weekly rows, separation weighted by targets and YAC-above-expected by "
+            "receptions. separation_source names which, and fallback_weeks and fallback_targets give "
+            "the sample size behind a weekly-rows row (most rest on 1-2 weeks). "
             "Default sort is most under-producing first (fp_diff_per_game ASC)."
         ),
         inputSchema={
@@ -678,6 +701,11 @@ TOOLS = [
                 "position": {"type": "string", "description": "Position filter (e.g. WR, TE)."},
                 "team": {"type": "string", "description": "Team abbreviation."},
                 "season": {"type": "integer", "description": "Exact season year (2016+)."},
+                "season_type": {
+                    "type": "string",
+                    "enum": ["REG", "POST", "ALL"],
+                    "description": "REG (regular season, the default), POST (playoffs), or ALL for both scopes - they stay separate rows. ALL is a literal value: this parameter is typed as a string, so a null is rejected before the tool runs.",
+                },
                 "regression_candidate": {
                     "type": "boolean",
                     "description": "If true, only return flagged positive-regression candidates.",

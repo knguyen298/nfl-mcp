@@ -263,6 +263,12 @@ def test_search_plays_uses_parameterized_filters(monkeypatch):
     assert result["player"]["gsis_id"] == "00-0036322"
 
 
+def _data_reads(calls):
+    """The queries that read data, without the information_schema lookups the team tools run
+    first to catch a database whose derived team tables predate the season_type column."""
+    return [(sql, params) for sql, params in calls if "information_schema" not in sql]
+
+
 def test_team_stats_uses_parameterized_team_and_season(monkeypatch):
     calls = []
 
@@ -273,10 +279,13 @@ def test_team_stats_uses_parameterized_team_and_season(monkeypatch):
     monkeypatch.setattr(tools, "_execute", fake_execute)
     tools.nfl_team_stats(team="kc", season=2024, side="both")
 
-    assert len(calls) == 3
-    assert all("team = ?" in sql for sql, _ in calls)
-    assert all(params[0] == "KC" for _, params in calls)
-    assert all(2024 in params for _, params in calls)
+    # One column lookup per table read, then the three data queries.
+    assert len(calls) == 6
+    reads = _data_reads(calls)
+    assert len(reads) == 3
+    assert all("team = ?" in sql for sql, _ in reads)
+    assert all(params[0] == "KC" for _, params in reads)
+    assert all(2024 in params for _, params in reads)
 
 
 def player_stats_column_rows(drop=()):
@@ -427,9 +436,11 @@ def test_compare_team_does_not_interpolate_user_input(monkeypatch):
     monkeypatch.setattr(tools, "_execute", fake_execute)
     tools.nfl_compare(entity1="KC'; DROP TABLE plays; --", entity2="BAL", compare_type="team", season=2024)
 
-    assert len(calls) == 4
+    reads = _data_reads(calls)
+    assert len(calls) == 6
+    assert len(reads) == 4
     assert all("DROP TABLE" not in sql for sql, _ in calls)
-    assert calls[0][1][0] == "KC'; DROP TABLE PLAYS; --"
+    assert reads[0][1][0] == "KC'; DROP TABLE PLAYS; --"
 
 
 def test_schema_table_returns_columns(monkeypatch):
@@ -680,8 +691,10 @@ def test_team_stats_offense_only_without_season_clause(monkeypatch):
     result = tools.nfl_team_stats(team="kc", side="offense")
     assert "offense" in result
     assert "defense" not in result
-    assert "season_year = ?" not in calls[0][0]
-    assert calls[0][1] == ["KC"]
+    reads = _data_reads(calls)
+    assert len(reads) == 1
+    assert "season_year = ?" not in reads[0][0]
+    assert reads[0][1] == ["KC"]
 
 
 def test_team_stats_returns_error_on_timeout(monkeypatch):
@@ -865,10 +878,12 @@ def test_compare_team_applies_season_range_filters(monkeypatch):
         season_to=2021,
     )
     assert "error" not in result
-    assert len(calls) == 4
-    assert "season_year >= ?" in calls[0][0]
-    assert "season_year <= ?" in calls[0][0]
-    assert calls[0][1] == ["KC", 2020, 2021]
+    reads = _data_reads(calls)
+    assert len(calls) == 6
+    assert len(reads) == 4
+    assert "season_year >= ?" in reads[0][0]
+    assert "season_year <= ?" in reads[0][0]
+    assert reads[0][1] == ["KC", 2020, 2021]
 
 
 def test_compare_returns_error_on_timeout(monkeypatch):
@@ -1182,6 +1197,10 @@ def _capture_execute(monkeypatch, rows):
     captured = {}
 
     def fake_execute(sql, params=None):
+        if "information_schema.columns WHERE table_name" in sql:
+            # The stale-derived-table guard probing what it can read: answer that the table is
+            # current so the call under test reaches its own query.
+            return [{"column_name": "season_type"}]
         captured["sql"] = sql
         captured["params"] = params
         return rows
@@ -1242,7 +1261,26 @@ def test_separation_opportunity_builds_filters(monkeypatch):
     assert "player_id = ?" in captured["sql"]
     assert "regression_candidate = ?" in captured["sql"]
     assert "fp_diff_per_game ASC" in captured["sql"]
-    assert captured["params"] == ["00-0036322", "WR", "SF", 2024, True]
+    # season_type defaults to REG, so the playoff rows do not crowd the list.
+    assert "season_type = ?" in captured["sql"]
+    assert captured["params"] == ["00-0036322", "WR", "SF", 2024, "REG", True]
+
+
+def test_separation_opportunity_names_the_sample_behind_a_fallback_row(monkeypatch):
+    captured = _capture_execute(monkeypatch, [])
+    stub_resolver(monkeypatch)
+    tools.nfl_separation_opportunity()
+    assert "fallback_weeks" in captured["sql"] and "fallback_targets" in captured["sql"]
+
+
+def test_separation_opportunity_says_what_to_rebuild(monkeypatch):
+    """An old player_separation_opportunity has no season_type; the caller must hear the rebuild
+    command, not DuckDB's binder error for a column they never typed."""
+    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [{"column_name": "season"}])
+    stub_resolver(monkeypatch)
+    assert tools.nfl_separation_opportunity() == {
+        "error": "player_separation_opportunity has no season_type column. "
+                 "Rebuild the derived tables: nfl-mcp ingest --dataset teams"}
 
 
 def test_separation_opportunity_guards_pre_2016():

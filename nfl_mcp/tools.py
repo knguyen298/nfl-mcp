@@ -690,31 +690,93 @@ def nfl_search_plays(
         return {"error": str(e)}
 
 
+# Where the three team tables' columns come from. nfl_schema(category='aggregate_tables') names
+# every column with its source; this is the same three sources in the response itself.
+_TEAM_STAT_SOURCES = {
+    "team_stats_raw": (
+        "counting stats, summed from one row per team per game: total_plays, total_yards, rush_plays, "
+        "pass_plays, completions, rush_yards, pass_yards, touchdowns, passing_tds, rushing_tds, "
+        "special_teams_tds, turnovers, passing_interceptions, fumbles_lost, sacks_suffered, "
+        "sack_yards, first_downs, penalties, penalty_yards, sacks, interceptions; the three "
+        "yards-per-play rates, which divide those same totals: yards_per_play (total_yards / "
+        "total_plays), yards_per_rush (rush_yards / rush_plays), yards_per_pass (pass_yards / "
+        "(pass_plays + sacks_suffered)); the defence's plays_against, yards_allowed and "
+        "turnovers_forced, from the opponent's box row grouped on opponent_team; and "
+        "yards_per_play_allowed, which is yards_allowed / plays_against from that same row"
+    ),
+    "schedules": "points_for, points_against, points_allowed (game_type REG is REG; WC, DIV, CON, SB are POST)",
+    "plays": (
+        "what no box carries, over scrimmage plays only - (pass = 1 OR rush = 1) AND epa IS NOT "
+        "NULL AND two_point_attempt <> 1 AND play_type <> 'no_play': explosive_plays, avg_epa, "
+        "pass_epa, rush_epa, avg_epa_allowed, and plays, avg_yards, "
+        "touchdowns, avg_epa in situational_stats. Over the conversion flags instead, so kneels and "
+        "spikes count too: third_down_*, and the conversions and conversion_attempts columns of "
+        "situational_stats. Over drives: red_zone_trips, red_zone_touchdowns, red_zone_td_pct"
+    ),
+}
+
+
+def _stale_derived_tables(tables: Sequence[str]) -> dict[str, Any] | None:
+    """Return an error naming the rebuild command when one of these tables predates its columns.
+
+    None means every table here can be read. A database ingested before this change has derived
+    tables - the ones the ingest builds rather than the ones nflverse publishes - with no season_type
+    column, so the tools that read them fail on a DuckDB binder error about a column the caller never
+    typed. A table the database does not have at all reports no columns and is left to the query, so
+    a database that was never ingested still hears that its tables are missing.
+    """
+    for table in tables:
+        columns = {str(row.get("column_name")) for row in _execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?", [table])}
+        if columns and "season_type" not in columns:
+            return {"error": f"{table} has no season_type column. "
+                             "Rebuild the derived tables: nfl-mcp ingest --dataset teams"}
+    return None
+
+
 def nfl_team_stats(
     team: str,
     season: int | None = None,
     side: str = "both",
+    season_type: str | None = None,
 ) -> Dict[str, Any]:
-    """Get pre-aggregated team stats (offense, defense, or both)."""
+    """Get pre-aggregated team stats (offense, defense, or both).
+
+    Each row is one team, season and season_type. A playoff game is its own row and is never added
+    into the regular season: pass season_type='REG' or 'POST' to get one of them, and leave it out
+    to get both, side by side. 'sources' says which table each column comes from.
+    """
     team = team.upper()
-    results = {}
+    results: dict[str, Any] = {"sources": _TEAM_STAT_SOURCES}
     season_clause = ""
     season_params: list[Any] = []
     if season:
-        season_clause = " AND season_year = ?"
+        season_clause += " AND season_year = ?"
         season_params.append(int(season))
+    if season_type:
+        season_clause += " AND season_type = ?"
+        season_params.append(season_type.upper())
+
+    tables = [t for s, t in (("offense", "team_offense_stats"),
+                             ("defense", "team_defense_stats"),
+                             ("situational", "situational_stats")) if side in (s, "both")]
 
     try:
+        stale = _stale_derived_tables(tables)
+        if stale is not None:
+            return stale
+
         if side in ("offense", "both"):
-            sql = f"SELECT * FROM team_offense_stats WHERE team = ?{season_clause} ORDER BY season_year"
+            sql = f"SELECT * FROM team_offense_stats WHERE team = ?{season_clause} ORDER BY season_year, season_type"
             results["offense"] = _execute(sql, [team, *season_params])
 
         if side in ("defense", "both"):
-            sql = f"SELECT * FROM team_defense_stats WHERE team = ?{season_clause} ORDER BY season_year"
+            sql = f"SELECT * FROM team_defense_stats WHERE team = ?{season_clause} ORDER BY season_year, season_type"
             results["defense"] = _execute(sql, [team, *season_params])
 
         if side in ("situational", "both"):
-            sql = f"SELECT * FROM situational_stats WHERE team = ?{season_clause} ORDER BY season_year, situation"
+            sql = ("SELECT * FROM situational_stats WHERE team = ?" + season_clause
+                   + " ORDER BY season_year, season_type, situation")
             results["situational"] = _execute(sql, [team, *season_params])
 
         return results
@@ -967,19 +1029,26 @@ def nfl_compare(
 ) -> Dict[str, Any]:
     """Side-by-side comparison of two teams or players.
 
-    Team mode returns one entry per abbreviation. Player mode returns {'players':
-    [side1, side2]} in the order asked for - a list, not a dict keyed by the name, so two
-    players who share a name (the two Justin Jeffersons) stay two entries. Each side
-    carries 'requested' (the text typed) and 'player' with its gsis_id plus the stat
-    blocks; a side the name cannot settle carries the resolver's ambiguous or not_found
-    answer in place of 'player'. Each stat block is nfl_player_stats' rows, summed from the
-    week-level player_stats table per season and season_type, with 'metric_sources' naming
-    the player_stats column behind every metric on that side.
+    Team mode returns one entry per abbreviation, each with 'offense' and 'defense' rows and the
+    'sources' map naming where every column comes from. Each row is one team, season and
+    season_type, and season_type is honoured here: pass 'REG' or 'POST' and a playoff game is not
+    mixed into the regular season. Player mode returns {'players': [side1, side2]} in the order
+    asked for - a list, not a dict keyed by the name, so two players who share a name (the two
+    Justin Jeffersons) stay two entries. Each side carries 'requested' (the text typed) and
+    'player' with its gsis_id plus the stat blocks; a side the name cannot settle carries the
+    resolver's ambiguous or not_found answer in place of 'player'. Each stat block is
+    nfl_player_stats' rows, summed from the week-level player_stats table per season and
+    season_type, with 'metric_sources' naming the player_stats column behind every metric on that
+    side.
     """
     e1, e2 = entity1, entity2
 
     try:
         if compare_type == "team":
+            stale = _stale_derived_tables(["team_offense_stats", "team_defense_stats"])
+            if stale is not None:
+                return stale
+
             t1, t2 = e1.upper(), e2.upper()
             season_filter = ""
             season_params: list[Any] = []
@@ -992,27 +1061,24 @@ def nfl_compare(
             if season_to:
                 season_filter += " AND season_year <= ?"
                 season_params.append(int(season_to))
+            if season_type:
+                season_filter += " AND season_type = ?"
+                season_params.append(season_type.upper())
 
-            off1 = _execute(
-                f"SELECT * FROM team_offense_stats WHERE team = ?{season_filter} ORDER BY season_year",
-                [t1, *season_params],
-            )
-            off2 = _execute(
-                f"SELECT * FROM team_offense_stats WHERE team = ?{season_filter} ORDER BY season_year",
-                [t2, *season_params],
-            )
-            def1 = _execute(
-                f"SELECT * FROM team_defense_stats WHERE team = ?{season_filter} ORDER BY season_year",
-                [t1, *season_params],
-            )
-            def2 = _execute(
-                f"SELECT * FROM team_defense_stats WHERE team = ?{season_filter} ORDER BY season_year",
-                [t2, *season_params],
-            )
+            def team_rows(table: str, code: str) -> list[dict]:
+                return _execute(
+                    f"SELECT * FROM {table} WHERE team = ?{season_filter}"
+                    " ORDER BY season_year, season_type",
+                    [code, *season_params],
+                )
 
             return {
-                entity1: {"offense": off1, "defense": def1},
-                entity2: {"offense": off2, "defense": def2},
+                entity1: {"offense": team_rows("team_offense_stats", t1),
+                          "defense": team_rows("team_defense_stats", t1),
+                          "sources": _TEAM_STAT_SOURCES},
+                entity2: {"offense": team_rows("team_offense_stats", t2),
+                          "defense": team_rows("team_defense_stats", t2),
+                          "sources": _TEAM_STAT_SOURCES},
             }
 
         elif compare_type == "player":
@@ -1737,6 +1803,7 @@ def nfl_separation_opportunity(
     position: str | None = None,
     team: str | None = None,
     season: int | None = None,
+    season_type: str | None = "REG",
     regression_candidate: bool | None = None,
     limit: int = 50,
 ) -> Dict[str, Any]:
@@ -1747,6 +1814,24 @@ def nfl_separation_opportunity(
     (fp_diff_per_game < -1.5 and td_luck < -1.0) as regression_candidate. Next Gen
     Stats only goes back to 2016. Default sort is most under-producing first
     (fp_diff_per_game ASC).
+
+    Each row is one player, season and season_type; the regular season and the postseason are
+    separate rows and are never averaged together. season_type defaults to 'REG' — the postseason
+    fallback rows rest on one or two weeks of data and crowd a list that asks for every season_type.
+    Pass season_type='ALL' to get both scopes in one call. A null does not reach this function over
+    MCP: the parameter is declared "type": "string", and mcp.server validates arguments against
+    that schema before the handler runs, so season_type=None answers 'Input validation error: None
+    is not of type \'string\''.
+
+    avg_separation, avg_yac_above_expectation and catch_percentage are NGS's own season summary row
+    (week = 0) where NGS published one, and a mean of that player's weekly rows in the same
+    season_type where it did not — separation weighted by targets, YAC above expectation by
+    receptions, since separation is measured on every target and YAC on every catch.
+    separation_source says which of the two a row used; on a weekly-rows row, fallback_weeks and
+    fallback_targets give the size of the sample behind it (124 of the 206 regular-season fallback
+    rows rest on a single week, averaging 1.7 weeks, because NGS published weekly rows for only 291
+    receiving players in 2024). regression_candidate is null on those rows: a one-week, five-target
+    sample cannot support a regression claim.
     """
     try:
         limit = max(1, min(int(limit), _MAX_ROWS))
@@ -1771,23 +1856,31 @@ def nfl_separation_opportunity(
     if season:
         conditions.append("season = ?")
         params.append(int(season))
+    if season_type and season_type.upper() != "ALL":
+        # 'ALL' is the only way to ask for both scopes: an empty or null value cannot survive the
+        # schema's "type": "string", so the literal is the contract.
+        conditions.append("season_type = ?")
+        params.append(season_type.upper())
     if regression_candidate is not None:
         conditions.append("regression_candidate = ?")
         params.append(bool(regression_candidate))
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
-        SELECT player_id, full_name, position, team, season, games,
+        SELECT player_id, full_name, position, team, season, season_type, games,
                fp_diff, fp_diff_per_game, td_luck, catch_luck,
                target_share_pct, air_yards_share_pct,
                avg_separation, avg_yac_above_expectation, catch_percentage,
-               regression_candidate
+               separation_source, fallback_weeks, fallback_targets, regression_candidate
         FROM player_separation_opportunity
         WHERE {where}
         ORDER BY fp_diff_per_game ASC NULLS LAST
         LIMIT {limit}
     """
     try:
+        stale = _stale_derived_tables(["player_separation_opportunity"])
+        if stale is not None:
+            return stale
         rows = _execute(sql, params if params else None)
         return _echo_player(
             {"separation_opportunity": _label_players(rows), "count": len(rows)}, identity

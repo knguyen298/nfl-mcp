@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 
+import pytest
 from mcp.types import ListToolsRequest
 
 import nfl_mcp.server as server_module
@@ -174,3 +175,67 @@ def test_every_exposed_tool_has_a_handler():
         # Tools report failures as a plain string; only the server reports UNKNOWN_TOOL.
         code = error.get("code") if isinstance(error, dict) else None
         assert code != "UNKNOWN_TOOL", name
+
+
+@pytest.mark.parametrize("name", ["nfl_team_stats", "nfl_compare", "nfl_separation_opportunity"])
+def test_the_tools_entry_lists_every_argument_the_function_takes(name):
+    """season_type was added to all three; a parameter with no TOOLS entry is invisible."""
+    tool = next(tool for tool in server_module.TOOLS if tool.name == name)
+    assert set(tool.inputSchema["properties"]) == set(
+        inspect.signature(getattr(server_module, name)).parameters)
+    if name != "nfl_compare":
+        assert "season_type" in tool.inputSchema["properties"]
+
+
+def test_the_team_tool_text_names_where_the_numbers_come_from():
+    """Group B rule: the text the model reads says which table or flag produced a number."""
+    described = {tool.name: tool.description for tool in server_module.TOOLS
+                 if tool.name in ("nfl_team_stats", "nfl_compare", "nfl_separation_opportunity")}
+    assert set(described) == {"nfl_team_stats", "nfl_compare", "nfl_separation_opportunity"}
+    team = described["nfl_team_stats"]
+    assert "team_stats_raw" in team and "schedules" in team and "scrimmage plays" in team
+    assert "season_type" in team and "playoff" in team
+    assert "season_type" in described["nfl_compare"]
+    assert "week = 0" in described["nfl_separation_opportunity"]
+    assert "never averaged together" in described["nfl_separation_opportunity"]
+
+
+def test_the_compare_tool_no_longer_says_team_mode_ignores_season_type():
+    described = {tool.name: tool for tool in server_module.TOOLS if tool.name == "nfl_compare"}
+    tool = described["nfl_compare"]
+    assert "ignores" not in tool.description
+    params = tool.inputSchema["properties"]["season_type"]["description"]
+    assert "ignores" not in params and "Both modes apply it" in params
+
+
+def test_the_separation_tool_offers_only_a_season_type_mcp_accepts():
+    """Its description told the model to pass null for both scopes. mcp.server validates the
+    arguments against inputSchema before the handler runs (mcp/server/lowlevel/server.py, the
+    jsonschema.validate call that answers 'Input validation error: ...'), and this parameter is typed
+    "string", so season_type=null never reached Python: the re-reviewer's call returned
+    `Input validation error: None is not of type 'string'`. The literal 'ALL' is the way to ask for
+    both scopes now, and the schema has to accept it."""
+    import jsonschema
+
+    tool = next(t for t in server_module.TOOLS if t.name == "nfl_separation_opportunity")
+    spec = tool.inputSchema["properties"]["season_type"]
+    assert spec["enum"] == ["REG", "POST", "ALL"]
+    assert "ALL" in spec["description"]
+    assert "pass null" not in spec["description"].lower()
+    assert "null for both" not in tool.description.lower()
+    assert "'ALL' for both" in tool.description
+    jsonschema.validate({"season_type": "ALL"}, tool.inputSchema)
+    jsonschema.validate({"season_type": "REG"}, tool.inputSchema)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"season_type": None}, tool.inputSchema)
+
+
+def test_no_other_tool_promises_a_null_its_schema_rejects():
+    """A description that says pass null for a property the schema types as a string is a promise the
+    server cannot keep, because mcp validates before it dispatches."""
+    for tool in server_module.TOOLS:
+        for name, spec in tool.inputSchema["properties"].items():
+            text = (spec.get("description") or "").lower()
+            promised_null = "pass null" in text or "= null" in text or "null for" in text
+            if promised_null:
+                assert "null" in json.dumps(spec.get("type")), f"{tool.name}.{name}"

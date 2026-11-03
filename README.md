@@ -315,7 +315,7 @@ SELECT season, team, wins, losses, ties FROM team_records WHERE season = 1972 AN
 | `nfl_status` | Database health: total plays, loaded seasons, available tables |
 | `nfl_query` | Raw SQL SELECT for custom queries (500 row cap, 10s timeout) |
 | `nfl_search_plays` | Find plays by player, team, season, season type, situation, touchdowns, etc. |
-| `nfl_team_stats` | Pre-aggregated team offense, defense, and situational stats |
+| `nfl_team_stats` | Pre-aggregated team offense, defense, and situational stats, one row per season and season_type (regular season and playoffs are never merged) |
 | `nfl_player_stats` | Official player counting stats per season and season type, summed from the week-level `player_stats` table — passing, rushing, or receiving |
 | `nfl_compare` | Side-by-side comparison of two teams or two players |
 | `nfl_schedule` | Game schedule and results — scores, spread, weather, coaches |

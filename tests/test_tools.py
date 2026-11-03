@@ -16,8 +16,13 @@ from nfl_mcp.tools import (
 
 
 @pytest.fixture
-def require_db():
-    """Skip integration tests if no data is loaded."""
+def require_db(rebuilt_db):
+    """Skip integration tests if no data is loaded.
+
+    Depends on rebuilt_db, so the queries below read a copy of the database whose derived team
+    tables have been rebuilt by the current ingest code: the databases on disk and in CI were built
+    before those tables gained a season_type column, and no test may write to them.
+    """
     result = nfl_query("SELECT COUNT(*) AS n FROM plays")
     if "error" in result:
         pytest.skip("No DuckDB database loaded")
@@ -55,6 +60,18 @@ class TestNflSchema:
         result = nfl_schema(category="nonexistent")
         assert "error" in result
         assert "available" in result
+
+    def test_the_team_table_docs_name_the_source_and_the_filter(self):
+        """Group B rule: the schema text says where each column comes from."""
+        schema = nfl_schema(category="aggregate_tables")["schema"]
+        assert "season_type" in schema
+        assert "team_stats_raw" in schema and "schedules" in schema
+        assert "(pass = 1 OR rush = 1) AND epa IS NOT NULL AND two_point_attempt <> 1" in schema
+        assert "third_down_converted" in schema and "fourth_down_converted" in schema
+        assert "red_zone_trips" in schema and "game_id plus" in schema
+        assert "play_type = 'no_play'" in schema
+        for table in ("team_offense_stats", "team_defense_stats", "situational_stats"):
+            assert table in schema
 
 
 @pytest.mark.integration
@@ -149,7 +166,11 @@ class TestNflTeamStats:
         assert "error" not in result
         assert "offense" in result
         assert "defense" in result
-        assert len(result["offense"]) == 1
+        # Two rows now, where the old table handed back one merged line: the Chiefs played 17
+        # regular-season games and 3 postseason games in 2024 and they are not the same sample.
+        assert [(r["season_type"], r["total_plays"]) for r in result["offense"]] == [
+            ("POST", 162), ("REG", 1091)]
+        assert [r["season_type"] for r in result["defense"]] == ["POST", "REG"]
 
     def test_offense_only(self):
         result = nfl_team_stats(team="BAL", season=2024, side="offense")
@@ -170,6 +191,503 @@ class TestNflTeamStats:
         result = nfl_team_stats(team="ZZZ", season=2024)
         assert "error" not in result
         assert len(result["offense"]) == 0
+
+    def test_season_type_picks_one_of_the_two_rows(self):
+        reg = nfl_team_stats(team="KC", season=2024, season_type="REG")
+        assert [r["season_type"] for r in reg["offense"]] == ["REG"]
+        assert [r["season_type"] for r in reg["defense"]] == ["REG"]
+        assert [r["season_type"] for r in reg["situational"]] == ["REG"] * len(reg["situational"])
+        post = nfl_team_stats(team="KC", season=2024, side="offense", season_type="post")
+        assert [(r["season_type"], r["total_plays"]) for r in post["offense"]] == [("POST", 162)]
+
+    def test_the_response_names_the_source_of_every_column(self):
+        sources = nfl_team_stats(team="KC", season=2024, side="offense")["sources"]
+        assert set(sources) == {"team_stats_raw", "schedules", "plays"}
+        assert "red_zone_trips" in sources["plays"]
+        assert "points_for" in sources["schedules"]
+        assert "scrimmage plays only" in sources["plays"]
+
+
+def _team_tables_db(tmp_path, monkeypatch, *, season_type: bool) -> None:
+    """Point the tools at a database whose derived tables do, or do not, carry season_type - the
+    shape a database ingested before that column landed reports. No ingest, no network. The one row
+    in each table is synthetic, only there so the read path has a row.
+
+    player_separation_opportunity is always created in the old shape, because only the guard test
+    reads it and the guard must fire whatever else in the database is current.
+    """
+    db = tmp_path / "team_tables.duckdb"
+    conn = duckdb.connect(str(db))
+    extra = ", season_type VARCHAR" if season_type else ""
+    tail = ", 'REG'" if season_type else ""
+    for table, cols, value in (
+        ("team_offense_stats", "team VARCHAR, season_year INTEGER, total_plays INTEGER", "1091"),
+        ("team_defense_stats", "team VARCHAR, season_year INTEGER, sacks INTEGER", "39"),
+        ("situational_stats", "team VARCHAR, season_year INTEGER, situation VARCHAR", "'4th Down'"),
+    ):
+        conn.execute(f"CREATE TABLE {table} ({cols}{extra})")
+        conn.execute(f"INSERT INTO {table} VALUES ('KC', 2024, {value}{tail})")
+    conn.execute("CREATE TABLE player_separation_opportunity "
+                 "(player_id VARCHAR, season INTEGER, avg_separation DOUBLE)")
+    conn.execute("INSERT INTO player_separation_opportunity VALUES ('00-0033873', 2024, 2.9)")
+    conn.close()
+    monkeypatch.setenv("NFL_MCP_DB_PATH", str(db))
+
+
+_REBUILD = "Rebuild the derived tables: nfl-mcp ingest --dataset teams"
+
+
+class TestStaleDerivedTables:
+    """A database ingested before these derived tables gained season_type cannot serve these queries.
+
+    The tools must say what to run, not hand back DuckDB's binder error about a column the caller
+    never typed. `teams` is the cheapest dataset that rebuilds the derived tables: it is static and
+    replace-style, so the run does one small fetch, no season loop, no play-by-play download.
+    """
+
+    def test_a_table_without_season_type_names_the_command_to_rebuild_it(self, tmp_path, monkeypatch):
+        _team_tables_db(tmp_path, monkeypatch, season_type=False)
+        assert nfl_team_stats(team="KC", season=2024) == {
+            "error": f"team_offense_stats has no season_type column. {_REBUILD}"}
+
+    def test_each_side_names_the_table_it_cannot_read(self, tmp_path, monkeypatch):
+        _team_tables_db(tmp_path, monkeypatch, season_type=False)
+        errors = {side: nfl_team_stats(team="KC", season=2024, side=side)["error"]
+                  for side in ("offense", "defense", "situational")}
+        assert errors == {
+            "offense": f"team_offense_stats has no season_type column. {_REBUILD}",
+            "defense": f"team_defense_stats has no season_type column. {_REBUILD}",
+            "situational": f"situational_stats has no season_type column. {_REBUILD}"}
+
+    def test_compare_team_names_the_command_to_rebuild_it(self, tmp_path, monkeypatch):
+        _team_tables_db(tmp_path, monkeypatch, season_type=False)
+        assert nfl_compare(entity1="KC", entity2="BAL", compare_type="team", season=2024) == {
+            "error": f"team_offense_stats has no season_type column. {_REBUILD}"}
+
+    def test_separation_names_the_command_to_rebuild_it(self, tmp_path, monkeypatch):
+        """player_separation_opportunity selects season_type and separation_source, so an old
+        database failed here with a raw binder error and a logged traceback."""
+        _team_tables_db(tmp_path, monkeypatch, season_type=True)
+        assert nfl_separation_opportunity() == {
+            "error": f"player_separation_opportunity has no season_type column. {_REBUILD}"}
+
+    def test_a_table_with_season_type_is_read_as_usual(self, tmp_path, monkeypatch):
+        _team_tables_db(tmp_path, monkeypatch, season_type=True)
+        stats = nfl_team_stats(team="KC", season=2024)
+        assert "error" not in stats
+        assert [r["season_type"] for r in stats["offense"]] == ["REG"]
+        compared = nfl_compare(entity1="KC", entity2="BAL", compare_type="team", season=2024)
+        assert "error" not in compared
+        assert [r["season_type"] for r in compared["KC"]["offense"]] == ["REG"]
+        assert compared["BAL"]["offense"] == []
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("require_db")
+class TestTeamTablesAreTheOfficialNumbers:
+    """The rebuilt team tables against team_stats_raw, schedules, and counts run by hand.
+
+    Every expected number below was read off the same database the test runs on, by the queries
+    next to it, for the 2024 season: Kansas City (17 regular-season games, 3 postseason) and
+    Philadelphia (17 and 2). The regular-season rows must equal the week-level team box exactly,
+    because the box is what ESPN and Pro Football Reference print.
+    """
+
+    BOX_COLUMNS = (
+        "attempts", "sacks_suffered", "carries", "completions", "rushing_yards", "passing_yards",
+        "sack_yards_lost", "passing_tds", "rushing_tds", "special_teams_tds",
+        "passing_interceptions", "fumbles_lost_total", "def_sacks", "def_interceptions",
+        "penalties", "penalty_yards",
+    )
+
+    @staticmethod
+    def box(team, season_type):
+        """Ground truth: the week-level team box summed the way the derived table sums it."""
+        select = ", ".join(f"COALESCE(SUM({c}), 0) AS {c}" for c in
+                           TestTeamTablesAreTheOfficialNumbers.BOX_COLUMNS)
+        return nfl_query(
+            f"SELECT {select}, "
+            f"COALESCE(SUM(passing_first_downs + rushing_first_downs + receiving_first_downs), 0) "
+            f"AS first_downs "
+            f"FROM team_stats_raw WHERE team='{team}' AND season=2024 AND season_type='{season_type}'"
+        )["rows"][0]
+
+    @pytest.mark.parametrize("team,plays,yards,tds,tovs", [
+        ("KC", 1091, 5570, 41, 14),
+        ("PHI", 1114, 6242, 53, 15),
+    ])
+    def test_two_team_seasons_equal_the_week_level_team_box(self, team, plays, yards, tds, tovs):
+        got = nfl_team_stats(team=team, season=2024, season_type="REG", side="offense")["offense"][0]
+        box = self.box(team, "REG")
+        assert (got["total_plays"], got["total_yards"]) == (plays, yards)
+        assert (got["touchdowns"], got["turnovers"]) == (tds, tovs)
+        assert got["total_plays"] == box["attempts"] + box["sacks_suffered"] + box["carries"]
+        assert got["total_yards"] == (box["rushing_yards"] + box["passing_yards"]
+                                      + box["sack_yards_lost"])
+        assert (got["pass_plays"], got["rush_plays"], got["completions"]) == (
+            box["attempts"], box["carries"], box["completions"])
+        assert (got["pass_yards"], got["rush_yards"]) == (
+            box["passing_yards"] + box["sack_yards_lost"], box["rushing_yards"])
+        assert (got["touchdowns"], got["sacks_suffered"], got["sack_yards"]) == (
+            box["passing_tds"] + box["rushing_tds"], box["sacks_suffered"], box["sack_yards_lost"])
+        assert (got["turnovers"], got["first_downs"], got["penalties"]) == (
+            box["passing_interceptions"] + box["fumbles_lost_total"], box["first_downs"],
+            box["penalties"])
+        defense = nfl_team_stats(team=team, season=2024, season_type="REG", side="defense")["defense"][0]
+        assert (defense["sacks"], defense["interceptions"]) == (
+            box["def_sacks"], box["def_interceptions"])
+
+    def test_a_sack_is_not_a_pass_attempt(self):
+        """The old table counted a sack in pass_plays: Kansas City 2024 said 741."""
+        got = nfl_team_stats(team="KC", season=2024, season_type="REG", side="offense")["offense"][0]
+        assert got["pass_plays"] == 600
+        assert got["sacks_suffered"] == 41
+        assert got["sack_yards"] == -266
+        assert got["pass_plays"] + got["sacks_suffered"] + got["rush_plays"] == got["total_plays"]
+
+    def test_a_return_touchdown_is_not_an_offensive_touchdown(self):
+        """Week 22, 2024 postseason: a Mahomes pass is intercepted and returned 38 yards for a
+        touchdown. play_by_play files that with posteam = KC and touchdown = 1, so the old table
+        credited the Chiefs' offense with a score it did not have."""
+        naive = nfl_query(
+            "SELECT COUNT(*) AS n FROM plays WHERE posteam='KC' AND season=2024 "
+            "AND season_type='POST' AND touchdown = 1")["rows"][0]["n"]
+        got = nfl_team_stats(team="KC", season=2024, season_type="POST", side="offense")["offense"][0]
+        assert naive == 10
+        assert got["touchdowns"] == 9
+        assert (got["passing_tds"], got["rushing_tds"]) == (5, 4)
+        # The situational rows add up to the offense's 9, not to 10.
+        situational = nfl_team_stats(team="KC", season=2024, season_type="POST",
+                                    side="situational")["situational"]
+        assert sum(r["touchdowns"] for r in situational) == 9
+
+    def test_third_down_rate_uses_the_conversion_flags(self):
+        """The two counts cover every play that carries a conversion flag, so a quarterback kneel
+        that fails a third down is an attempt: 48 kneels and 8 spikes carry third_down_failed = 1 in
+        the 2024 regular season, and the pass-or-rush population used to drop all of them. Kansas
+        City's 225 attempts become 229. A punt or a field-goal attempt carries no flag, and a play a
+        penalty nullified carries none either, so nothing double counts."""
+        got = nfl_team_stats(team="KC", season=2024, season_type="REG", side="offense")["offense"][0]
+        assert (got["third_down_conversions"], got["third_down_attempts"]) == (111, 229)
+        assert got["third_down_pct"] == 48.5
+        assert got["third_down_pct"] == round(100.0 * 111 / 229, 1)
+        defense = nfl_team_stats(team="KC", season=2024, season_type="REG", side="defense")["defense"][0]
+        assert (defense["third_down_stops"], defense["third_down_attempts"]) == (122, 215)
+        assert defense["third_down_stop_pct"] == 56.7
+
+    def test_the_flags_and_the_yardage_do_not_agree_and_the_flags_win(self):
+        """Buffalo 2024 regular season: the conversion flags credit 89 third downs out of 202
+        attempts, while measuring yards against ydstogo over every 3rd-down play says 88 out of 214,
+        and the same flags over the scrimmage population only says 89 out of 198. A rate is only as
+        good as the rule behind it, so all three numbers are pinned."""
+        counts = nfl_query(
+            "SELECT SUM(CASE WHEN COALESCE(third_down_converted,0)=1 THEN 1 ELSE 0 END) AS conv, "
+            "SUM(CASE WHEN COALESCE(third_down_converted,0)=1 OR COALESCE(third_down_failed,0)=1 "
+            "THEN 1 ELSE 0 END) AS att, SUM(CASE WHEN yards_gained>=ydstogo THEN 1 ELSE 0 END) AS "
+            "by_yards, COUNT(*) AS all_thirds FROM plays WHERE posteam='BUF' AND season=2024 "
+            "AND season_type='REG' AND down=3 AND (COALESCE(pass,0)=1 OR COALESCE(rush,0)=1) "
+            "AND epa IS NOT NULL AND COALESCE(two_point_attempt,0)<>1")['rows'][0]
+        assert (counts["conv"], counts["att"], counts["by_yards"], counts["all_thirds"]) == (
+            89, 198, 88, 214)
+        got = nfl_team_stats(team="BUF", season=2024, season_type="REG", side="offense")["offense"][0]
+        assert (got["third_down_conversions"], got["third_down_attempts"]) == (89, 202)
+        assert got["third_down_pct"] == round(100.0 * 89 / 202, 1)
+
+    def test_a_red_zone_rate_divides_trips_and_not_plays(self):
+        """A trip is a drive that gets a football play inside the opponent's 20. Kansas City reached
+        it on 67 regular-season drives in 2024 and scored a touchdown of its own on 35 (52.2%).
+
+        The raw-source query, kept here so the literals can be re-run:
+          SELECT COUNT(*) t, SUM(td) scored FROM (
+            SELECT game_id, drive,
+                   MAX(CASE WHEN play_type IN ('pass','run','field_goal','qb_kneel','qb_spike')
+                             AND COALESCE(two_point_attempt,0)<>1
+                            THEN 1 ELSE 0 END) AS reached_20,
+                   MAX(CASE WHEN COALESCE(pass_touchdown,0)=1 OR COALESCE(rush_touchdown,0)=1
+                            THEN 1 ELSE 0 END) AS td
+            FROM plays WHERE posteam='KC' AND season=2024 AND season_type='REG'
+              AND drive IS NOT NULL AND game_id IS NOT NULL AND yardline_100<=20
+            GROUP BY game_id, drive) WHERE reached_20 = 1;
+
+        Kansas City also played 276 downs inside the 20, and the old rate divided by those and
+        reported 12.7. Counting a kick as proof added 6 drives that never got a football play inside
+        the 20 - each one is a long touchdown pass followed by the extra point at the 15 - and the
+        league figure read 2,141 trips and 47.6% for the 2024 regular season."""
+        got = nfl_team_stats(team="KC", season=2024, season_type="REG", side="offense")["offense"][0]
+        assert (got["red_zone_trips"], got["red_zone_touchdowns"]) == (67, 35)
+        assert got["red_zone_td_pct"] == 52.2
+        plays = nfl_query(
+            "SELECT COUNT(*) AS n FROM plays WHERE posteam='KC' AND season=2024 "
+            "AND season_type='REG' AND yardline_100<=20")["rows"][0]["n"]
+        assert plays == 276
+        assert got["red_zone_td_pct"] != round(100.0 * 35 / plays, 1)
+        # A kick-only drive is not a trip: 6 of Kansas City's 73 old trips were that shape.
+        kick_only = nfl_query(
+            "SELECT COUNT(*) AS n FROM (SELECT game_id, drive, "
+            "SUM(CASE WHEN play_type IN ('pass','run','field_goal','qb_kneel','qb_spike') "
+            "AND COALESCE(two_point_attempt,0)<>1 THEN 1 "
+            "ELSE 0 END) AS football FROM plays WHERE posteam='KC' AND season=2024 "
+            "AND season_type='REG' AND drive IS NOT NULL AND game_id IS NOT NULL "
+            "AND yardline_100<=20 GROUP BY game_id, drive) WHERE football = 0")["rows"][0]["n"]
+        assert kick_only == 6
+        phi = nfl_team_stats(team="PHI", season=2024, season_type="REG", side="offense")["offense"][0]
+        assert (phi["red_zone_trips"], phi["red_zone_touchdowns"], phi["red_zone_td_pct"]) == (
+            71, 38, 53.5)
+
+    def test_a_red_zone_trip_needs_a_football_play_not_a_kick(self):
+        """The extra point is spotted at the 15 and the two-point try at the 2, so yardline_100 <= 20
+        on its own let the kick after a touchdown prove the trip - 1,292 extra-point rows in 2024
+        sit inside that bound. Of the 6 Kansas City drives that bound used to count, every one holds
+        a single extra-point row and no football play inside the 20."""
+        drives = nfl_query(
+            "SELECT types FROM (SELECT game_id, drive, "
+            "SUM(CASE WHEN play_type IN ('pass','run','field_goal','qb_kneel','qb_spike') "
+            "AND COALESCE(two_point_attempt,0)<>1 THEN 1 "
+            "ELSE 0 END) AS football, LIST(play_type) AS types FROM plays WHERE posteam='KC' "
+            "AND season=2024 AND season_type='REG' AND drive IS NOT NULL AND game_id IS NOT NULL "
+            "AND yardline_100<=20 GROUP BY game_id, drive) WHERE football = 0")["rows"]
+        assert [r["types"] for r in drives] == [["extra_point"]] * 6
+
+    def test_a_two_point_try_does_not_prove_a_red_zone_trip(self):
+        """A two-point attempt is recorded with play_type 'pass' or 'run' and is spotted at the 2, so
+        it clears the football-play gate on its own and is the extra point defect again in a
+        different costume: 99 passes and 36 runs in the 2024 regular season carry
+        two_point_attempt = 1. The gate excludes them by that flag, the way _SCRIMMAGE does.
+
+        The league row is what catches it, because no single team's count moves - Kansas City's 67
+        trips are the same either way. The gate with the exclusion gives 1,821 trips and 1,019
+        touchdowns across the 32 regular-season rows (56.0%); without it, 1,844 and 55.3%:
+
+          SELECT COUNT(*) t, SUM(td) scored FROM (
+            SELECT posteam, game_id, drive,
+                   MAX(CASE WHEN play_type IN ('pass','run','field_goal','qb_kneel','qb_spike')
+                             AND COALESCE(two_point_attempt,0)<>1 THEN 1 ELSE 0 END) AS reached_20,
+                   MAX(CASE WHEN COALESCE(pass_touchdown,0)=1 OR COALESCE(rush_touchdown,0)=1
+                            THEN 1 ELSE 0 END) AS td
+            FROM plays WHERE posteam IS NOT NULL AND season=2024 AND season_type='REG'
+              AND drive IS NOT NULL AND game_id IS NOT NULL AND yardline_100<=20
+            GROUP BY 1, 2, 3) WHERE reached_20 = 1;
+        """
+        league = nfl_query(
+            "SELECT SUM(red_zone_trips) AS trips, SUM(red_zone_touchdowns) AS tds, "
+            "ROUND(100.0*SUM(red_zone_touchdowns)/SUM(red_zone_trips), 1) AS pct "
+            "FROM team_offense_stats WHERE season_year=2024 AND season_type='REG'")["rows"][0]
+        assert (league["trips"], league["tds"], league["pct"]) == (1821, 1019, 56.0)
+        # 23 drives proved themselves only through the two-point try, and every one of them is
+        # recorded as a pass or a run, which is why the play_type gate alone cannot drop them.
+        only_two_point = nfl_query(
+            "SELECT COUNT(*) AS n FROM (SELECT posteam, game_id, drive, "
+            "SUM(CASE WHEN play_type IN ('pass','run','field_goal','qb_kneel','qb_spike') "
+            "AND COALESCE(two_point_attempt,0)<>1 THEN 1 ELSE 0 END) AS football, "
+            "SUM(CASE WHEN COALESCE(two_point_attempt,0)=1 THEN 1 ELSE 0 END) AS tries "
+            "FROM plays WHERE posteam IS NOT NULL AND season=2024 AND season_type='REG' "
+            "AND drive IS NOT NULL AND game_id IS NOT NULL AND yardline_100<=20 "
+            "GROUP BY 1, 2, 3) WHERE football = 0 AND tries > 0")["rows"][0]["n"]
+        assert only_two_point == 23
+
+    def test_one_nullified_play_carries_a_conversion_flag(self):
+        """The comment used to say a play a penalty nullified carries no flag at all. One of the
+        6,569 no_play rows in the table does: game 2024_15_MIA_HOU, a Houston fake punt on 4th and 2,
+        35 yards, fourth_down_converted = 1. The conversion columns count it and plays does not, so
+        the Houston 2024 regular-season 4th Down row reads 18 attempts over 17 plays - the rule is
+        kept as built, and the row says so."""
+        flagged = nfl_query(
+            "SELECT game_id, play_id, posteam, down, ydstogo, yards_gained, fourth_down_converted "
+            "FROM plays WHERE play_type='no_play' AND (COALESCE(third_down_converted,0)=1 OR "
+            "COALESCE(third_down_failed,0)=1 OR COALESCE(fourth_down_converted,0)=1 OR "
+            "COALESCE(fourth_down_failed,0)=1)")["rows"]
+        assert [(r["game_id"], r["posteam"], r["down"], r["ydstogo"], r["yards_gained"]) for r in flagged] == [
+            ("2024_15_MIA_HOU", "HOU", 4.0, 2.0, 35.0)]
+        fourth = next(r for r in nfl_team_stats(team="HOU", season=2024, season_type="REG",
+                                                side="situational")["situational"]
+                      if r["situation"] == "4th Down")
+        assert (fourth["plays"], fourth["conversion_attempts"]) == (17, 18)
+        # 32 rows of this table from 2024 show more attempts than plays; the other 31 are kneels and
+        # spikes, which carry a flag and are not scrimmage plays, so this gap is not a counting error.
+        # (Across every season in the database the same count is 84; it is scoped here so the
+        # 2024-only database this suite also runs on answers the same.)
+        gap = nfl_query("SELECT COUNT(*) AS n FROM situational_stats WHERE season_year=2024 "
+                        "AND conversion_attempts > plays")
+        assert gap["rows"][0]["n"] == 32
+
+    def test_a_trip_scored_from_outside_the_20_counts_as_a_miss(self):
+        """The touchdown check reads only plays inside the 20, so a drive that entered the 20, was
+        pushed back, and scored from outside it is a trip with no touchdown. 11 drives of the 2024
+        regular season have that shape and stay in the denominator as misses; the rule is deliberate
+        and recorded in the comment, so this pins the count that motivated it."""
+        drives = nfl_query(
+            "SELECT COUNT(*) AS n FROM (SELECT posteam, game_id, drive, "
+            "MAX(CASE WHEN play_type IN ('pass','run','field_goal','qb_kneel','qb_spike') "
+            "AND COALESCE(two_point_attempt,0)<>1 THEN 1 ELSE 0 END) AS reached, "
+            "MAX(CASE WHEN COALESCE(pass_touchdown,0)=1 OR COALESCE(rush_touchdown,0)=1 "
+            "THEN 1 ELSE 0 END) AS td_inside FROM plays WHERE posteam IS NOT NULL AND season=2024 "
+            "AND season_type='REG' AND drive IS NOT NULL AND game_id IS NOT NULL "
+            "AND yardline_100<=20 GROUP BY 1,2,3) t JOIN (SELECT posteam, game_id, drive, "
+            "MAX(CASE WHEN COALESCE(pass_touchdown,0)=1 OR COALESCE(rush_touchdown,0)=1 "
+            "THEN 1 ELSE 0 END) AS td_any FROM plays WHERE posteam IS NOT NULL AND season=2024 "
+            "AND season_type='REG' AND drive IS NOT NULL AND game_id IS NOT NULL GROUP BY 1,2,3) a "
+            "USING (posteam, game_id, drive) WHERE t.reached=1 AND t.td_inside=0 AND a.td_any=1")
+        assert drives["rows"][0]["n"] == 11
+
+    def test_punts_and_field_goals_are_not_fourth_down_attempts(self):
+        """Kansas City 2024 regular season: 118 plays are recorded on 4th down, 95 of them a punt or
+        a field goal and 6 more nullified by a penalty. The situational row is the 17 plays left, of
+        which the nflfastR flags credit 12 conversions out of 17 attempts."""
+        down4 = nfl_query(
+            "SELECT COUNT(*) AS n, SUM(CASE WHEN play_type IN ('punt','field_goal') THEN 1 ELSE 0 "
+            "END) AS kicks, SUM(CASE WHEN play_type = 'no_play' THEN 1 ELSE 0 END) AS nullified "
+            "FROM plays WHERE posteam='KC' AND season=2024 AND season_type='REG' "
+            "AND down=4")["rows"][0]
+        assert (down4["n"], down4["kicks"], down4["nullified"]) == (118, 95, 6)
+        rows = nfl_team_stats(team="KC", season=2024, season_type="REG", side="situational")["situational"]
+        fourth = next(r for r in rows if r["situation"] == "4th Down")
+        assert (fourth["plays"], fourth["conversions"], fourth["conversion_attempts"]) == (17, 12, 17)
+        assert fourth["conversion_pct"] == 70.6
+        # A row with no third- or fourth-down attempt in it has a null rate, not a 0.0 rate.
+        # ('Standard' and 'Red Zone' are not such rows: _SITUATION_EXPR splits 3rd down only at
+        # 3rd & short and 3rd & long, so 3rd & medium lands in them.)
+        two_minute = next(r for r in rows if r["situation"] == "Two Minute Drill")
+        assert (two_minute["plays"], two_minute["conversion_attempts"]) == (13, 0)
+        assert two_minute["conversion_pct"] is None
+
+    def test_a_play_a_penalty_nullified_is_not_an_attempt(self):
+        """play_type = 'no_play' is a down a penalty undid, and the same down was replayed, so the
+        official box counts the replay and not that attempt. The 2024 regular season holds 1,612 of
+        them inside the scrimmage population and they gain 35 yards between them (0.02 each).
+        Kansas City's avg_epa reads 0.071 with them and 0.072 without, and the table says 0.072."""
+        league = nfl_query(
+            "SELECT COUNT(*) AS n, ROUND(SUM(COALESCE(yards_gained,0)), 1) AS yards FROM plays "
+            "WHERE season=2024 AND season_type='REG' AND play_type = 'no_play' "
+            "AND (COALESCE(pass,0)=1 OR COALESCE(rush,0)=1) AND epa IS NOT NULL "
+            "AND COALESCE(two_point_attempt,0)<>1")["rows"][0]
+        assert (league["n"], league["yards"]) == (1612, 35.0)
+        kc = nfl_query(
+            "SELECT ROUND(AVG(epa), 3) AS with_them, "
+            "ROUND(AVG(CASE WHEN play_type <> 'no_play' THEN epa END), 3) AS without FROM plays "
+            "WHERE posteam='KC' AND season=2024 AND season_type='REG' "
+            "AND (COALESCE(pass,0)=1 OR COALESCE(rush,0)=1) AND epa IS NOT NULL "
+            "AND COALESCE(two_point_attempt,0)<>1")["rows"][0]
+        assert (kc["with_them"], kc["without"]) == (0.071, 0.072)
+        got = nfl_team_stats(team="KC", season=2024, season_type="REG", side="offense")["offense"][0]
+        assert got["avg_epa"] == 0.072
+
+    def test_the_three_yards_per_play_rates_divide_the_totals_in_the_row(self):
+        """The same row used to hold two answers for one question. Kansas City 2024 regular season
+        said 5.02 yards per play, 4.26 per rush and 5.92 per pass while carrying 5570 yards over
+        1091 plays, 1790 over 450 carries, and 3780 over 641 dropbacks - 5.11, 3.98 and 5.90.
+        Baltimore is here too because its spread was larger: 6.65 against 6.85, 5.89 against 5.76,
+        8.14 against 8.05."""
+        for team, ypp, ypr, yppass in (("BAL", 6.85, 5.76, 8.05), ("KC", 5.11, 3.98, 5.9)):
+            got = nfl_team_stats(team=team, season=2024, season_type="REG",
+                                 side="offense")["offense"][0]
+            assert (got["yards_per_play"], got["yards_per_rush"], got["yards_per_pass"]) == (
+                ypp, ypr, yppass)
+            assert got["yards_per_play"] == round(got["total_yards"] / got["total_plays"], 2)
+            assert got["yards_per_rush"] == round(got["rush_yards"] / got["rush_plays"], 2)
+            assert got["yards_per_pass"] == round(
+                got["pass_yards"] / (got["pass_plays"] + got["sacks_suffered"]), 2)
+
+    def test_the_defence_counts_come_from_the_opponents_box_row(self):
+        """The defence was built from plays while the offence in front of it was built from the box,
+        so a team's defence and its opponents' offence disagreed: Kansas City 2024 regular season
+        showed 1069 plays against and 19 takeaways against the opponents' 1026 and 20, and the
+        postseason 209 and 1 against 203 and 1. Philadelphia: 1030 and 25 against 999 and 26, and
+        267 and 11 against 256 and 13."""
+        for team, season_type, plays, tovs, yards in (
+            ("KC", "REG", 1026, 20, 5451), ("KC", "POST", 203, 1, 1055),
+            ("PHI", "REG", 999, 26, 4732), ("PHI", "POST", 256, 13, 1329),
+        ):
+            box = nfl_query(
+                f"SELECT SUM(attempts + sacks_suffered + carries) AS plays, "
+                f"SUM(passing_interceptions + fumbles_lost_total) AS tovs, "
+                f"SUM(passing_yards + rushing_yards + sack_yards_lost) AS yards "
+                f"FROM team_stats_raw WHERE season = 2024 AND season_type = '{season_type}' "
+                f"AND opponent_team = '{team}'")["rows"][0]
+            assert (box["plays"], box["tovs"], box["yards"]) == (plays, tovs, yards)
+            got = nfl_team_stats(team=team, season=2024, season_type=season_type,
+                                 side="defense")["defense"][0]
+            assert (got["plays_against"], got["turnovers_forced"], got["yards_allowed"]) == (
+                plays, tovs, yards)
+        # The two populations do differ: 1017 scrimmage plays were recorded against Kansas City in
+        # the 2024 regular season, against the 1026 the opponents' box rows add up to. What no box
+        # carries still comes from plays.
+        scrim = nfl_query(
+            "SELECT COUNT(*) AS n FROM plays WHERE defteam='KC' AND season=2024 "
+            "AND season_type='REG' AND (COALESCE(pass,0)=1 OR COALESCE(rush,0)=1) "
+            "AND epa IS NOT NULL AND COALESCE(two_point_attempt,0)<>1 "
+            "AND COALESCE(play_type,'')<>'no_play'")["rows"][0]["n"]
+        assert scrim == 1017
+        got = nfl_team_stats(team="KC", season=2024, season_type="REG", side="defense")["defense"][0]
+        # The rate divides the two box totals already in the row: 5451 / 1026. Averaged over the
+        # 1017 scrimmage plays it said 5.37, disagreeing with the yards and plays next to it.
+        assert (got["yards_per_play_allowed"], got["avg_epa_allowed"]) == (5.31, 0.011)
+        assert got["yards_per_play_allowed"] == round(got["yards_allowed"] / got["plays_against"], 2)
+
+    def test_no_defence_row_holds_two_answers_for_one_question(self):
+        """Every rate in team_defense_stats now divides two numbers that sit in the same row.
+        yards_per_play_allowed was the exception: averaged over scrimmage plays it disagreed with the
+        yards and the plays next to it on all 46 rows of 2024 - Kansas City regular season 5.37
+        against 5451 / 1026 = 5.31, Baltimore postseason 5.50 against 553 / 104 = 5.32 - by as much
+        as 0.33. avg_epa_allowed is the one figure left on plays: no box carries expected points, and
+        the row holds no companion count that it claims to divide.
+
+        The audit turned up one pair that is not a rate but reads like one. plays_against adds the
+        opponents' sacks_suffered while sacks reports this defence's own def_sacks, and the two ends
+        of one sack are not always charged the same way: 9 of the 32 rows of the 2024 regular season
+        differ (Dallas 51 def_sacks against 52 sacks suffered by its opponents), by at most 2, so
+        plays_against cannot be decomposed out of the row. turnovers_forced has no such problem - its        interception half equals interceptions on every one of the 46 team-season rows of 2024."""
+        # Both checks run in SQL: Python rounds 117 / 208 = 56.25 to even (56.2) and DuckDB rounds
+        # it away from zero (56.3), which is the value the table holds.
+        bad = nfl_query(
+            "SELECT COUNT(*) AS n FROM team_defense_stats WHERE season_year=2024 AND ("
+            "yards_per_play_allowed IS DISTINCT FROM "
+            "ROUND(1.0*yards_allowed/NULLIF(plays_against,0), 2) OR third_down_stop_pct "
+            "IS DISTINCT FROM ROUND(100.0*third_down_stops/NULLIF(third_down_attempts,0), 1))")["rows"][0]["n"]
+        assert bad == 0
+        assert nfl_query("SELECT COUNT(*) AS n FROM team_defense_stats "
+                         "WHERE season_year=2024")["rows"][0]["n"] == 46
+        rows_ = nfl_query(
+            "SELECT team, season_type, yards_allowed, plays_against, yards_per_play_allowed "
+            "FROM team_defense_stats WHERE season_year=2024")["rows"]
+        kc = next(r for r in rows_ if r["team"] == "KC" and r["season_type"] == "REG")
+        assert (kc["yards_allowed"], kc["plays_against"], kc["yards_per_play_allowed"]) == (
+            5451, 1026, 5.31)
+        bal = next(r for r in rows_ if r["team"] == "BAL" and r["season_type"] == "POST")
+        assert (bal["yards_allowed"], bal["plays_against"], bal["yards_per_play_allowed"]) == (
+            553, 104, 5.32)
+        sack_gap = nfl_query(
+            "SELECT SUM(CASE WHEN o.ds<>p.ss THEN 1 ELSE 0 END) AS gap, MAX(ABS(o.ds-p.ss)) AS "
+            "worst, SUM(CASE WHEN o.di<>p.pi THEN 1 ELSE 0 END) AS int_gap, COUNT(*) AS n "
+            "FROM (SELECT team, season, season_type, SUM(def_sacks) ds, SUM(def_interceptions) di "
+            "FROM team_stats_raw WHERE season=2024 GROUP BY 1,2,3) o JOIN (SELECT opponent_team "
+            "team, season, season_type, SUM(sacks_suffered) ss, SUM(passing_interceptions) pi "
+            "FROM team_stats_raw WHERE season=2024 GROUP BY 1,2,3) p "
+            "USING (team, season, season_type)")["rows"][0]
+        assert (sack_gap["gap"], sack_gap["worst"], sack_gap["int_gap"], sack_gap["n"]) == (
+            9, 2, 0, 46)
+
+    def test_a_regular_season_value_excludes_the_playoffs(self):
+        reg = nfl_team_stats(team="KC", season=2024, season_type="REG", side="both")
+        post = nfl_team_stats(team="KC", season=2024, season_type="POST", side="both")
+        assert (reg["offense"][0]["total_plays"], post["offense"][0]["total_plays"]) == (1091, 162)
+        assert (reg["offense"][0]["touchdowns"], post["offense"][0]["touchdowns"]) == (41, 9)
+        assert (reg["offense"][0]["points_for"], post["offense"][0]["points_for"]) == (385, 77)
+        assert (reg["defense"][0]["sacks"], post["defense"][0]["sacks"]) == (39, 12)
+        # The merged number the old table gave for the same team-season.
+        both = nfl_team_stats(team="KC", season=2024, side="offense")["offense"]
+        assert [r["total_plays"] for r in both] == [162, 1091]
+        assert sum(r["total_plays"] for r in both) == 1253
+
+    def test_points_come_from_the_schedule(self):
+        sched = nfl_query(
+            "SELECT SUM(home_score) AS kc FROM (SELECT home_score FROM schedules WHERE season=2024 "
+            "AND game_type='REG' AND home_team='KC' UNION ALL SELECT away_score FROM schedules "
+            "WHERE season=2024 AND game_type='REG' AND away_team='KC')")["rows"][0]["kc"]
+        got = nfl_team_stats(team="KC", season=2024, season_type="REG", side="both")
+        assert sched == 385
+        assert got["offense"][0]["points_for"] == 385
+        assert got["offense"][0]["points_against"] == 326
+        assert got["defense"][0]["points_allowed"] == 326
 
 
 @pytest.mark.integration
@@ -402,6 +920,34 @@ class TestNflCompare:
         assert "BAL" in result
         assert "offense" in result["KC"]
         assert "defense" in result["BAL"]
+
+    def test_compare_teams_honours_season_type(self):
+        """Team mode used to take season_type and ignore it."""
+        both = nfl_compare(entity1="KC", entity2="PHI", compare_type="team", season=2024)
+        assert [(r["season_type"], r["total_plays"]) for r in both["KC"]["offense"]] == [
+            ("POST", 162), ("REG", 1091)]
+        post = nfl_compare(entity1="KC", entity2="PHI", compare_type="team", season=2024,
+                           season_type="POST")
+        assert [(s["offense"][0]["season_type"], s["offense"][0]["total_plays"])
+                for s in (post["KC"], post["PHI"])] == [("POST", 162), ("POST", 254)]
+        reg = nfl_compare(entity1="KC", entity2="PHI", compare_type="team", season=2024,
+                          season_type="REG")
+        assert [s["offense"][0]["total_plays"] for s in (reg["KC"], reg["PHI"])] == [1091, 1114]
+        assert [s["defense"][0]["sacks"] for s in (reg["KC"], reg["PHI"])] == [39, 41]
+        for side in (reg["KC"], reg["PHI"]):
+            assert set(side) == {"offense", "defense", "sources"}
+        assert "scrimmage plays only" in reg["KC"]["sources"]["plays"]
+
+    def test_compare_team_filters_stack_in_the_right_order(self):
+        """Season range and season type share one parameter list; the order has to match."""
+        got = nfl_compare(entity1="KC", entity2="PHI", compare_type="team",
+                          season_from=2024, season_to=2025, season_type="REG")
+        offense = got["KC"]["offense"]
+        years = [r["season_year"] for r in offense]
+        # The CI database holds 2024 only, so assert the shape of the window and pin its 2024 row.
+        assert years == sorted(set(years)) and set(years) <= {2024, 2025} and 2024 in years
+        assert {r["season_type"] for r in offense} == {"REG"}
+        assert [r["total_plays"] for r in offense if r["season_year"] == 2024] == [1091]
 
     def test_compare_players(self):
         result = nfl_compare(
@@ -855,6 +1401,99 @@ class TestNflSeparationOpportunity:
     def test_filter_by_player_team_position(self):
         result = nfl_separation_opportunity(player="Jefferson", team="MIN", position="WR", season=2024)
         assert "error" not in result
+
+    def test_the_three_season_type_scopes(self):
+        """The description used to say "pass null for both", and the re-reviewer ran the real MCP
+        handler that way: mcp.server validates the arguments against the tool's inputSchema before
+        the handler is called, and season_type is typed "string", so the answer was
+        `Input validation error: None is not of type 'string'`. The literal 'ALL' is what works:
+        REG is the default, POST is one scope, ALL is both."""
+        one = nfl_separation_opportunity(player_id="00-0036322", season=2024)
+        assert {r["season_type"] for r in one["separation_opportunity"]} == {"REG"}
+        post = nfl_separation_opportunity(player_id="00-0036322", season=2024, season_type="POST")
+        assert {r["season_type"] for r in post["separation_opportunity"]} == {"POST"}
+        both = nfl_separation_opportunity(player_id="00-0036322", season=2024, season_type="ALL")
+        assert {r["season_type"] for r in both["separation_opportunity"]} == {"REG", "POST"}
+        # Lower case reaches the same place, and ALL is not passed to the database as a filter.
+        lower = nfl_separation_opportunity(player_id="00-0036322", season=2024, season_type="all")
+        assert len(lower["separation_opportunity"]) == len(both["separation_opportunity"])
+
+    def test_the_ngs_season_summary_row_is_the_figure(self):
+        """Justin Jefferson 2024: NGS's own week = 0 summary row says 3.079 yards of average
+        separation and a 66.88 catch rate. Averaging his weekly rows unweighted gives 3.073 and
+        67.48, and the old code also pulled the postseason weekly rows into that mean. season_type
+        defaults to REG, so the plain call returns the regular-season row only."""
+        rows = nfl_separation_opportunity(player_id="00-0036322", season=2024)["separation_opportunity"]
+        assert {r["season_type"] for r in rows} == {"REG"}
+        both = nfl_separation_opportunity(player_id="00-0036322", season=2024,
+                                         season_type="ALL")["separation_opportunity"]
+        assert {r["season_type"] for r in both} == {"REG", "POST"}
+        reg = rows[0]
+        summary = nfl_query(
+            "SELECT avg_separation, avg_yac_above_expectation, catch_percentage "
+            "FROM nextgen_stats_receiving WHERE player_gsis_id='00-0036322' AND season=2024 "
+            "AND season_type='REG' AND week=0")["rows"][0]
+        assert reg["separation_source"] == "ngs_season_summary"
+        assert reg["avg_separation"] == round(summary["avg_separation"], 3)
+        assert reg["avg_yac_above_expectation"] == round(summary["avg_yac_above_expectation"], 3)
+        assert reg["catch_percentage"] == round(summary["catch_percentage"], 2)
+        assert reg["avg_separation"] == 3.079
+        assert reg["games"] == 17
+        # A summary row is not an estimate from weekly rows, so it reports no sample.
+        assert (reg["fallback_weeks"], reg["fallback_targets"]) == (None, None)
+
+    def test_a_fallback_row_carries_its_sample_and_no_regression_claim(self):
+        """A.J. Brown's 2024 postseason row is a fallback: separation 2.150, from 3 Next Gen Stats
+        weeks holding 20 targets. The sample sits beside the figure, and regression_candidate is
+        null, because a sample that thin cannot carry a regression claim. The thinness is upstream -
+        NGS published weekly rows for only 291 receiving players in 2024 - and it is normal: of the
+        2024 fallback rows, 39 of 69 regular-season rows and 24 of 36 postseason rows rest on a
+        single week. On the full database the same query over every season gives 206 regular-season
+        fallback rows averaging 1.7 weeks, 124 of them from one week (the caller's examples:
+        DeAndre Hopkins, Baltimore 2025, 17 games, separation 2.588 from one week of five targets).
+        Counts here are scoped to 2024 so both databases this suite runs on answer the same."""
+        rows = nfl_separation_opportunity(player_id="00-0035676", season=2024,
+                                         season_type="POST")["separation_opportunity"]
+        assert [(r["separation_source"], r["avg_separation"], r["fallback_weeks"],
+                 r["fallback_targets"], r["regression_candidate"]) for r in rows] == [
+            ("weekly_rows_weighted_by_targets", 2.15, 3, 20, None)]
+        thin = nfl_query(
+            "SELECT season_type, COUNT(*) n, SUM(CASE WHEN fallback_weeks = 1 THEN 1 ELSE 0 END) "
+            "one_week, SUM(CASE WHEN regression_candidate IS NOT NULL THEN 1 ELSE 0 END) claims "
+            "FROM player_separation_opportunity WHERE season = 2024 AND separation_source = "
+            "'weekly_rows_weighted_by_targets' GROUP BY season_type")["rows"]
+        assert {r["season_type"]: (r["n"], r["one_week"], r["claims"]) for r in thin} == {
+            "REG": (69, 39, 0), "POST": (36, 24, 0)}
+
+    def test_the_fallback_yac_figure_is_weighted_by_receptions(self):
+        """YAC above expectation is a per-reception figure, so receptions weight it in a fallback
+        row; separation is measured on every target, so targets still weight that one. A.J. Brown's
+        2024 postseason row rests on 3 weeks and 20 targets: reception-weighted YAC is 1.509, while
+        weighting it by targets reads 1.050."""
+        row = nfl_separation_opportunity(player_id="00-0035676", season=2024,
+                                        season_type="POST")["separation_opportunity"][0]
+        assert row["separation_source"] == "weekly_rows_weighted_by_targets"
+        weekly = nfl_query(
+            "SELECT SUM(avg_yac_above_expectation*receptions)/SUM(receptions) AS by_rec, "
+            "SUM(avg_yac_above_expectation*targets)/SUM(targets) AS by_tgt, "
+            "SUM(avg_separation*targets)/SUM(targets) AS sep_by_tgt, COUNT(DISTINCT week) AS n_weeks, "
+            "SUM(targets) AS targets FROM nextgen_stats_receiving WHERE player_gsis_id = "
+            "'00-0035676' AND season=2024 AND season_type='POST' AND week > 0")["rows"][0]
+        assert (round(weekly["by_rec"], 3), round(weekly["by_tgt"], 3),
+                round(weekly["sep_by_tgt"], 3)) == (1.509, 1.05, 2.15)
+        assert row["avg_yac_above_expectation"] == round(weekly["by_rec"], 3)
+        assert row["avg_separation"] == round(weekly["sep_by_tgt"], 3)
+        assert (row["fallback_weeks"], row["fallback_targets"]) == (weekly["n_weeks"], weekly["targets"])
+        assert (row["fallback_weeks"], row["fallback_targets"]) == (3, 20)
+
+    def test_season_type_splits_the_rows(self):
+        """NGS publishes no postseason summary row, so a postseason row is the weekly figure and
+        says so; the regular-season row is the summary."""
+        rows = nfl_separation_opportunity(player_id="00-0036322", season=2024,
+                                         season_type="post")["separation_opportunity"]
+        assert [(r["season_type"], r["games"], r["separation_source"]) for r in rows] == [
+            ("POST", 1, "weekly_rows_weighted_by_targets")]
+        assert rows[0]["avg_separation"] == 3.243
 
     def test_invalid_limit_falls_back(self):
         result = nfl_separation_opportunity(limit="oops")

@@ -531,83 +531,319 @@ _FORMATION_EXPR = """
 """.strip()
 
 
+# Every per-play figure in the three team tables uses scrimmage plays only: the standard nflfastR
+# filter with two-point attempts taken back out (a two-point try carries pass or rush = 1 and an EPA
+# value - all 327 of them in this data do - and is not in the regular stats) and plays nullified by
+# a flag taken back out too. A no_play row is a down a penalty undid, and the same down was replayed,
+# so the official box counts the replay and not that attempt: 3,879 of them across 2024 to 2026, 1,612
+# in the 2024 regular season, averaging 0.02 yards and dragging avg_epa, avg_epa_allowed,
+# explosive_plays and the conversion counts. What is left still includes sacks and scrambles, which
+# the box charges to the pass and the run.
+_SCRIMMAGE = ("(COALESCE(pass,0)=1 OR COALESCE(rush,0)=1) "
+              "AND epa IS NOT NULL AND COALESCE(two_point_attempt,0)<>1 "
+              "AND COALESCE(play_type,'')<>'no_play'")
+
+# A touchdown the offense scored itself. play_by_play gives a pick-six posteam = the team that threw
+# it, so counting `touchdown` handed the offense a touchdown it did not score.
+_OFFENSIVE_TD = "(COALESCE(pass_touchdown,0)=1 OR COALESCE(rush_touchdown,0)=1)"
+
+# A play nflverse scored as a down conversion or a down failure. The conversion columns count every
+# play that carries one of these flags, without also requiring pass = 1 or rush = 1: 48 quarterback
+# kneels and 8 spikes in the 2024 regular season carry third_down_failed = 1, and the pass-or-rush
+# population dropped all of them. A punt or a field-goal attempt never carries a flag, so kicks stay
+# out of the denominator. A play a penalty undid nearly always carries none either: of the 6,569
+# no_play rows in the table exactly one carries a flag - game 2024_15_MIA_HOU, a Houston fake punt on
+# 4th and 2 for 35 yards, fourth_down_converted = 1 - and the conversion columns do count it. That row
+# is why the Houston 2024 regular-season 4th Down row of situational_stats reports 18 attempts over 17
+# plays; the other 83 rows in that table where attempts exceed plays come from kneels and spikes, which
+# carry a flag and are not scrimmage plays.
+_DOWN_FLAGS = ("COALESCE(third_down_converted,0)=1 OR COALESCE(third_down_failed,0)=1 "
+               "OR COALESCE(fourth_down_converted,0)=1 OR COALESCE(fourth_down_failed,0)=1")
+
+# Counting stats come from team_stats_raw (nflverse's week-level team box, the same source
+# player_stats is built from) and points from schedules: both already carry the official value, so a
+# sack is never added to the pass attempts. Only what they do not carry - per-play rates,
+# down-and-distance, red-zone trips - is built from plays, with nflfastR's own flags. Every rate
+# divides a summed total by a summed total; no weekly rate is averaged. Each table gains a
+# season_type column, because the postseason used to be summed into the regular season.
+#
+# Derived table column -> the team_stats_raw expression behind it.
+_TEAM_BOX_SUMS = {
+    "attempts": "attempts", "completions": "completions", "passing_yards": "passing_yards",
+    "sacks_suffered": "sacks_suffered", "sack_yards": "sack_yards_lost", "carries": "carries",
+    "rushing_yards": "rushing_yards", "passing_tds": "passing_tds", "rushing_tds": "rushing_tds",
+    "special_teams_tds": "special_teams_tds", "passing_interceptions": "passing_interceptions",
+    "fumbles_lost": "fumbles_lost_total", "penalties": "penalties",
+    "penalty_yards": "penalty_yards", "def_sacks": "def_sacks",
+    "def_interceptions": "def_interceptions",
+    "first_downs": "passing_first_downs + rushing_first_downs + receiving_first_downs",
+}
+
+# A database with plays only - no team box, no schedule - still gets every per-play figure: this
+# relation has the columns both sources carry and no rows, so those columns come back null.
+_NO_SOURCES = (
+    "(SELECT NULL::VARCHAR AS team, NULL::VARCHAR AS opponent_team, "
+    "NULL::VARCHAR AS season_type, NULL::VARCHAR AS game_type, "
+    "NULL::VARCHAR AS home_team, NULL::VARCHAR AS away_team, NULL::INTEGER AS season, "
+    "NULL::INTEGER AS home_score, NULL::INTEGER AS away_score, "
+    + ", ".join(f"NULL::BIGINT AS {c.strip()}"
+                for c in sorted({p.strip() for e in _TEAM_BOX_SUMS.values() for p in e.split("+")}))
+    + " WHERE FALSE)"
+)
+
+
+def _box_cte(conn: duckdb.DuckDBPyConnection) -> str:
+    """One row per team, season and season_type of the week-level team box."""
+    src = "team_stats_raw" if _table_exists(conn, "team_stats_raw") else _NO_SOURCES
+    sums = ", ".join(f"COALESCE(SUM({e}), 0) AS {a}" for a, e in _TEAM_BOX_SUMS.items())
+    return f"box AS (SELECT team, season AS season_year, season_type, {sums} FROM {src} GROUP BY 1, 2, 3)"
+
+
+def _opp_box_cte(conn: duckdb.DuckDBPyConnection) -> str:
+    """The same team box read from the other side: one row per defence, season and season_type,
+    built by grouping the opponent's box row on opponent_team.
+
+    The box and the per-play population do not agree on what a defence faces, and the box is the
+    larger one: Kansas City 2024 regular season 1,026 plays against in the box against 1,017
+    scrimmage plays in plays, its postseason 203 against 199, Philadelphia 999 against 990. A
+    quarterback kneel is a carry and a spike is a pass attempt in the league's box, while
+    play_by_play flags neither with pass = 1 or rush = 1, so _SCRIMMAGE drops both - and 45 of the 46
+    rows of 2024 close on exactly that difference. The nullified downs are out of both counts: plays
+    keeps 87 of them against Kansas City that season, and both the league's box and _SCRIMMAGE count
+    the replay of the down instead. The yards run the other way by a
+    handful (5,457 over those scrimmage plays against the box's 5,451), so no rate may mix the two
+    populations: yards_per_play_allowed divides the two box totals, and only expected points, which
+    no box carries, is read off plays."""
+    src = "team_stats_raw" if _table_exists(conn, "team_stats_raw") else _NO_SOURCES
+    return ("opp AS (SELECT opponent_team AS team, season AS season_year, season_type, "
+            "COALESCE(SUM(attempts + sacks_suffered + carries), 0) AS plays_against, "
+            "COALESCE(SUM(passing_yards + rushing_yards + sack_yards_lost), 0) AS yards_allowed, "
+            "COALESCE(SUM(passing_interceptions + fumbles_lost_total), 0) AS turnovers_forced "
+            f"FROM {src} GROUP BY 1, 2, 3)")
+
+
+def _points_cte(conn: duckdb.DuckDBPyConnection) -> str:
+    """Points for and against per team, season and season_type. schedules.game_type names the round
+    (REG, WC, DIV, CON, SB); the derived tables use plays' two values, so a round is REG or POST."""
+    src = "schedules" if _table_exists(conn, "schedules") else _NO_SOURCES
+    round_ = "CASE WHEN game_type = 'REG' THEN 'REG' ELSE 'POST' END"
+    return (f"points AS (SELECT team, season AS season_year, season_type, SUM(pts) AS points_for,"
+            f" SUM(opp_pts) AS points_against FROM ("
+            f"SELECT season, {round_} AS season_type, home_team AS team, home_score AS pts,"
+            f" away_score AS opp_pts FROM {src}"
+            f" UNION ALL "
+            f"SELECT season, {round_}, away_team, away_score, home_score FROM {src})"
+            f" WHERE pts IS NOT NULL GROUP BY 1, 2, 3)")
+
+
 def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
+    """Build the derived team tables from plays, the week-level team box, and the schedule.
+
+    Called after the other datasets load, so a run that ingests team_stats_raw in the same command
+    is read here instead of one run later.
+    """
     print("\n  Creating aggregate tables…")
+
+    if not _table_exists(conn, "plays"):
+        print("    plays not loaded yet, skipping")
+        return
 
     for table in ["team_offense_stats", "team_defense_stats",
                   "situational_stats", "formation_effectiveness"]:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
 
-    conn.execute("""
+    box, opp, points = _box_cte(conn), _opp_box_cte(conn), _points_cte(conn)
+
+    conn.execute(f"""
         CREATE TABLE team_offense_stats AS
+        WITH scrim AS (
+            -- What no box carries: expected points and the explosive-play count, both per scrimmage
+            -- play. The three yards-per-play figures are NOT here - they divide the box totals, see
+            -- the SELECT below.
+            SELECT posteam AS team, season AS season_year, season_type,
+                   SUM(CASE WHEN (pass_attempt=1 AND yards_gained>=20)
+                              OR (rush_attempt=1 AND yards_gained>=10) THEN 1 ELSE 0 END)
+                       AS explosive_plays,
+                   ROUND(AVG(epa), 3) AS avg_epa,
+                   ROUND(AVG(CASE WHEN pass_attempt=1 THEN epa END), 3) AS pass_epa,
+                   ROUND(AVG(CASE WHEN rush_attempt=1 THEN epa END), 3) AS rush_epa
+            FROM plays WHERE posteam IS NOT NULL AND {_SCRIMMAGE} GROUP BY 1, 2, 3
+        ),
+        -- Down conversions over every play that carries a conversion flag, kneels and spikes
+        -- included, so this population is wider than scrim's.
+        downs AS (
+            SELECT posteam AS team, season AS season_year, season_type,
+                   SUM(CASE WHEN COALESCE(third_down_converted,0)=1 THEN 1 ELSE 0 END)
+                       AS third_down_conversions,
+                   SUM(CASE WHEN COALESCE(third_down_converted,0)=1
+                             OR COALESCE(third_down_failed,0)=1 THEN 1 ELSE 0 END)
+                       AS third_down_attempts
+            FROM plays
+            WHERE posteam IS NOT NULL AND COALESCE(play_type,'')<>'no_play' AND {_DOWN_FLAGS}
+            GROUP BY 1, 2, 3
+        ),
+        -- A red zone trip is one drive that reaches the opponent's 20, not one play inside it.
+        -- game_id is in the key because drive numbers restart every week.
+        -- Only a football play proves the trip: the extra point is spotted at the 15 and the two-point
+        -- try at the 2, so yardline_100<=20 on its own let every scoring drive prove itself through
+        -- the kick after the score (1,292 extra-point rows in 2024 sit inside that bound), which
+        -- counted drives that never got inside the 20 - what a long touchdown pass looks like. The
+        -- two-point try is the same defect in a different costume: nflverse records it as play_type
+        -- 'pass' or 'run' spotted at the 2 (99 passes and 36 runs in the 2024 regular season), so it
+        -- passes the play_type test and must be excluded by its own flag, the way _SCRIMMAGE does.
+        -- That takes 23 drives out of the 1,844 the 2024 regular season first reported, 1,821 left.
+        -- A trip
+        -- that ends in a field goal stays in the denominator: that drive did reach the 20. The score
+        -- it is credited with is one the offence scored itself (_OFFENSIVE_TD - a pick-six is not
+        -- one, since play_by_play files it with posteam = the team that threw the interception). The
+        -- touchdown is read only from plays inside the 20, so a drive pushed back by a penalty before
+        -- it scores is a trip with no touchdown: 11 drives of the 2024 regular season entered the 20
+        -- and then scored from outside it, and they stay in the denominator as misses.
+        red_zone AS (
+            SELECT team, season_year, season_type, COUNT(*) AS red_zone_trips,
+                   SUM(touchdown) AS red_zone_touchdowns
+            FROM (SELECT posteam AS team, season AS season_year, season_type, game_id, drive,
+                         MAX(CASE WHEN play_type IN ('pass','run','field_goal','qb_kneel','qb_spike')
+                                   AND COALESCE(two_point_attempt,0)<>1
+                                  THEN 1 ELSE 0 END) AS reached_20,
+                         MAX(CASE WHEN {_OFFENSIVE_TD} THEN 1 ELSE 0 END) AS touchdown
+                  FROM plays
+                  WHERE posteam IS NOT NULL AND drive IS NOT NULL AND game_id IS NOT NULL
+                    AND yardline_100<=20
+                  GROUP BY 1, 2, 3, 4, 5)
+            WHERE reached_20 = 1
+            GROUP BY 1, 2, 3
+        ),
+        {box},
+        {points}
         SELECT
-            posteam AS team, season AS season_year,
-            COUNT(*) AS total_plays,
-            SUM(COALESCE(yards_gained,0)) AS total_yards,
-            ROUND(AVG(yards_gained), 2) AS yards_per_play,
-            SUM(CASE WHEN rush_attempt=1 THEN 1 ELSE 0 END) AS rush_plays,
-            SUM(CASE WHEN pass_attempt=1 THEN 1 ELSE 0 END) AS pass_plays,
-            SUM(CASE WHEN rush_attempt=1 THEN COALESCE(yards_gained,0) ELSE 0 END) AS rush_yards,
-            SUM(CASE WHEN pass_attempt=1 THEN COALESCE(yards_gained,0) ELSE 0 END) AS pass_yards,
-            ROUND(AVG(CASE WHEN rush_attempt=1 THEN yards_gained END), 2) AS yards_per_rush,
-            ROUND(AVG(CASE WHEN pass_attempt=1 THEN yards_gained END), 2) AS yards_per_pass,
-            SUM(CASE WHEN touchdown=1 THEN 1 ELSE 0 END) AS touchdowns,
-            SUM(CASE WHEN interception=1 OR fumble_lost=1 THEN 1 ELSE 0 END) AS turnovers,
-            ROUND(100.0*SUM(CASE WHEN down=3 AND yards_gained>=ydstogo THEN 1 ELSE 0 END)
-                /NULLIF(SUM(CASE WHEN down=3 THEN 1 ELSE 0 END),0), 1) AS third_down_pct,
-            ROUND(100.0*SUM(CASE WHEN yardline_100<=20 AND touchdown=1 THEN 1 ELSE 0 END)
-                /NULLIF(SUM(CASE WHEN yardline_100<=20 THEN 1 ELSE 0 END),0), 1) AS red_zone_td_pct,
-            SUM(CASE WHEN (pass_attempt=1 AND yards_gained>=20)
-                       OR (rush_attempt=1  AND yards_gained>=10) THEN 1 ELSE 0 END) AS explosive_plays,
-            ROUND(AVG(epa), 3) AS avg_epa,
-            ROUND(AVG(CASE WHEN pass_attempt=1 THEN epa END), 3) AS pass_epa,
-            ROUND(AVG(CASE WHEN rush_attempt=1  THEN epa END), 3) AS rush_epa
-        FROM plays
-        WHERE posteam IS NOT NULL
-          AND play_type IN ('pass','run','field_goal','extra_point',
-                            'punt','kickoff','qb_spike','qb_kneel','no_play')
-        GROUP BY posteam, season
+            s.team, s.season_year, s.season_type,
+            b.attempts + b.sacks_suffered + b.carries AS total_plays,
+            b.rushing_yards + b.passing_yards + b.sack_yards AS total_yards,
+            -- Every rate divides one box total by another, so the row cannot hold two answers for
+            -- the same question. The per-play average over scrimmage plays was the second one, and
+            -- it disagreed with the box the row already carried: Kansas City 2024 regular season
+            -- said 5.02 yards per play against the box's 5570 / 1091 = 5.11, 4.26 yards per rush
+            -- against 1790 / 450 = 3.98, 5.92 per pass against 3780 / 641 = 5.90.
+            ROUND(1.0*(b.rushing_yards + b.passing_yards + b.sack_yards)
+                  / NULLIF(b.attempts + b.sacks_suffered + b.carries, 0), 2) AS yards_per_play,
+            b.carries AS rush_plays,
+            b.attempts AS pass_plays,
+            b.completions,
+            b.rushing_yards AS rush_yards,
+            b.passing_yards + b.sack_yards AS pass_yards,
+            ROUND(1.0*b.rushing_yards / NULLIF(b.carries, 0), 2) AS yards_per_rush,
+            ROUND(1.0*(b.passing_yards + b.sack_yards)
+                  / NULLIF(b.attempts + b.sacks_suffered, 0), 2) AS yards_per_pass,
+            b.passing_tds + b.rushing_tds AS touchdowns,
+            b.passing_tds, b.rushing_tds, b.special_teams_tds,
+            b.passing_interceptions + b.fumbles_lost AS turnovers,
+            b.passing_interceptions, b.fumbles_lost,
+            b.sacks_suffered, b.sack_yards,
+            d.third_down_conversions, d.third_down_attempts,
+            ROUND(100.0*d.third_down_conversions/NULLIF(d.third_down_attempts,0), 1)
+                AS third_down_pct,
+            rz.red_zone_trips, rz.red_zone_touchdowns,
+            ROUND(100.0*rz.red_zone_touchdowns/NULLIF(rz.red_zone_trips,0), 1)
+                AS red_zone_td_pct,
+            b.first_downs, b.penalties, b.penalty_yards,
+            s.explosive_plays, s.avg_epa, s.pass_epa, s.rush_epa,
+            p.points_for, p.points_against
+        FROM scrim s
+        LEFT JOIN box b      USING (team, season_year, season_type)
+        LEFT JOIN downs d    USING (team, season_year, season_type)
+        LEFT JOIN red_zone rz USING (team, season_year, season_type)
+        LEFT JOIN points p    USING (team, season_year, season_type)
     """)
     print("    team_offense_stats ✓")
 
-    conn.execute("""
+    conn.execute(f"""
         CREATE TABLE team_defense_stats AS
+        WITH scrim AS (
+            -- Expected points, which no box carries. The counting columns come from the opponents'
+            -- box rows (opp below), and so does the yards-per-play rate in the SELECT. The two
+            -- populations differ and the box is the larger: Kansas City 2024 regular season 1,026
+            -- plays against in the box against 1,017 scrimmage plays here, postseason 203 against
+            -- 199, Philadelphia 999 against 990, because the box charges a kneel as a carry and a
+            -- spike as a pass attempt while play_by_play flags neither. Before this table took its
+            -- counts from the box the row read 1069 plays and 19 takeaways, and 1069 is neither
+            -- population: it is the pass-or-rush plays with the 52 of Kansas City's 87 nullified
+            -- downs that carried a pass or rush flag still in, and the 9 kneels and spikes still out.
+            SELECT defteam AS team, season AS season_year, season_type,
+                   ROUND(AVG(epa), 3) AS avg_epa_allowed
+            FROM plays WHERE defteam IS NOT NULL AND {_SCRIMMAGE} GROUP BY 1, 2, 3
+        ),
+        downs AS (
+            SELECT defteam AS team, season AS season_year, season_type,
+                   SUM(CASE WHEN COALESCE(third_down_failed,0)=1 THEN 1 ELSE 0 END)
+                       AS third_down_stops,
+                   SUM(CASE WHEN COALESCE(third_down_converted,0)=1
+                             OR COALESCE(third_down_failed,0)=1 THEN 1 ELSE 0 END)
+                       AS third_down_attempts
+            FROM plays
+            WHERE defteam IS NOT NULL AND COALESCE(play_type,'')<>'no_play' AND {_DOWN_FLAGS}
+            GROUP BY 1, 2, 3
+        ),
+        {opp},
+        {box},
+        {points}
         SELECT
-            defteam AS team, season AS season_year,
-            COUNT(*) AS plays_against,
-            SUM(COALESCE(yards_gained,0)) AS yards_allowed,
-            ROUND(AVG(yards_gained), 2) AS yards_per_play_allowed,
-            SUM(CASE WHEN sack=1         THEN 1 ELSE 0 END) AS sacks,
-            SUM(CASE WHEN interception=1 THEN 1 ELSE 0 END) AS interceptions,
-            SUM(CASE WHEN interception=1 OR fumble_lost=1 THEN 1 ELSE 0 END) AS turnovers_forced,
-            ROUND(100.0*SUM(CASE WHEN down=3 AND yards_gained<ydstogo THEN 1 ELSE 0 END)
-                /NULLIF(SUM(CASE WHEN down=3 THEN 1 ELSE 0 END),0), 1) AS third_down_stop_pct,
-            ROUND(AVG(epa), 3) AS avg_epa_allowed
-        FROM plays
-        WHERE defteam IS NOT NULL
-          AND play_type IN ('pass','run','field_goal','extra_point',
-                            'punt','kickoff','qb_spike','qb_kneel','no_play')
-        GROUP BY defteam, season
+            s.team, s.season_year, s.season_type,
+            -- yards_per_play_allowed divides the two box totals in this same row, so the row cannot
+            -- hold two answers for the same question: averaged over scrimmage plays it said 5.37 for
+            -- Kansas City 2024 regular season against 5451 / 1026 = 5.31 from the opponents' box, and
+            -- Baltimore's postseason 5.50 against 553 / 104 = 5.32. All 46 rows of 2024 disagreed,
+            -- by as much as 0.33. Null when the box counts no plays against this defence.
+            o.plays_against, o.yards_allowed,
+            ROUND(1.0*o.yards_allowed / NULLIF(o.plays_against, 0), 2) AS yards_per_play_allowed,
+            b.def_sacks AS sacks, b.def_interceptions AS interceptions,
+            o.turnovers_forced,
+            d.third_down_stops, d.third_down_attempts,
+            ROUND(100.0*d.third_down_stops/NULLIF(d.third_down_attempts,0), 1)
+                AS third_down_stop_pct,
+            s.avg_epa_allowed, p.points_against AS points_allowed
+        FROM scrim s
+        LEFT JOIN opp o USING (team, season_year, season_type)
+        LEFT JOIN downs d USING (team, season_year, season_type)
+        LEFT JOIN box b   USING (team, season_year, season_type)
+        LEFT JOIN points p USING (team, season_year, season_type)
     """)
     print("    team_defense_stats ✓")
 
+    # A punt and a field goal are not scrimmage plays and neither carries a conversion flag, so they
+    # are out of 4th down both ways; they used to sit in the denominator and pull the conversion rate
+    # down to nothing useful, and conversion_pct itself used yards_gained >= ydstogo instead of the
+    # conversion flags. The two conversion columns reach a wider population than the rest of the row:
+    # every play that carries a flag, so a kneel or a spike that fails a third down is an attempt.
+    # A play a penalty nullified carries no flag in all but one recorded case - the Houston fake punt
+    # in 2024_15_MIA_HOU - which is why that 4th Down row counts 18 attempts over 17 plays.
     conn.execute(f"""
         CREATE TABLE situational_stats AS
         WITH base AS (
-            SELECT *, {_SITUATION_EXPR} AS situation_label
-            FROM plays WHERE posteam IS NOT NULL AND down IS NOT NULL
+            SELECT *, {_SITUATION_EXPR} AS situation_label,
+                   CASE WHEN {_SCRIMMAGE} THEN 1 ELSE 0 END AS scrimmage,
+                   COALESCE(third_down_converted,0)+COALESCE(fourth_down_converted,0) AS converted,
+                   COALESCE(third_down_converted,0)+COALESCE(third_down_failed,0)
+                      +COALESCE(fourth_down_converted,0)+COALESCE(fourth_down_failed,0) AS down_attempt
+            FROM plays
+            WHERE posteam IS NOT NULL AND down IS NOT NULL
+              AND ({_SCRIMMAGE} OR {_DOWN_FLAGS})
         )
         SELECT
-            posteam AS team, season AS season_year,
+            posteam AS team, season AS season_year, season_type,
             situation_label AS situation,
-            COUNT(*) AS plays,
-            ROUND(AVG(yards_gained), 2) AS avg_yards,
-            SUM(CASE WHEN touchdown=1 THEN 1 ELSE 0 END) AS touchdowns,
-            ROUND(100.0*SUM(CASE WHEN yards_gained>=ydstogo THEN 1 ELSE 0 END)
-                /NULLIF(COUNT(*),0), 1) AS conversion_pct,
-            ROUND(AVG(epa), 3) AS avg_epa
+            -- plays, avg_yards, touchdowns and avg_epa stay on the scrimmage population; only the
+            -- two conversion columns reach the wider flag population, which adds kneels and spikes.
+            SUM(scrimmage) AS plays,
+            ROUND(AVG(CASE WHEN scrimmage=1 THEN yards_gained END), 2) AS avg_yards,
+            SUM(CASE WHEN scrimmage=1 AND {_OFFENSIVE_TD} THEN 1 ELSE 0 END) AS touchdowns,
+            SUM(converted) AS conversions,
+            SUM(CASE WHEN down_attempt > 0 THEN 1 ELSE 0 END) AS conversion_attempts,
+            ROUND(100.0*SUM(converted)/NULLIF(SUM(CASE WHEN down_attempt > 0 THEN 1 ELSE 0 END),0), 1)
+                AS conversion_pct,
+            ROUND(AVG(CASE WHEN scrimmage=1 THEN epa END), 3) AS avg_epa
         FROM base
-        GROUP BY posteam, season, situation_label
+        GROUP BY posteam, season, season_type, situation_label
     """)
     print("    situational_stats ✓")
 
@@ -708,20 +944,61 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
     # 3. Separation-adjusted opportunity — joins Next Gen Stats receiving (2016+) to
     #    fantasy opportunity to flag separation-creators who underproduced (regression up).
     ("player_separation_opportunity", ["ff_opportunity", "nextgen_stats_receiving"], """
-        WITH ng AS (
-            SELECT
-                player_gsis_id,
-                season,
-                AVG(avg_separation)              AS avg_separation,
-                AVG(avg_yac_above_expectation)   AS avg_yac_above_expectation,
-                AVG(catch_percentage)            AS catch_percentage
+        -- The Next Gen Stats figures used to be AVG() of the player's weekly rows, which is wrong
+        -- twice: the weekly rows are means with no play count next to them, so a 3-route game got the
+        -- weight of a 12-route game, and they are incomplete (7.2 rows per player-season on average;
+        -- the season summary's targets total is larger than the sum of the weekly rows for 335 of the
+        -- 366 player-seasons that have both). NGS's own season summary is the week = 0 row, so that
+        -- row is the figure now. It exists only for season_type = 'REG' (the POST rows are per-game,
+        -- weeks 19 to 23) and not for every receiver - 69 of the 198 with REG rows in 2024 have none
+        -- - so the fallback is a weighted mean of that player's weekly rows in the same
+        -- season_type (separation by targets, YAC above expectation by receptions), and
+        -- separation_source says which of the two a row used. ff_opportunity has no
+        -- season_type, so its week column decides it: 1-18 are regular-season games and 19-22 are
+        -- playoff games (checked against schedules.game_type).
+        WITH ng_weekly AS (
+            SELECT player_gsis_id, season, season_type,
+                   -- Separation is measured on every target, so targets weight it. YAC above
+                   -- expectation is a per-reception figure, so receptions weight that one.
+                   SUM(avg_separation*targets)/NULLIF(SUM(targets),0) AS avg_separation,
+                   SUM(avg_yac_above_expectation*receptions)/NULLIF(SUM(receptions),0) AS avg_yac_above_expectation,
+                   100.0*SUM(receptions)/NULLIF(SUM(targets),0) AS catch_percentage,
+                   -- The sample beside the figure, because the fallback is thin: of the 206
+                   -- regular-season fallback rows 124 rest on a single weekly row and 169 on two or
+                   -- fewer (1.7 weeks on average); the postseason is 83 rows, 54 of them from one
+                   -- week. NGS published weekly rows for only 291 receiving players in 2024, so the
+                   -- coverage is upstream and cannot be widened here.
+                   COUNT(DISTINCT week) AS fallback_weeks,
+                   SUM(targets) AS fallback_targets
             FROM nextgen_stats_receiving
             WHERE week > 0 AND player_gsis_id IS NOT NULL
-            GROUP BY player_gsis_id, season
+            GROUP BY 1, 2, 3
+        ),
+        ng AS (
+            -- No sample columns on a summary row: NGS published the season figure itself, so nothing
+            -- was estimated from weekly rows and there is no sample to report.
+            SELECT player_gsis_id, season, season_type, avg_separation, avg_yac_above_expectation,
+                   catch_percentage, 'ngs_season_summary' AS separation_source,
+                   NULL::INTEGER AS fallback_weeks, NULL::BIGINT AS fallback_targets
+            FROM nextgen_stats_receiving
+            WHERE week = 0 AND player_gsis_id IS NOT NULL
+            UNION ALL
+            SELECT player_gsis_id, season, season_type, avg_separation, avg_yac_above_expectation,
+                   catch_percentage, 'weekly_rows_weighted_by_targets' AS separation_source,
+                   fallback_weeks, fallback_targets
+            FROM ng_weekly
+        ),
+        ng_preferred AS (
+            -- 'ngs_season_summary' sorts before 'weekly_rows_weighted_by_targets', so the summary
+            -- row wins wherever NGS published one.
+            SELECT * EXCLUDE (rn) FROM (SELECT *, ROW_NUMBER() OVER (
+                       PARTITION BY player_gsis_id, season, season_type ORDER BY separation_source
+                   ) AS rn FROM ng) WHERE rn = 1
         ),
         opp AS (
             SELECT
                 player_id,
+                CASE WHEN week >= 19 THEN 'POST' ELSE 'REG' END AS season_type,
                 ANY_VALUE(full_name)   AS full_name,
                 ANY_VALUE(position)    AS position,
                 ANY_VALUE(posteam)     AS team,
@@ -735,18 +1012,29 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
                 ROUND(100.0 * SUM(rec_air_yards) / NULLIF(SUM(rec_air_yards_team), 0), 2) AS air_yards_share_pct
             FROM ff_opportunity
             WHERE player_id IS NOT NULL
-            GROUP BY player_id, CAST(season AS INTEGER)
+            GROUP BY player_id, CAST(season AS INTEGER), CASE WHEN week >= 19 THEN 'POST' ELSE 'REG' END
         )
         SELECT
-            opp.player_id, opp.full_name, opp.position, opp.team, opp.season,
+            opp.player_id, opp.full_name, opp.position, opp.team, opp.season, opp.season_type,
             opp.games, opp.fp_diff, opp.fp_diff_per_game, opp.td_luck, opp.catch_luck,
             opp.target_share_pct, opp.air_yards_share_pct,
             ROUND(ng.avg_separation, 3)            AS avg_separation,
             ROUND(ng.avg_yac_above_expectation, 3) AS avg_yac_above_expectation,
             ROUND(ng.catch_percentage, 2)          AS catch_percentage,
-            (ng.avg_separation > 2.5 AND opp.fp_diff_per_game < -1.5 AND opp.td_luck < -1.0) AS regression_candidate
+            ng.separation_source,
+            ng.fallback_weeks,
+            ng.fallback_targets,
+            -- Null on a fallback row: a sample of one NGS week and five targets cannot support a
+            -- regression claim (DeAndre Hopkins, Baltimore 2025: 17 games, separation 2.588 from one
+            -- week holding five targets), and the flag is only ever read as a claim on the season
+            -- figure.
+            CASE WHEN ng.separation_source = 'ngs_season_summary'
+                 THEN (ng.avg_separation > 2.5 AND opp.fp_diff_per_game < -1.5 AND opp.td_luck < -1.0)
+            END AS regression_candidate
         FROM opp
-        JOIN ng ON ng.player_gsis_id = opp.player_id AND ng.season = opp.season
+        JOIN ng_preferred ng
+          ON ng.player_gsis_id = opp.player_id AND ng.season = opp.season
+         AND ng.season_type = opp.season_type
     """),
 
     # 4. Drop rate — catchable-target drop rate from FTN charting (2022+) joined to plays.
@@ -1109,9 +1397,6 @@ def run_ingest_datasets(
 
         _create_indexes(conn)
 
-        if not skip_views:
-            _create_aggregate_tables(conn)
-
     # ── All other datasets ─────────────────────────────────────────────────
     other_ids = [d for d in dataset_ids if d != "pbp"]
     if other_ids:
@@ -1126,8 +1411,11 @@ def run_ingest_datasets(
             else:
                 _ingest_generic_dataset(conn, defn, seasons, fresh=fresh)
 
-    # ── Fantasy derived tables (built from already-ingested sources) ────────
+    # ── Derived tables (built from already-ingested sources) ────────────────
     if not skip_views:
+        # After the datasets above: the team tables read team_stats_raw and schedules, so building
+        # them here means a run that ingests those two is reflected in the same run.
+        _create_aggregate_tables(conn)
         _create_fantasy_tables(conn)
         _create_team_records(conn)
 

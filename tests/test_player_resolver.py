@@ -36,8 +36,12 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="module", autouse=True)
-def require_db():
-    """Skip this module when no database is loaded, like the other integration tests."""
+def require_db(rebuilt_db):
+    """Skip this module when no database is loaded, like the other integration tests.
+
+    Depends on rebuilt_db so the derived tables these tools read are the ones the current ingest
+    builds - nfl_separation_opportunity selects season_type, which the file on disk predates.
+    """
     result = nfl_query("SELECT COUNT(*) AS n FROM plays")
     if "error" in result or result["rows"][0]["n"] == 0:
         pytest.skip("No DuckDB database loaded", allow_module_level=True)

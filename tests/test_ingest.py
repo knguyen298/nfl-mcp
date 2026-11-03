@@ -9,6 +9,7 @@ import polars as pl
 import pytest
 
 from nfl_mcp.registry import DatasetDef
+from tests.team_table_fixtures import TEAM_PLAYS, load_team_sources, rows
 from nfl_mcp.ingest import (
     _apply_duckdb_pragmas,
     _build_enhanced_description,
@@ -28,6 +29,7 @@ from nfl_mcp.ingest import (
     _record_loaded,
     _reconcile_schema,
     _safe_rename,
+    _FANTASY_TABLES,
     _str,
     _table_exists,
     _write_df_to_table,
@@ -765,38 +767,18 @@ class TestClipToWindow:
 
 class TestAggregateAndIndexBuilders:
     def test_create_aggregate_tables_from_minimal_plays(self, conn):
-        plays = pl.DataFrame({
-            "posteam": ["KC", "KC", "KC", "KC", "KC", "BAL"],
-            "defteam": ["BAL", "BAL", "BAL", "BAL", "BAL", "KC"],
-            "season": [2024, 2024, 2024, 2024, 2024, 2024],
-            "yards_gained": [5, 8, 12, 20, 25, 3],
-            "rush_attempt": [1, 0, 1, 0, 0, 0],
-            "pass_attempt": [0, 1, 0, 1, 1, 1],
-            "touchdown": [0, 0, 0, 1, 0, 0],
-            "interception": [0, 0, 0, 0, 0, 1],
-            "fumble_lost": [0, 0, 0, 0, 0, 0],
-            "down": [1, 3, 3, 4, 3, 3],
-            "ydstogo": [10, 7, 2, 1, 8, 5],
-            "yardline_100": [80, 45, 18, 10, 30, 40],
-            "epa": [0.1, 0.2, 0.4, 1.1, 0.8, -0.6],
-            "sack": [0, 0, 0, 1, 0, 0],
-            "qtr": [1, 2, 4, 4, 4, 2],
-            "time": ["10:00", "08:00", "01:30", "05:00", "00:45", "09:15"],
-            "shotgun": [1, 1, 1, 1, 1, 0],
-            "no_huddle": [0, 1, 0, 0, 1, 0],
-            "play_type": ["run", "pass", "run", "pass", "pass", "pass"],
-            "game_id": ["g1", "g1", "g1", "g1", "g1", "g1"],
-        })
-        _write_df_to_table(conn, "plays", plays, replace=True)
+        load_team_sources(conn, _write_df_to_table)
 
         _create_aggregate_tables(conn)
         created = {r[0] for r in conn.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
         ).fetchall()}
-        assert "team_offense_stats" in created
-        assert "team_defense_stats" in created
-        assert "situational_stats" in created
-        assert "formation_effectiveness" in created
+        assert {"team_offense_stats", "team_defense_stats",
+                "situational_stats", "formation_effectiveness"} <= created
+
+    def test_aggregate_tables_are_skipped_without_plays(self, conn):
+        _create_aggregate_tables(conn)  # should not raise
+        assert not _table_exists(conn, "team_offense_stats")
 
     def test_create_indexes_handles_missing_columns_gracefully(self, conn):
         conn.execute("CREATE TABLE plays (season BIGINT)")
@@ -1086,6 +1068,7 @@ class TestRunIngestOrchestration:
             "nfl_mcp.ingest._ingest_generic_dataset",
             lambda c, defn, seasons, fresh=False: generic_calls.append(defn.dataset_id) or 1,
         )
+        monkeypatch.setattr("nfl_mcp.ingest._create_aggregate_tables", lambda c: None)
         monkeypatch.setattr("nfl_mcp.ingest._create_fantasy_tables", lambda c: None)
         monkeypatch.setattr("nfl_mcp.ingest._create_team_records", lambda c: None)
 
@@ -1373,3 +1356,263 @@ class TestIngestEspnRecords:
         )
         _ingest_espn_records(conn, [1996])
         assert "30/30 franchises" in capsys.readouterr().out
+
+
+# ── the rebuilt team tables: every number below is added up by hand in the fixture ──────────────
+
+class TestTeamTables:
+    @pytest.fixture(autouse=True)
+    def built(self, conn):
+        load_team_sources(conn, _write_df_to_table)
+        _create_aggregate_tables(conn)
+
+    def _offense(self, conn, team, season_type):
+        got = rows(conn, "SELECT * FROM team_offense_stats WHERE team=? AND season_year=? "
+                         "AND season_type=?", team, 2024, season_type)
+        assert len(got) == 1
+        return got[0]
+
+    def test_counting_stats_come_from_the_team_box(self, conn):
+        kc = self._offense(conn, "KC", "REG")
+        # 3 attempts + 0 sacks + 2 carries, and 14 rush + 18 pass + 0 sack yards.
+        assert kc["total_plays"] == 5
+        assert kc["total_yards"] == 32
+        assert (kc["rush_plays"], kc["pass_plays"], kc["completions"]) == (2, 3, 2)
+        assert (kc["rush_yards"], kc["pass_yards"]) == (14, 18)
+        # One passing touchdown and no rushing one. Row 7's pick-six is not in either.
+        assert (kc["touchdowns"], kc["passing_tds"], kc["rushing_tds"]) == (1, 1, 0)
+        assert (kc["turnovers"], kc["passing_interceptions"], kc["fumbles_lost"]) == (1, 1, 0)
+        assert (kc["first_downs"], kc["penalties"], kc["penalty_yards"]) == (3, 3, 20)
+        # The box says the defense got 1 sack; no play in this data is a sack, and 1 still wins.
+        kc_def = rows(conn, "SELECT * FROM team_defense_stats WHERE team='KC' AND season_year=2024 "
+                            "AND season_type='REG'")[0]
+        assert (kc_def["sacks"], kc_def["interceptions"]) == (1, 0)
+        bal_def = rows(conn, "SELECT * FROM team_defense_stats WHERE team='BAL' AND season_year=2024 "
+                             "AND season_type='REG'")[0]
+        assert (bal_def["sacks"], bal_def["interceptions"]) == (0, 1)
+
+    def test_points_come_from_the_schedule(self, conn):
+        assert (self._offense(conn, "KC", "REG")["points_for"],
+                self._offense(conn, "KC", "REG")["points_against"]) == (21, 14)
+        assert (self._offense(conn, "BAL", "REG")["points_for"],
+                self._offense(conn, "BAL", "REG")["points_against"]) == (14, 21)
+        # The wild card is a POST row, not two more regular-season points.
+        bal_post = self._offense(conn, "BAL", "POST")
+        assert (bal_post["points_for"], bal_post["points_against"]) == (10, 17)
+
+    def test_per_play_figures_use_scrimmage_plays_only(self, conn):
+        kc = self._offense(conn, "KC", "REG")
+        # avg_epa, pass_epa, rush_epa and explosive_plays are over rows 1, 2, 3, 4 and 7: EPA -0.3
+        # over 5 plays. The punt (row 5), the field goal (row 6) and the two-point try (row 8) are
+        # not in any of these.
+        assert kc["avg_epa"] == pytest.approx(-0.06, abs=1e-9)
+        assert kc["pass_epa"] == pytest.approx(-0.233, abs=1e-9)
+        assert kc["rush_epa"] == pytest.approx(0.2, abs=1e-9)
+        assert kc["explosive_plays"] == 1           # row 1, a 12-yard carry
+
+    def test_the_three_yards_per_play_rates_divide_the_box_totals_in_the_row(self, conn):
+        """The row used to hold two answers for one question: a per-scrimmage-play average next to
+        the box yards and plays that did not divide into it. Kansas City here ran 20 yards over 5
+        scrimmage plays (4.0) while its box row says 32 yards over 5 plays (6.4)."""
+        kc = self._offense(conn, "KC", "REG")
+        assert (kc["total_yards"], kc["total_plays"]) == (32, 5)
+        assert kc["yards_per_play"] == 6.4
+        assert (kc["rush_yards"], kc["rush_plays"], kc["yards_per_rush"]) == (14, 2, 7.0)
+        # 18 pass yards (net of 0 sack yards) over 3 attempts plus 0 sacks suffered.
+        assert (kc["pass_yards"], kc["pass_plays"], kc["sacks_suffered"]) == (18, 3, 0)
+        assert kc["yards_per_pass"] == 6.0
+        # A team whose box carries no carry gets a null, not a division by zero.
+        assert self._offense(conn, "BAL", "REG")["yards_per_rush"] is None
+
+    def test_third_down_uses_the_conversion_flags(self, conn):
+        kc = self._offense(conn, "KC", "REG")
+        # Rows 2 and 3 converted, row 7 failed: 2 of 3, and 66.7%. Measuring yards against
+        # ydstogo instead would lose row 3 (1 yard on 3rd and 2, converted by a flag) and call it
+        # 1 of 3, or 33.3%.
+        assert (kc["third_down_conversions"], kc["third_down_attempts"]) == (2, 3)
+        assert kc["third_down_pct"] == 66.7
+        bal_def = rows(conn, "SELECT * FROM team_defense_stats WHERE team='BAL' AND season_year=2024 "
+                             "AND season_type='REG'")[0]
+        assert (bal_def["third_down_stops"], bal_def["third_down_attempts"]) == (1, 3)
+        assert bal_def["third_down_stop_pct"] == 33.3
+
+    def test_red_zone_rate_divides_trips_and_not_plays(self, conn):
+        kc = self._offense(conn, "KC", "REG")
+        # Five plays inside the 20, on two drives (row 1 alone, rows 3, 4, 7 and 8 together).
+        # One of those drives ended in a touchdown that the offense scored itself.
+        assert kc["red_zone_trips"] == 2
+        assert kc["red_zone_touchdowns"] == 1
+        assert kc["red_zone_td_pct"] == 50.0
+
+    def test_a_punt_and_a_field_goal_are_not_fourth_down_conversions(self, conn):
+        got = {r["situation"]: r for r in rows(
+            conn, "SELECT * FROM situational_stats WHERE team='KC' AND season_year=2024 "
+                  "AND season_type='REG'")}
+        # Row 4 only. The old table counted the punt and the field goal as failed conversions,
+        # which turned this row into 1 of 3.
+        assert got["4th Down"]["plays"] == 1
+        assert (got["4th Down"]["conversions"], got["4th Down"]["conversion_attempts"]) == (1, 1)
+        assert got["4th Down"]["conversion_pct"] == 100.0
+        assert got["3rd & Long"]["plays"] == 2
+        assert (got["3rd & Long"]["conversions"], got["3rd & Long"]["conversion_attempts"]) == (1, 2)
+        assert got["3rd & Long"]["conversion_pct"] == 50.0
+        assert got["3rd & Long"]["avg_yards"] == -2.0
+        # Row 3 gained 1 yard on 3rd and 2 and was converted by a flag; a yardage rule would call
+        # this row 0 of 1.
+        assert (got["3rd & Short"]["plays"], got["3rd & Short"]["conversions"]) == (1, 1)
+        assert got["3rd & Short"]["conversion_pct"] == 100.0
+        # Row 7 is a touchdown on the play - intercepted and returned - so no bucket counts it.
+        assert sum(r["touchdowns"] for r in got.values()) == 1
+        # A 1st-down play has no third- or fourth-down attempt, so its rate is null and not 0.
+        assert got["Red Zone"]["plays"] == 1
+        assert got["Red Zone"]["conversion_attempts"] == 0
+        assert got["Red Zone"]["conversion_pct"] is None
+
+    def test_the_postseason_is_its_own_row(self, conn):
+        # BAL has one regular-season play (6 yards) and one postseason play (12 yards). Merged, the
+        # old table said 2 plays and 9.0 yards per play.
+        assert self._offense(conn, "BAL", "REG")["yards_per_play"] == 6.0
+        assert self._offense(conn, "BAL", "POST")["yards_per_play"] == 12.0
+        assert [r["season_type"] for r in rows(
+            conn, "SELECT * FROM team_offense_stats WHERE team='KC'")] == ["REG"]
+        kc_def = rows(conn, "SELECT season_type, plays_against, yards_allowed, points_allowed "
+                            "FROM team_defense_stats WHERE team='KC' ORDER BY season_type")
+        # The wild card gave up 12 yards and scored 17, so it allowed 10; merged, this was one row.
+        assert [(r["season_type"], r["plays_against"], r["yards_allowed"], r["points_allowed"])
+                for r in kc_def] == [("POST", 1, 12, 10), ("REG", 1, 6, 14)]
+
+    def test_the_defence_counts_come_from_the_opponents_box_row(self, conn):
+        """Baltimore's defence is Kansas City's box row: 3 attempts + 0 sacks + 2 carries = 5 plays
+        against, 18 pass + 14 rush + 0 sack = 32 yards allowed, 1 interception + 0 fumbles lost = 1
+        takeaway. Counting plays with defteam = 'BAL' instead gives the same 5 plays and 19 yards,
+        because plays keeps only what scrimmage plays gained and the box keeps what the league
+        charged."""
+        bal_def = rows(conn, "SELECT * FROM team_defense_stats WHERE team='BAL' AND season_year=2024 "
+                             "AND season_type='REG'")[0]
+        assert (bal_def["plays_against"], bal_def["yards_allowed"], bal_def["turnovers_forced"]) == (
+            5, 32, 1)
+        # The per-play figures no box carries stay on plays against this defence; the yards-per-play
+        # rate now divides the two box totals above, so Baltimore is charged 32 yards over 5 plays.
+        assert bal_def["yards_per_play_allowed"] == 6.4
+        assert bal_def["avg_epa_allowed"] == pytest.approx(-0.06, abs=1e-9)
+
+    def test_a_drive_whose_only_play_inside_the_20_is_a_kick_is_not_a_trip(self, conn):
+        """The extra point is spotted at the 15, so yardline_100 <= 20 on its own let a kick prove a
+        trip. Real data has this shape: Kansas City 2024 regular season holds six drives whose only
+        play inside the 20 is the extra point - a long touchdown pass, then the kick - and an
+        extra-point row carries no touchdown flag of its own (all 1,308 of them in 2024 carry
+        touchdown = 0). Each of those six drove the denominator up without a touchdown, which is why
+        the league rate read 47.6. Here drive d3 is that shape, so trips stay 2 and the touchdowns
+        stay 1 (50.0); counting the kick as proof would make it 3 trips and 33.3."""
+        conn.execute("DROP TABLE IF EXISTS plays")
+        # One extra row after the ten in the fixture: an extra point for KC on its own drive.
+        extra = {"posteam": "KC", "defteam": "BAL", "season": 2024, "season_type": "REG",
+                 "down": None, "ydstogo": None, "yardline_100": 15, "play_type": "extra_point",
+                 "pass": 0, "rush": 0, "pass_attempt": 0, "rush_attempt": 0, "yards_gained": 0,
+                 "play_id": 11, "epa": 0.0, "touchdown": 0, "pass_touchdown": 0,
+                 "rush_touchdown": 0, "interception": 0, "fumble_lost": 0, "sack": 0,
+                 "third_down_converted": 0, "third_down_failed": 0, "fourth_down_converted": 0,
+                 "fourth_down_failed": 0, "two_point_attempt": 0, "game_id": "g1", "drive": "d3",
+                 "qtr": 1, "time": "10:00", "shotgun": 0, "no_huddle": 0}
+        _write_df_to_table(conn, "plays", pl.DataFrame(
+            {k: [*v, extra[k]] for k, v in TEAM_PLAYS.items()}), replace=True)
+        _create_aggregate_tables(conn)
+        kc = self._offense(conn, "KC", "REG")
+        assert (kc["red_zone_trips"], kc["red_zone_touchdowns"]) == (2, 1)
+        assert kc["red_zone_td_pct"] == 50.0
+
+    def test_a_plays_only_database_keeps_the_per_play_figures(self, conn):
+        load_team_sources(conn, _write_df_to_table, with_box=False, with_schedule=False)
+        _create_aggregate_tables(conn)
+        kc = self._offense(conn, "KC", "REG")
+        # What the box and the schedule carry is null, and so are the three rates that divide the
+        # box totals; what plays carries is not.
+        assert (kc["total_plays"], kc["total_yards"], kc["touchdowns"], kc["points_for"]) == (
+            None, None, None, None)
+        assert (kc["yards_per_play"], kc["yards_per_rush"], kc["yards_per_pass"]) == (
+            None, None, None)
+        assert kc["avg_epa"] == pytest.approx(-0.06, abs=1e-9)
+        assert kc["third_down_pct"] == 66.7
+        assert kc["red_zone_td_pct"] == 50.0
+        kc_def = rows(conn, "SELECT * FROM team_defense_stats WHERE team='KC' AND season_year=2024 "
+                            "AND season_type='REG'")[0]
+        assert (kc_def["sacks"], kc_def["interceptions"], kc_def["points_allowed"]) == (None, None, None)
+        assert kc_def["plays_against"] is None
+        # No box, so no rate: 6.0 was the mean of the one Baltimore play against this defence (row 9).
+        assert kc_def["yards_per_play_allowed"] is None
+        assert kc_def["avg_epa_allowed"] == pytest.approx(0.05, abs=1e-9)
+
+
+# ── the Next Gen Stats season summary row ───────────────────────────────────────────────────────
+
+class TestSeparationOpportunityUsesTheSeasonSummary:
+    """NGS's week = 0 row is the season figure; a mean of the weekly rows is not.
+
+    p1 has a summary row saying 2.0 yards of separation, weekly rows saying 4.0 (2 targets) and 1.0
+    (8 targets). Every one of the three numbers a mean could produce is different: 2.5 unweighted,
+    1.6 weighted by targets, 2.0 from the summary. p2 has no summary row, so its figure is the
+    targets-weighted mean, 1.6, and the row says so.
+    """
+
+    @pytest.fixture(autouse=True)
+    def built(self, conn, monkeypatch):
+        # Build only the table under test: the other fantasy tables read columns of ff_opportunity
+        # this fixture does not bother to write.
+        monkeypatch.setattr(
+            "nfl_mcp.ingest._FANTASY_TABLES",
+            [t for t in _FANTASY_TABLES if t[0] == "player_separation_opportunity"],
+        )
+        _write_df_to_table(conn, "nextgen_stats_receiving", pl.DataFrame({
+            "player_gsis_id": ["p1", "p1", "p1", "p1", "p2", "p2"],
+            "season": [2024] * 6,
+            "season_type": ["REG", "REG", "REG", "POST", "REG", "REG"],
+            "week": [0, 1, 2, 19, 1, 2],
+            "targets": [10, 2, 8, 4, 2, 8],
+            "receptions": [6, 1, 5, 2, 1, 2],
+            "avg_separation": [2.0, 4.0, 1.0, 3.0, 4.0, 1.0],
+            "avg_yac_above_expectation": [0.5, 1.0, -1.0, 0.0, 1.0, -1.0],
+            "catch_percentage": [60.0, 50.0, 62.5, 50.0, 50.0, 25.0],
+        }), replace=True)
+        _write_df_to_table(conn, "ff_opportunity", pl.DataFrame({
+            "player_id": ["p1", "p1", "p1", "p2"],
+            "season": [2024] * 4,
+            "week": [1, 2, 19, 1],
+            "full_name": ["P One"] * 4,
+            "position": ["WR"] * 4,
+            "posteam": ["KC"] * 4,
+            "rec_attempt": [4, 8, 3, 2],
+            "rec_attempt_team": [20, 25, 10, 5],
+            "rec_air_yards": [30, 60, 20, 10],
+            "rec_air_yards_team": [150, 200, 80, 40],
+            "total_fantasy_points_diff": [-1.0, -2.0, 0.5, -3.0],
+            "rec_touchdown_diff": [-1.0, -1.0, 0.0, 1.0],
+            "receptions_diff": [0.0, -1.0, 0.0, 0.0],
+        }), replace=True)
+        _create_fantasy_tables(conn)
+
+    def _rows(self, conn):
+        return rows(conn, "SELECT * FROM player_separation_opportunity ORDER BY player_id, season_type")
+
+    def test_the_summary_row_wins_over_any_mean_of_weekly_rows(self, conn):
+        p1 = [r for r in self._rows(conn) if r["player_id"] == "p1"]
+        reg = next(r for r in p1 if r["season_type"] == "REG")
+        assert (reg["avg_separation"], reg["avg_yac_above_expectation"]) == (2.0, 0.5)
+        assert reg["catch_percentage"] == 60.0
+        assert reg["separation_source"] == "ngs_season_summary"
+
+    def test_weekly_rows_are_weighted_by_targets_when_there_is_no_summary(self, conn):
+        post = [r for r in self._rows(conn) if r["player_id"] == "p1" and r["season_type"] == "POST"]
+        assert [(r["avg_separation"], r["separation_source"]) for r in post] == [
+            (3.0, "weekly_rows_weighted_by_targets")]
+        p2 = next(r for r in self._rows(conn) if r["player_id"] == "p2")
+        # (4.0*2 + 1.0*8) / 10, and (50%*2 + 25%*8) / 10 - not 2.5 and not 37.5.
+        assert p2["avg_separation"] == 1.6
+        assert p2["catch_percentage"] == 30.0
+        assert p2["separation_source"] == "weekly_rows_weighted_by_targets"
+
+    def test_playoff_games_are_their_own_row(self, conn):
+        got = {(r["player_id"], r["season_type"]): r["games"] for r in self._rows(conn)}
+        assert got == {("p1", "REG"): 2, ("p1", "POST"): 1, ("p2", "REG"): 1}
+        p1 = next(r for r in self._rows(conn) if r["player_id"] == "p1" and r["season_type"] == "REG")
+        assert (p1["target_share_pct"], p1["air_yards_share_pct"]) == (
+            round(100.0 * 12 / 45, 2), round(100.0 * 90 / 350, 2))
