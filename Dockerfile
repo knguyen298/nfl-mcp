@@ -35,9 +35,12 @@ ENV NFL_MCP_DB_PATH=/data/nflread.duckdb
 # within the CI runner's RAM (spilling to disk) without leaking the large limit
 # into the lightweight runtime serve process configured further down.
 #
-# After ingest we validate the seed: no leftover WAL, and the core tables that the
-# slow PBP path produces actually have rows — so a silently-incomplete ingest fails
-# the build instead of shipping a broken image.
+# After ingest we validate the seed: no leftover WAL; the core tables that the
+# slow PBP path produces actually have rows; and the derived tables `rebuild_derived_tables`
+# writes carry the columns this code reads (the same probe the tools guard with, so a seed
+# built by an older shape fails the build instead of shipping and answering every team and
+# fantasy question with a rebuild message) — so a silently-incomplete ingest fails the build
+# instead of shipping a broken image.
 #
 # INGEST_ARGS is empty by default, so production/release builds bake the default window:
 # 1966 onward, clipped per dataset (play-by-play and the stats tables from their 1999
@@ -58,7 +61,8 @@ RUN mkdir -p /seed /data /var/log/nflmcp \
     nfl-mcp ingest --pre1999 ${INGEST_ARGS} \
  && rm -rf /seed/.duckdb_spill /data/.duckdb_spill /root/.cache \
  && test ! -e /seed/nflread.duckdb.wal \
- && python -c "import duckdb,sys; c=duckdb.connect('/seed/nflread.duckdb',read_only=True); rows={t:c.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in ('plays','schedules')}; print('baked rows:',rows); sys.exit(0 if all(v>0 for v in rows.values()) else 1)"
+ && python -c "import duckdb,sys; c=duckdb.connect('/seed/nflread.duckdb',read_only=True); rows={t:c.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in ('plays','schedules')}; print('baked rows:',rows); sys.exit(0 if all(v>0 for v in rows.values()) else 1)" \
+ && python -c "import duckdb,sys; from nfl_mcp.ingest import probe_missing_season_type; c=duckdb.connect('/seed/nflread.duckdb',read_only=True); old=probe_missing_season_type(c); print('derived tables with no season_type column:', old or 'none'); sys.exit(0 if not old else 1)"
 
 # A/B slot management plus the schedule that drives it.
 COPY entrypoint.sh /entrypoint.sh

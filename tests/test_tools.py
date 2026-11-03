@@ -4,6 +4,11 @@ import pytest
 import duckdb
 from unittest.mock import patch
 from nfl_mcp import tools
+from nfl_mcp.ingest import (
+    DERIVED_SHAPE_VERSION,
+    _ensure_metadata_table,
+    _record_loaded,
+)
 from nfl_mcp.tools import (
     nfl_schema, nfl_status, nfl_search_plays, nfl_team_stats,
     nfl_player_stats, nfl_compare, nfl_query,
@@ -209,72 +214,154 @@ class TestNflTeamStats:
         assert "scrimmage plays only" in sources["plays"]
 
 
-def _team_tables_db(tmp_path, monkeypatch, *, season_type: bool) -> None:
-    """Point the tools at a database whose derived tables do, or do not, carry season_type - the
-    shape a database ingested before that column landed reports. No ingest, no network. The one row
-    in each table is synthetic, only there so the read path has a row.
+# The four tables the staleness probe reads (nfl_mcp.ingest._PROBE_TABLES), with the
+# columns their tools select and one synthetic row each, so a read path has a row.
+_PROBED_TABLES = (
+    ("team_offense_stats", "team VARCHAR, season_year INTEGER, total_plays INTEGER",
+     "('KC', 2024, 1091"),
+    ("team_defense_stats", "team VARCHAR, season_year INTEGER, sacks INTEGER",
+     "('KC', 2024, 39"),
+    ("situational_stats", "team VARCHAR, season_year INTEGER, situation VARCHAR",
+     "('KC', 2024, '4th Down'"),
+    ("player_separation_opportunity", "player_id VARCHAR, season INTEGER, avg_separation DOUBLE",
+     "('00-0033873', 2024, 2.9"),
+)
+_ALL_PROBED = tuple(t for t, _, _ in _PROBED_TABLES)
 
-    player_separation_opportunity is always created in the old shape, because only the guard test
-    reads it and the guard must fire whatever else in the database is current.
+
+def _derived_shape_db(tmp_path, monkeypatch, *, without: tuple[str, ...] = (),
+                      stamp: int | None = None) -> None:
+    """Point the tools at a database built to one derived shape, with no ingest and no network.
+
+    `without` names the probe tables to create in the shape a database ingested before season_type
+    landed has: no season_type column. All four are built the same way by default because the guard
+    asks one question about the whole database - one old-shaped table is enough to make every reader
+    of a derived table answer with the rebuild message.
+
+    `stamp` writes the row `rebuild_derived_tables` leaves in _ingest_metadata, and None leaves the
+    database with no _ingest_metadata table at all, which is what a hand-built test database looks
+    like. Tables the tools read that are not named here simply do not exist, which is how the tests
+    below tell a guard answer from a query answer.
     """
     db = tmp_path / "team_tables.duckdb"
     conn = duckdb.connect(str(db))
-    extra = ", season_type VARCHAR" if season_type else ""
-    tail = ", 'REG'" if season_type else ""
-    for table, cols, value in (
-        ("team_offense_stats", "team VARCHAR, season_year INTEGER, total_plays INTEGER", "1091"),
-        ("team_defense_stats", "team VARCHAR, season_year INTEGER, sacks INTEGER", "39"),
-        ("situational_stats", "team VARCHAR, season_year INTEGER, situation VARCHAR", "'4th Down'"),
-    ):
+    for table, cols, values in _PROBED_TABLES:
+        old = table in without
+        extra = "" if old else ", season_type VARCHAR"
+        tail = "" if old else ", 'REG'"
         conn.execute(f"CREATE TABLE {table} ({cols}{extra})")
-        conn.execute(f"INSERT INTO {table} VALUES ('KC', 2024, {value}{tail})")
-    conn.execute("CREATE TABLE player_separation_opportunity "
-                 "(player_id VARCHAR, season INTEGER, avg_separation DOUBLE)")
-    conn.execute("INSERT INTO player_separation_opportunity VALUES ('00-0033873', 2024, 2.9)")
+        conn.execute(f"INSERT INTO {table} VALUES {values}{tail})")
+    if stamp is not None:
+        _ensure_metadata_table(conn)
+        _record_loaded(conn, dataset_id="derived_shape", table_name="derived_shape",
+                       loader_fn="test_tools", row_count=stamp)
     conn.close()
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(db))
+    return db
 
 
 _REBUILD = ("Rebuild the derived tables: nfl-mcp rebuild with the server stopped, or "
             "/update_db.sh in a container (builds the idle slot and swaps the symlink)")
+_ALL_FOUR = "player_separation_opportunity, situational_stats, team_defense_stats, team_offense_stats"
+_STAMP_OLD = (f"the derived-shape stamp reads {DERIVED_SHAPE_VERSION - 1}, "
+              f"this build writes {DERIVED_SHAPE_VERSION}")
 
 
 class TestStaleDerivedTables:
-    """A database ingested before these derived tables gained season_type cannot serve these queries.
+    """A database whose derived tables predate this build cannot serve these queries.
 
     The tools must say what to run, not hand back DuckDB's binder error about a column the caller
-    never typed. The named command must reach a DuckDB writer without the network: `nfl-mcp
-    rebuild` with the server stopped, or /update_db.sh in a container.
+    never typed, and not return rows in the old shape as if they were the new one. The named
+    command must reach a DuckDB writer without the network: `nfl-mcp rebuild` with the server
+    stopped, or /update_db.sh in a container. Every reader of a rebuilt table asks the same
+    question `nfl-mcp rebuild --check` answers, so the answer does not depend on which table the
+    tool happens to read.
     """
 
     def test_a_table_without_season_type_names_the_command_to_rebuild_it(self, tmp_path, monkeypatch):
-        _team_tables_db(tmp_path, monkeypatch, season_type=False)
+        _derived_shape_db(tmp_path, monkeypatch, without=_ALL_PROBED)
         assert nfl_team_stats(team="KC", season=2024) == {
-            "error": f"team_offense_stats has no season_type column. {_REBUILD}"}
+            "error": f"{_ALL_FOUR} have no season_type column. {_REBUILD}"}
 
-    def test_each_side_names_the_table_it_cannot_read(self, tmp_path, monkeypatch):
-        _team_tables_db(tmp_path, monkeypatch, season_type=False)
+    def test_the_answer_does_not_depend_on_which_table_the_tool_reads(
+            self, tmp_path, monkeypatch):
+        """The guard is one question about the database, so all three sides report the same gap."""
+        _derived_shape_db(tmp_path, monkeypatch, without=_ALL_PROBED)
         errors = {side: nfl_team_stats(team="KC", season=2024, side=side)["error"]
                   for side in ("offense", "defense", "situational")}
-        assert errors == {
-            "offense": f"team_offense_stats has no season_type column. {_REBUILD}",
-            "defense": f"team_defense_stats has no season_type column. {_REBUILD}",
-            "situational": f"situational_stats has no season_type column. {_REBUILD}"}
+        assert len(errors) == 3
+        assert len(set(errors.values())) == 1
+        assert errors["offense"] == f"{_ALL_FOUR} have no season_type column. {_REBUILD}"
+
+    def test_one_old_shaped_table_stales_the_whole_database(self, tmp_path, monkeypatch):
+        """player_separation_opportunity selects season_type and separation_source, so an old
+        database failed here with a raw binder error and a logged traceback. The other three probe
+        tables are current, and that no longer buys nfl_team_stats a read: the database needs a
+        rebuild either way."""
+        _derived_shape_db(tmp_path, monkeypatch, without=("player_separation_opportunity",))
+        expected = {"error": "player_separation_opportunity has no season_type column. "
+                             f"{_REBUILD}"}
+        assert nfl_separation_opportunity() == expected
+        assert nfl_team_stats(team="KC", season=2024) == expected
 
     def test_compare_team_names_the_command_to_rebuild_it(self, tmp_path, monkeypatch):
-        _team_tables_db(tmp_path, monkeypatch, season_type=False)
+        _derived_shape_db(tmp_path, monkeypatch, without=_ALL_PROBED)
         assert nfl_compare(entity1="KC", entity2="BAL", compare_type="team", season=2024) == {
-            "error": f"team_offense_stats has no season_type column. {_REBUILD}"}
+            "error": f"{_ALL_FOUR} have no season_type column. {_REBUILD}"}
 
-    def test_separation_names_the_command_to_rebuild_it(self, tmp_path, monkeypatch):
-        """player_separation_opportunity selects season_type and separation_source, so an old
-        database failed here with a raw binder error and a logged traceback."""
-        _team_tables_db(tmp_path, monkeypatch, season_type=True)
-        assert nfl_separation_opportunity() == {
-            "error": f"player_separation_opportunity has no season_type column. {_REBUILD}"}
+    @pytest.mark.parametrize("tool,kwargs", [
+        pytest.param(nfl_team_stats, {"team": "KC", "season": 2024}, id="nfl_team_stats"),
+        pytest.param(nfl_compare,
+                     {"entity1": "KC", "entity2": "BAL", "compare_type": "team"},
+                     id="nfl_compare"),
+        pytest.param(nfl_separation_opportunity, {}, id="nfl_separation_opportunity"),
+        pytest.param(nfl_team_records, {"team": "KC"}, id="nfl_team_records"),
+        pytest.param(nfl_td_luck, {}, id="nfl_td_luck"),
+        pytest.param(nfl_role_trend, {}, id="nfl_role_trend"),
+        pytest.param(nfl_drop_rate, {}, id="nfl_drop_rate"),
+        pytest.param(nfl_contract_value, {}, id="nfl_contract_value"),
+        pytest.param(nfl_injury_return, {"injury_type": "ankle"}, id="nfl_injury_return"),
+    ])
+    def test_an_old_stamp_answers_before_the_tool_queries(self, tool, kwargs, tmp_path, monkeypatch):
+        """The stamp branch, over every tool that reads a table rebuild_derived_tables writes.
 
-    def test_a_table_with_season_type_is_read_as_usual(self, tmp_path, monkeypatch):
-        _team_tables_db(tmp_path, monkeypatch, season_type=True)
+        The four probe tables are current here and the stamp row is one version back, so only the
+        stamp can be what fires. None of the tables these tools read exists in the database: had a
+        tool reached its own query it would hear DuckDB say the table is missing, so an answer that
+        names the stamp proves the guard answered first.
+        """
+        _derived_shape_db(tmp_path, monkeypatch, stamp=DERIVED_SHAPE_VERSION - 1)
+        assert tool(**kwargs) == {"error": f"{_STAMP_OLD}. {_REBUILD}"}
+
+    def test_injury_return_stops_answering_with_old_shaped_rows(self, tmp_path, monkeypatch):
+        """The cost the review measured, on a database in the shape that ingest left behind.
+
+        injury_return_curve carries 20 pre-season_type injury groups including `other`, and the
+        tool handed them back with no error at all. The probe tables are in that same old shape,
+        so the guard now answers first.
+        """
+        db = _derived_shape_db(tmp_path, monkeypatch, without=_ALL_PROBED)
+        conn = duckdb.connect(str(db))
+        conn.execute("CREATE TABLE injury_return_curve (injury_type VARCHAR, position VARCHAR, "
+                     "week_post_return INTEGER, avg_snap_pct_recovery DOUBLE, "
+                     "median_snap_pct_recovery DOUBLE, sample_size INTEGER)")
+        conn.execute("INSERT INTO injury_return_curve VALUES "
+                     "('ankle', 'WR', 1, 82.0, 80.0, 41), ('other', 'RB', 1, 74.0, 71.0, 12)")
+        conn.close()
+        result = nfl_injury_return(injury_type="ankle")
+        assert result == {"error": f"{_ALL_FOUR} have no season_type column. {_REBUILD}"}
+
+    @pytest.mark.parametrize("stamp", [
+        pytest.param(None, id="no_stamp_row"),
+        pytest.param(DERIVED_SHAPE_VERSION, id="current_stamp_row"),
+    ])
+    def test_a_current_shape_is_read_as_usual(self, stamp, tmp_path, monkeypatch):
+        """Probe passes with no stamp row at all, or with the current one: stay silent.
+
+        A hand-built test database looks like the first and a database rebuilt just before the
+        stamp was introduced like the second, and nagging either is wrong.
+        """
+        _derived_shape_db(tmp_path, monkeypatch, stamp=stamp)
         stats = nfl_team_stats(team="KC", season=2024)
         assert "error" not in stats
         assert [r["season_type"] for r in stats["offense"]] == ["REG"]
@@ -282,6 +369,11 @@ class TestStaleDerivedTables:
         assert "error" not in compared
         assert [r["season_type"] for r in compared["KC"]["offense"]] == ["REG"]
         assert compared["BAL"]["offense"] == []
+        # A tool whose table the probe does not list still reaches its own query, and DuckDB is
+        # the one that says the table is missing - the guard said nothing.
+        missing = nfl_injury_return(injury_type="ankle")
+        assert "Rebuild the derived tables" not in missing["error"]
+        assert "injury_return_curve" in missing["error"]
 
 
 @pytest.mark.integration
@@ -1695,7 +1787,14 @@ class TestNflTeamRecords:
             {"season": 1985, "team": "IND", "source_team": "IND", "games": 14,
              "wins": 5, "losses": 11, "ties": 0, "source": "espn"},
         ]
-        with patch("nfl_mcp.tools._execute", return_value=rows):
+        def fake_execute(sql, params=None):
+            """Answer the derived-shape guard's two lookups with 'nothing is old-shaped' and hand
+            the two records to the data query, which is the one under test."""
+            if "_ingest_metadata" in sql or "information_schema" in sql:
+                return []
+            return rows
+
+        with patch("nfl_mcp.tools._execute", side_effect=fake_execute):
             result = nfl_team_records(team="IND", from_season=1970, to_season=1985)
         assert [row["club"] for row in result["records"]] == [
             "Baltimore Colts", "Indianapolis Colts",

@@ -525,6 +525,36 @@ class TestPositionNarrowsCandidatesOnly:   # batch 2 fix 3
         assert result["count"] == 41 and len(result["candidates"]) == 20 and "player" not in result
 
 
+class TestPositionFiltersTheResolverItself:   # review batch one, fix 4
+    """`position` is bound into the resolver's own WHERE clause, whatever its docstring claimed.
+
+    nfl_resolve_player is not in server.TOOLS, so there is no parameter description to correct
+    there: the door into it is the function, and the seven tools that resolve a player each bind
+    position in their own query as well. Its docstring said `position` filters no rows here while
+    the code appended `position ILIKE ?`.
+    """
+
+    @pytest.mark.parametrize("typed,winner", [("WR", JJ_WR), ("lb", JJ_LB)])
+    def test_a_position_settles_the_pair_inside_the_resolver(self, typed, winner):
+        resolved = nfl_resolve_player("Justin Jefferson", season=2026, position=typed)
+        assert resolved["resolved"]["gsis_id"] == winner
+
+    def test_a_position_that_matches_nobody_is_not_found(self):
+        result = nfl_resolve_player("Justin Jefferson", season=2026, position="XX")
+        assert result["not_found"] is True
+        assert "resolved" not in result
+
+    def test_an_id_outranks_a_position(self):
+        # The position clause sits on the name branch only; the id already picked the player.
+        result = nfl_resolve_player("Justin Jefferson", player_id=JJ_LB, position="WR")
+        assert result["resolved"]["gsis_id"] == JJ_LB
+
+    def test_the_docstring_describes_what_the_code_does(self):
+        text = nfl_resolve_player.__doc__ or ""
+        assert "filters no rows" not in text
+        assert "position ILIKE ?" in text
+
+
 class TestPositionStaysWithItsOwnTable:
     """snap_counts uses PFR codes (T, S, DL); players uses OT, SAF, DT (fix 4)."""
 

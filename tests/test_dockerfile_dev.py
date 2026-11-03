@@ -79,6 +79,32 @@ class TestPublishedImageCarriesUpdater:
         assert "test ! -e /seed/nflread.duckdb.wal" in dockerfile
         assert "('plays','schedules')" in dockerfile
 
+    def test_build_fails_on_a_seed_whose_derived_shape_is_old(self):
+        """A seed whose derived tables predate this build would ship and then answer every team
+        and fantasy question with a rebuild message. The check calls the same probe the tools guard
+        with (nfl_mcp.ingest.probe_missing_season_type), so the build and the server cannot drift
+        apart on what "old shaped" means."""
+        dockerfile = _read("Dockerfile")
+        assert "from nfl_mcp.ingest import probe_missing_season_type" in dockerfile
+        assert "derived tables with no season_type column:" in dockerfile
+
+    def test_the_seed_build_snippet_parses_as_posix_shell(self, tmp_path):
+        """The bake and its three validations are one &&-chain in one RUN.
+
+        A stray quote in it breaks the image build and nothing else, so parse it the way the
+        builder's shell does: join the backslash continuations, then `sh -n`.
+        """
+        raw = _read("Dockerfile")
+        block = raw[raw.index("RUN mkdir -p /seed") + len("RUN "):]
+        snippet = " ".join(line.rstrip().rstrip("\\").rstrip()
+                           for line in block[:block.index("\n\n")].splitlines())
+        script = tmp_path / "seed_run.sh"
+        script.write_text(snippet + "\n")
+        result = subprocess.run(["sh", "-n", str(script)], capture_output=True, text=True,
+                                check=False)  # sh -n only parses; the assertion reads the code
+        assert result.returncode == 0, result.stderr.strip()
+        assert "probe_missing_season_type" in snippet   # the shape check is inside this RUN
+
     def test_seed_includes_pre1999_records_but_runtime_does_not(self):
         # The published image answers 1970+ standings out of the box, while a running
         # container never calls ESPN: the opt-in flag belongs to the build only.

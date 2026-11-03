@@ -1292,6 +1292,41 @@ _PROBE_TABLES = ("team_offense_stats", "team_defense_stats",
                  "situational_stats", "player_separation_opportunity")
 
 
+# The two reads the staleness question needs, as SQL rather than as a method, so
+# nfl_mcp.tools can run the identical pair through its own read-only executor
+# instead of opening a second kind of connection.
+_SHAPE_STAMP_SQL = ("SELECT row_count FROM _ingest_metadata "
+                    "WHERE dataset_id = 'derived_shape' AND season IS NULL")
+_PROBE_PLACEHOLDERS = ", ".join("?" for _ in _PROBE_TABLES)
+_SHAPE_PROBE_SQL = (
+    f"SELECT DISTINCT table_name FROM information_schema.columns"
+    f" WHERE table_name IN ({_PROBE_PLACEHOLDERS})"
+    f"   AND table_name NOT IN (SELECT DISTINCT table_name FROM information_schema.columns"
+    f"     WHERE table_name IN ({_PROBE_PLACEHOLDERS}) AND column_name = 'season_type')"
+)
+_PROBE_PARAMS = [*list(_PROBE_TABLES), *list(_PROBE_TABLES)]
+
+
+def shape_needs_rebuild(*, stamp: int | None, missing: list[str]) -> bool:
+    """Decide staleness from the stamp and the probe, either of which may be all you have.
+
+    Stale when the stamp is present and older than DERIVED_SHAPE_VERSION. Stale when the
+    probe names a derived table with no season_type column, because a database written before
+    the stamp existed has no row to compare.
+
+    The third answer is the one that must stay quiet: the probe passed and there is no stamp
+    row at all. A hand-built test database looks like that, and so does a database rebuilt
+    just before the stamp was introduced. The CLI adds that case back as stale through
+    derived_shape_is_stale, because there "no stamp" means "never rebuilt by code that could
+    stamp it"; a tool reading rows the probe already vouched for has nothing to rebuild.
+    """
+    if missing:
+        return True
+    if stamp is None:
+        return False
+    return stamp < DERIVED_SHAPE_VERSION
+
+
 def derived_shape_is_stale(conn: duckdb.DuckDBPyConnection) -> bool:
     """True when the derived tables need a rebuild for the current code.
 
@@ -1299,26 +1334,30 @@ def derived_shape_is_stale(conn: duckdb.DuckDBPyConnection) -> bool:
     database written before stamps existed. Keep both, not either alone. A
     probe table the database does not have passes: absent tables are
     nfl_status's job, not a reason to rebuild on every partial database.
+
+    A database that carries no stamp row counts as stale here. This answers "rebuild this
+    volume now", and a volume with no stamp was never rebuilt by code that could stamp it.
+    A tool answers the weaker question - "are the rows I am about to read the wrong shape" -
+    with shape_needs_rebuild directly; see nfl_mcp.tools._stale_derived_shape.
     """
-    try:
-        row = conn.execute(
-            "SELECT row_count FROM _ingest_metadata "
-            "WHERE dataset_id = 'derived_shape' AND season IS NULL"
-        ).fetchone()
-        stamp = int(row[0]) if row and row[0] is not None else None
-    except (duckdb.CatalogException, duckdb.BinderException):
-        stamp = None
-    if stamp is None or stamp < DERIVED_SHAPE_VERSION:
+    stamp = shape_stamp(conn)
+    if stamp is None:
         return True
-    placeholders = ", ".join(["?"] * len(_PROBE_TABLES))
-    stale = conn.execute(
-        f"SELECT DISTINCT table_name FROM information_schema.columns"
-        f" WHERE table_name IN ({placeholders})"
-        f"   AND table_name NOT IN (SELECT table_name FROM information_schema.columns"
-        f"     WHERE table_name IN ({placeholders}) AND column_name = 'season_type')",
-        [*list(_PROBE_TABLES), *list(_PROBE_TABLES)],
-    ).fetchall()
-    return bool(stale)
+    return shape_needs_rebuild(stamp=stamp, missing=probe_missing_season_type(conn))
+
+
+def shape_stamp(conn: duckdb.DuckDBPyConnection) -> int | None:
+    """The derived-shape version this database carries, or None when it carries no row."""
+    try:
+        row = conn.execute(_SHAPE_STAMP_SQL).fetchone()
+    except (duckdb.CatalogException, duckdb.BinderException):
+        return None
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def probe_missing_season_type(conn: duckdb.DuckDBPyConnection) -> list[str]:
+    """Probe tables this database has that carry no season_type column."""
+    return [str(row[0]) for row in conn.execute(_SHAPE_PROBE_SQL, _PROBE_PARAMS).fetchall()]
 
 
 def rebuild_derived_tables(conn: duckdb.DuckDBPyConnection, db_path: str) -> None:

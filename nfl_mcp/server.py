@@ -213,9 +213,10 @@ TOOLS = [
             "Each row is one team, season and season_type: a playoff game is never added into "
             "the regular season, so pass season_type='REG' or 'POST' for one of them or leave it "
             "out to get both as separate rows. Counting stats come from the week-level team box "
-            "(team_stats_raw) and points from schedules; a per-play figure comes from plays over "
-            "scrimmage plays only. The response carries 'sources', which names the table, column "
-            "or flags behind every column."
+            "(team_stats_raw) and points from schedules; the yards-per-play rates divide those same "
+            "box totals in the row they sit on, and what no box carries (expected points, "
+            "explosive plays) is counted from plays over scrimmage plays only. The response "
+            "carries 'sources', which names the table, column or flags behind every column."
         ),
         inputSchema={
             "type": "object",

@@ -195,6 +195,12 @@ def test_the_team_tool_text_names_where_the_numbers_come_from():
     team = described["nfl_team_stats"]
     assert "team_stats_raw" in team and "schedules" in team and "scrimmage plays" in team
     assert "season_type" in team and "playoff" in team
+    # def6ef5 moved the per-play rates onto the box: yards_per_play, yards_per_rush, yards_per_pass
+    # and yards_per_play_allowed divide the team_stats_raw totals in the row they sit on, and only
+    # what no box carries (expected points, explosive plays) is counted from plays. The text used
+    # to tell the model that any per-play figure came from plays over scrimmage plays only.
+    assert "yards-per-play" in team.split("scrimmage plays")[0]
+    assert "a per-play figure comes from plays" not in team
     assert "season_type" in described["nfl_compare"]
     assert "week = 0" in described["nfl_separation_opportunity"]
     assert "never averaged together" in described["nfl_separation_opportunity"]

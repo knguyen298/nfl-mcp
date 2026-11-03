@@ -186,9 +186,16 @@ def nfl_resolve_player(
     here, so 'J.Smith' means every Smith whose first name starts with J. `team` takes any
     code the club published under - typed, current, or alias ('OAK', 'LAR', 'RAM') - and a
     latest-team match counts only when that club is a past or current member of the team
-    asked for: roster tables prove the season, latest-team does not. `position` filters no
-    rows here - the seven tools that resolve a player filter their own rows with it, and
-    players.position uses different codes than snap_counts.position does.
+    asked for: roster tables prove the season, latest-team does not. `position` does filter
+    rows here, on the name path: it is bound as `position ILIKE ?` against players.position
+    with no wildcards, so it is case-insensitive but whole-code - position='WR' settles the two
+    Justin Jeffersons of 2026 to 00-0036322 and position='LB' to 00-0041075, position='XX'
+    answers not_found rather than handing back the unfiltered list, and 'LB' never matches a
+    stored 'OLB'. It does nothing when `player_id` settles the player, because that branch
+    reads by id. The tools that resolve a player filter their own rows with position too,
+    because players.position uses different codes than snap_counts.position does: that is why
+    _player_filter does not send position down here - 'T' would find no Trent Williams row at
+    all, since players writes 'OT'.
     Returns exactly one of:
       {'resolved': {...}}                      - one player, use resolved['gsis_id']
       {'ambiguous': True, 'candidates': [...]} - several players, no stats to return
@@ -198,8 +205,7 @@ def nfl_resolve_player(
     the one exception the caller asks for: a generational suffix in the query picks the
     player who carries it, which is how 'Marvin Harrison Jr.' is not his father. A 'count'
     larger than 'candidates' means the list was cut off at 20. Never call this to build a
-    list - 'candidates' holds at most 20. No caller may pass position= here: the tools that
-    resolve a player narrow their own candidates with it.
+    list - 'candidates' holds at most 20.
     """
     tokens: list[str] = [] if player_id else _name_tokens(player or "")
     if not tokens and not player_id:
@@ -346,32 +352,52 @@ def _team_filter(conditions: list[str], params: list[Any], column: str, team: st
 
 # The four playoff rounds `schedules.game_type` names, in order of play.
 _POSTSEASON_ROUNDS = ("WC", "DIV", "CON", "SB")
+_SEASON_TYPES = ("REG", "POST")
 
 
 def _season_type_filter(
     conditions: list[str], params: list[Any], column: str,
-    season_type: str | None, rounds: bool = False,
+    season_type: str | None, rounds: bool = False, allow_all: bool = False,
 ) -> dict[str, Any] | None:
     """Append a season-type filter in the vocabulary that column actually stores.
 
-    The tables disagree: `schedules.game_type` names the playoff round ('WC', 'DIV',
-    'CON', 'SB') while `plays` and `player_stats` only ever say 'REG' or 'POST'. Comparing
+    The tables disagree: `schedules.game_type` names the playoff round ('WC', 'DIV', 'CON', 'SB')
+    while `plays` and `player_stats` only ever say 'REG' or 'POST'. Comparing
     either column to the caller's text as typed is an empty success - 'POST' matches no
     schedule row and 'WC' matches no play. With `rounds` the tool reads the schedules
     column, so 'POST' expands to the four rounds. Without it a round name is refused
     rather than widened: the caller who asked for the Super Bowl and the caller who asked
-    for the wild card both got 'POST', one answer for two different questions. A value
-    that is only spaces applies no filter. Returns the error to hand back, or None.
+    for the wild card both got 'POST', one answer for two different questions.
+
+    Anything outside that vocabulary is refused rather than bound. 'ALL' is the shape of the
+    shape of the mistake: it is a real value for nfl_separation_opportunity (see `allow_all`), a
+    model carries it to the next tool, and `nfl_schedule(season_type='ALL')` came back with zero
+    games - an empty answer the caller reads as an empty stat. The error names the set this column
+    accepts, which is the answer to the question the caller actually asked. `allow_all` is for the
+    one tool that documents 'ALL' as "both scopes": it applies no filter, because that tool already
+    returns the two scopes as separate rows. A value that is only spaces applies no filter.
+    Returns the error to hand back, or None.
     """
     if not season_type or not season_type.strip():
         return None
     code = season_type.strip().upper()
+    if allow_all and code == "ALL":
+        return None
+    accepted = [*_SEASON_TYPES, *_POSTSEASON_ROUNDS] if rounds else list(_SEASON_TYPES)
+    if allow_all:
+        accepted.append("ALL")
     if not rounds and code in _POSTSEASON_ROUNDS:
         return {
             "error": f"season_type '{code}' names a playoff round, and the table behind this "
                      f"tool stores only 'REG' or 'POST'.",
             "hint": "Use season_type='POST' for every playoff game, or nfl_schedule to pick "
                     "one round: WC, DIV, CON, SB.",
+        }
+    if code not in accepted:
+        return {
+            "error": f"season_type '{code}' is not a value the table behind this tool stores. "
+                     f"Accepted: {', '.join(accepted)}.",
+            "hint": "Leave season_type out to get every scope this table has, as separate rows.",
         }
     values: list[str] = list(_POSTSEASON_ROUNDS) if rounds and code == "POST" else [code]
     if len(values) == 1:
@@ -787,14 +813,27 @@ _TEAM_STAT_SOURCES = {
 }
 
 
-def _stale_derived_tables(tables: Sequence[str]) -> dict[str, Any] | None:
-    """Return an error naming both rebuild paths when a derived table predates its columns.
+_REBUILD_HINT = (
+    "Rebuild the derived tables: nfl-mcp rebuild with the server stopped, or /update_db.sh in "
+    "a container (builds the idle slot and swaps the symlink)"
+)
 
-    None means every table here can be read. A database ingested before this change has derived
-    tables - the ones the ingest builds rather than the ones nflverse publishes - with no season_type
-    column, so the tools that read them fail on a DuckDB binder error about a column the caller never
-    typed. A table the database does not have at all reports no columns and is left to the query, so
-    a database that was never ingested still hears that its tables are missing.
+
+def _stale_derived_shape() -> dict[str, Any] | None:
+    """Return an error naming both rebuild paths when this database's derived shape is old.
+
+    None means every derived table here carries the shape this code writes, so any of them can
+    be read. The rule lives in nfl_mcp.ingest.shape_needs_rebuild - the same question
+    `nfl-mcp rebuild --check` answers - and both reads ride on _execute so the guard stays on
+    the server's read-only connection and never takes the write lock. It differs from the CLI on
+    one branch only: no stamp row plus a passing probe is current here, so a hand-built test
+    database and a database rebuilt just before the stamp was introduced are not nagged.
+
+    A database ingested before this change has derived tables - the ones the ingest builds rather
+    than the ones nflverse publishes - with no season_type column, so the tools that read them
+    either fail on a DuckDB binder error about a column the caller never typed or, worse, answer
+    with the old shape as if it were the new one: nfl_injury_return(injury_type="ankle") returned
+    20 pre-season_type injury groups, `other` among them, with no error at all.
 
     The command has to reach a DuckDB writer. `nfl-mcp ingest --dataset teams` is wrong here: it
     takes a write lock on the file this server is reading and re-fetches plays over the network.
@@ -802,15 +841,32 @@ def _stale_derived_tables(tables: Sequence[str]) -> dict[str, Any] | None:
     server must be stopped first. In a container the server never stops, so there the path is
     /update_db.sh, which builds the idle slot and swaps the symlink.
     """
-    for table in tables:
-        columns = {str(row.get("column_name")) for row in _execute(
-            "SELECT column_name FROM information_schema.columns WHERE table_name = ?", [table])}
-        if columns and "season_type" not in columns:
-            return {"error": f"{table} has no season_type column. "
-                             "Rebuild the derived tables: nfl-mcp rebuild with the server "
-                             "stopped, or /update_db.sh in a container (builds the idle slot "
-                             "and swaps the symlink)"}
-    return None
+    # Imported here for the same reason cli.py imports it inside its commands: a reader who only
+    # serves tools should not pay for polars and tqdm at import time.
+    from .ingest import (
+        _PROBE_PARAMS,
+        _SHAPE_PROBE_SQL,
+        _SHAPE_STAMP_SQL,
+        DERIVED_SHAPE_VERSION,
+        shape_needs_rebuild,
+    )
+
+    try:
+        rows = _execute(_SHAPE_STAMP_SQL)
+    except duckdb.Error:
+        stamp: int | None = None  # no _ingest_metadata at all: no row to compare the shape with
+    else:
+        stamp = int(rows[0]["row_count"]) if rows and rows[0]["row_count"] is not None else None
+    missing = [str(row["table_name"]) for row in _execute(_SHAPE_PROBE_SQL, _PROBE_PARAMS)]
+    if not shape_needs_rebuild(stamp=stamp, missing=missing):
+        return None
+    if missing:
+        names = ", ".join(sorted(missing))
+        what = f"{names} {'has' if len(missing) == 1 else 'have'} no season_type column"
+    else:
+        what = (f"the derived-shape stamp reads {stamp}, this build writes "
+                f"{DERIVED_SHAPE_VERSION}")
+    return {"error": f"{what}. {_REBUILD_HINT}"}
 
 
 def nfl_team_stats(
@@ -840,11 +896,8 @@ def nfl_team_stats(
     where = " AND ".join(conditions)
 
     results: dict[str, Any] = {"sources": _TEAM_STAT_SOURCES}
-    tables = [t for s, t in (("offense", "team_offense_stats"),
-                             ("defense", "team_defense_stats"),
-                             ("situational", "situational_stats")) if side in (s, "both")]
     try:
-        stale = _stale_derived_tables(tables)
+        stale = _stale_derived_shape()
         if stale is not None:
             return stale
 
@@ -1139,7 +1192,7 @@ def nfl_compare(
             if err is not None:
                 return err
 
-            stale = _stale_derived_tables(["team_offense_stats", "team_defense_stats"])
+            stale = _stale_derived_shape()
             if stale is not None:
                 return stale
             season_filter = ""
@@ -1433,7 +1486,9 @@ def nfl_schedule(
     if week:
         conditions.append("week = ?")
         params.append(int(week))
-    _season_type_filter(conditions, params, "game_type", season_type, rounds=True)
+    refused = _season_type_filter(conditions, params, "game_type", season_type, rounds=True)
+    if refused is not None:
+        return refused
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
@@ -1507,6 +1562,9 @@ def nfl_team_records(
         ORDER BY season DESC, team
     """
     try:
+        stale = _stale_derived_shape()
+        if stale is not None:
+            return stale
         rows, flag = _execute_limited(sql, params if params else None, _MAX_ROWS)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -1869,6 +1927,9 @@ def nfl_td_luck(
         ORDER BY total_td_luck_score ASC NULLS LAST
     """
     try:
+        stale = _stale_derived_shape()
+        if stale is not None:
+            return stale
         rows, flag = _execute_limited(sql, params if params else None, limit)
         return _echo_player({"td_luck": _label_players(rows), "count": len(rows), **flag}, identity)
     except (duckdb.Error, ValueError, TimeoutError) as e:
@@ -1930,6 +1991,9 @@ def nfl_role_trend(
         ORDER BY snap_pct_delta DESC NULLS LAST
     """
     try:
+        stale = _stale_derived_shape()
+        if stale is not None:
+            return stale
         rows, flag = _execute_limited(sql, params if params else None, limit)
         return _echo_player({"role_trend": _label_players(rows), "count": len(rows), **flag}, identity)
     except (duckdb.Error, ValueError, TimeoutError) as e:
@@ -1996,11 +2060,9 @@ def nfl_separation_opportunity(
     if season:
         conditions.append("season = ?")
         params.append(int(season))
-    if season_type and season_type.upper() != "ALL":
-        # 'ALL' is the only way to ask for both scopes: an empty or null value cannot survive the
-        # schema's "type": "string", so the literal is the contract.
-        conditions.append("season_type = ?")
-        params.append(season_type.upper())
+    refused = _season_type_filter(conditions, params, "season_type", season_type, allow_all=True)
+    if refused is not None:
+        return refused
     if regression_candidate is not None:
         conditions.append("regression_candidate = ?")
         params.append(bool(regression_candidate))
@@ -2017,7 +2079,7 @@ def nfl_separation_opportunity(
         ORDER BY fp_diff_per_game ASC NULLS LAST
     """
     try:
-        stale = _stale_derived_tables(["player_separation_opportunity"])
+        stale = _stale_derived_shape()
         if stale is not None:
             return stale
         rows, flag = _execute_limited(sql, params if params else None, limit)
@@ -2078,6 +2140,9 @@ def nfl_drop_rate(
         ORDER BY drop_rate_pct DESC NULLS LAST
     """
     try:
+        stale = _stale_derived_shape()
+        if stale is not None:
+            return stale
         rows, flag = _execute_limited(sql, params if params else None, limit)
         return _echo_player(
             {"drop_rate": _label_players(rows, name_key="player"), "count": len(rows), **flag}, identity
@@ -2139,6 +2204,9 @@ def nfl_contract_value(
         ORDER BY fp_per_million DESC NULLS LAST
     """
     try:
+        stale = _stale_derived_shape()
+        if stale is not None:
+            return stale
         rows, flag = _execute_limited(sql, params if params else None, limit)
         return _echo_player({"contract_value": _label_players(rows), "count": len(rows), **flag}, identity)
     except (duckdb.Error, ValueError, TimeoutError) as e:
@@ -2184,6 +2252,9 @@ def nfl_injury_return(
         ORDER BY week_post_return ASC, injury_type, position
     """
     try:
+        stale = _stale_derived_shape()
+        if stale is not None:
+            return stale
         rows, flag = _execute_limited(sql, params if params else None, limit)
         return {"injury_return": rows, "count": len(rows), **flag}
     except (duckdb.Error, ValueError, TimeoutError) as e:

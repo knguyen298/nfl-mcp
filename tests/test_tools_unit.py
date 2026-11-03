@@ -264,9 +264,11 @@ def test_search_plays_uses_parameterized_filters(monkeypatch):
 
 
 def _data_reads(calls):
-    """The queries that read data, without the information_schema lookups the team tools run
-    first to catch a database whose derived team tables predate the season_type column."""
-    return [(sql, params) for sql, params in calls if "information_schema" not in sql]
+    """The queries that read data, without the two lookups the derived-shape guard runs first
+    (nfl_mcp.tools._stale_derived_shape reads the stamp out of _ingest_metadata and probes
+    information_schema for a derived table that predates the season_type column)."""
+    return [(sql, params) for sql, params in calls
+            if "information_schema" not in sql and "_ingest_metadata" not in sql]
 
 
 def test_team_stats_uses_parameterized_team_and_season(monkeypatch):
@@ -279,8 +281,9 @@ def test_team_stats_uses_parameterized_team_and_season(monkeypatch):
     monkeypatch.setattr(tools, "_execute", fake_execute)
     tools.nfl_team_stats(team="kc", season=2024, side="both")
 
-    # One column lookup per table read, then the three data queries.
-    assert len(calls) == 6
+    # One stamp read and one column probe from the derived-shape guard, then the three data
+    # queries.
+    assert len(calls) == 5
     reads = _data_reads(calls)
     assert len(reads) == 3
     assert all("team = ?" in sql for sql, _ in reads)
@@ -1205,10 +1208,11 @@ def _capture_execute(monkeypatch, rows):
     captured = {}
 
     def fake_execute(sql, params=None):
-        if "information_schema.columns WHERE table_name" in sql:
-            # The stale-derived-table guard probing what it can read: answer that the table is
-            # current so the call under test reaches its own query.
-            return [{"column_name": "season_type"}]
+        if "information_schema" in sql or "_ingest_metadata" in sql:
+            # The derived-shape guard asking its two questions (nfl_mcp.tools
+            # ._stale_derived_shape): answer that nothing here is old-shaped, so the call under
+            # test reaches its own query.
+            return []
         captured["sql"] = sql
         captured["params"] = params
         return rows
@@ -1283,8 +1287,16 @@ def test_separation_opportunity_names_the_sample_behind_a_fallback_row(monkeypat
 
 def test_separation_opportunity_says_what_to_rebuild(monkeypatch):
     """An old player_separation_opportunity has no season_type; the caller must hear the rebuild
-    command, not DuckDB's binder error for a column they never typed."""
-    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [{"column_name": "season"}])
+    command, not DuckDB's binder error for a column they never typed. Any other query is a
+    failure here: the guard answers before the tool reads the table."""
+    def fake_execute(sql, params=None):
+        if "_ingest_metadata" in sql:
+            return []                     # no stamp row: only the probe can speak
+        if "information_schema" in sql:
+            return [{"table_name": "player_separation_opportunity"}]
+        raise AssertionError(f"the guard should have answered first: {sql}")
+
+    monkeypatch.setattr(tools, "_execute", fake_execute)
     stub_resolver(monkeypatch)
     assert tools.nfl_separation_opportunity() == {
         "error": "player_separation_opportunity has no season_type column. "

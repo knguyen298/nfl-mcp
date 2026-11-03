@@ -77,6 +77,25 @@ def recorded(monkeypatch):
 PLAYOFF_ROUNDS = ["WC", "DIV", "CON", "SB"]
 
 
+def _record_queries(monkeypatch):
+    """Record every query a tool builds, answer no rows, and keep two lookups honest.
+
+    nfl_player_stats checks which columns this database has before it filters, so that lookup
+    gets one column back. The two reads of the derived-shape guard (nfl_mcp.tools
+    ._stale_derived_shape) get 'nothing here is old-shaped' so they never answer for the tool.
+    """
+    calls: list[tuple[str, list]] = []
+
+    def fake_execute(sql, params=None):
+        calls.append((sql, list(params or [])))
+        if "SELECT column_name FROM information_schema.columns" in sql:
+            return [{"column_name": "attempts"}]
+        return []
+
+    monkeypatch.setattr(tools, "_execute", fake_execute)
+    return calls
+
+
 class TestSeasonTypeVocabulary:
     """`schedules.game_type` names the round; `plays` and `player_stats` say REG or POST."""
 
@@ -98,8 +117,9 @@ class TestSeasonTypeVocabulary:
     @pytest.mark.parametrize("round_code", PLAYOFF_ROUNDS)
     def test_a_round_name_on_a_two_word_table_is_refused_by_name(self, recorded, call,
                                                                  round_code):
-        # The widening this replaces gave the wild card and the Super Bowl the same 217
-        # rows, so a caller could not tell a round filter from a postseason filter.
+        # What this refusal replaces: a round name was widened to 'POST', so the wild card and
+        # the Super Bowl each answered with every postseason row the filter could reach - one
+        # answer for two different questions, with nothing to tell the caller they differed.
         result = call(team="KC", season=2024, season_type=round_code.lower())
         assert f"'{round_code}'" in result["error"]
         assert "only 'REG' or 'POST'" in result["error"]
@@ -223,6 +243,70 @@ class TestSeasonTypeVocabulary:
             where = recorded[0][0].split(" WHERE ")[1]
             assert "game_type" not in where
             recorded.clear()
+
+    @pytest.mark.parametrize("call,accepted", [
+        pytest.param(lambda c: nfl_search_plays(team="KC", season=2024, season_type=c),
+                     "REG, POST", id="nfl_search_plays"),
+        pytest.param(lambda c: nfl_team_stats(team="KC", season=2024, season_type=c),
+                     "REG, POST", id="nfl_team_stats"),
+        pytest.param(lambda c: nfl_player_stats(player_name="Patrick Mahomes", season=2024,
+                                                season_type=c),
+                     "REG, POST", id="nfl_player_stats"),
+        pytest.param(lambda c: nfl_compare(entity1="KC", entity2="BAL", compare_type="team",
+                                          season=2024, season_type=c),
+                     "REG, POST", id="nfl_compare"),
+        pytest.param(lambda c: nfl_schedule(team="KC", season=2024, season_type=c),
+                     "REG, POST, WC, DIV, CON, SB", id="nfl_schedule"),
+        pytest.param(lambda c: nfl_ftn_charting(team="KC", season=2024, season_type=c),
+                     "REG, POST", id="nfl_ftn_charting"),
+        pytest.param(lambda c: nfl_separation_opportunity(season=2024, season_type=c),
+                     "REG, POST, ALL", id="nfl_separation_opportunity"),
+    ])
+    def test_a_value_outside_the_column_vocabulary_is_refused_not_bound(
+            self, call, accepted, monkeypatch):
+        """Every tool that takes season_type, on the two values that used to answer empty.
+
+        'ALL' is a real value for nfl_separation_opportunity, so a model carries it to the next
+        tool: nfl_schedule(season_type='ALL') returned zero games and nfl_team_stats(season_type=
+        'playoffs') returned zero rows. Both bound a word the column never stores, and an empty
+        success reads as an empty stat. Each tool must instead name the set it accepts, and skip
+        the values that tool does accept.
+        """
+        calls = _record_queries(monkeypatch)
+        monkeypatch.setattr(tools, "nfl_resolve_player",
+                            lambda *a, **k: {"resolved": {"gsis_id": "00-0033873",
+                                                          "label": "Patrick Mahomes (QB, KC)"}})
+        wanted = accepted.split(", ")
+        for bad in ("ALL", "playoffs", "pre"):
+            if bad.upper() in wanted:
+                continue
+            result = call(bad)
+            assert f"'{bad.upper()}'" in result["error"], (bad, result)
+            assert f"Accepted: {accepted}." in result["error"], (bad, result)
+            assert "count" not in result, (bad, result)   # not an empty success
+        assert not [sql for sql, _ in calls
+                    if "season_type = ?" in sql or "game_type = ?" in sql]
+
+    def test_all_still_asks_for_both_scopes_on_the_tool_that_documents_it(self, recorded):
+        """'ALL' is that tool's own contract, so it filters nothing rather than erroring."""
+        result = nfl_separation_opportunity(season=2024, season_type="ALL")
+        assert "error" not in result
+        assert not [sql for sql, _ in recorded if "season_type = ?" in sql]
+
+    @pytest.mark.parametrize("name,accepted", [
+        pytest.param("nfl_search_plays", ["REG", "POST"], id="nfl_search_plays"),
+        pytest.param("nfl_team_stats", ["REG", "POST"], id="nfl_team_stats"),
+        pytest.param("nfl_player_stats", ["REG", "POST"], id="nfl_player_stats"),
+        pytest.param("nfl_compare", ["REG", "POST"], id="nfl_compare"),
+        pytest.param("nfl_ftn_charting", ["REG", "POST"], id="nfl_ftn_charting"),
+        pytest.param("nfl_schedule", ["REG", "POST", "WC", "DIV", "CON", "SB"], id="nfl_schedule"),
+        pytest.param("nfl_separation_opportunity", ["REG", "POST", "ALL"],
+                     id="nfl_separation_opportunity"),
+    ])
+    def test_the_schema_enum_offers_exactly_what_the_tool_accepts(self, name, accepted):
+        """A client must not be offered a value the tool refuses, nor refused one it accepts."""
+        tool = next(tool for tool in server.TOOLS if tool.name == name)
+        assert tool.inputSchema["properties"]["season_type"]["enum"] == accepted
 
 
 class TestPlayoffFilterOnRealData:
@@ -596,14 +680,16 @@ SHORT_ANSWERS = {
 def _fake_execute(rows):
     """A stand-in for `tools._execute` that answers the two kinds of query a capped tool runs.
 
-    Group B's tools read `information_schema` first, to catch a database whose derived tables
-    predate the season_type column, and Group C's tools then read the data. A single fake that
-    hands back data rows for both makes the staleness guard see a table with no columns and the
-    tool answers with an error instead of a truncated list.
+    Every reader of a rebuilt table asks the derived-shape question first (nfl_mcp.tools
+    ._stale_derived_shape): it reads the shape stamp out of _ingest_metadata and probes
+    information_schema for a derived table with no season_type column. Both answer "nothing is
+    old-shaped here", so the tool goes on to the data query the test is about. A fake that handed
+    data rows back for those two instead would make the guard report a stale database and the tool
+    would answer with an error instead of a truncated list.
     """
     def fake(sql, params=None):
-        if "information_schema" in sql:
-            return [{"column_name": "season_type"}]
+        if "_ingest_metadata" in sql or "information_schema" in sql:
+            return []
         return rows
     return fake
 
