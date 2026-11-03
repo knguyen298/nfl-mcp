@@ -262,6 +262,9 @@ def _derived_shape_db(tmp_path, monkeypatch, *, without: tuple[str, ...] = (),
 
 _REBUILD = ("Rebuild the derived tables: nfl-mcp rebuild with the server stopped, or "
             "/update_db.sh in a container (builds the idle slot and swaps the symlink)")
+# The guard answers about the database, so the message says so: the four probe tables it names and
+# the tool that refused may have nothing to do with each other.
+_STALE = "This database's derived tables are older than this build:"
 _ALL_FOUR = "player_separation_opportunity, situational_stats, team_defense_stats, team_offense_stats"
 _STAMP_OLD = (f"the derived-shape stamp reads {DERIVED_SHAPE_VERSION - 1}, "
               f"this build writes {DERIVED_SHAPE_VERSION}")
@@ -281,7 +284,7 @@ class TestStaleDerivedTables:
     def test_a_table_without_season_type_names_the_command_to_rebuild_it(self, tmp_path, monkeypatch):
         _derived_shape_db(tmp_path, monkeypatch, without=_ALL_PROBED)
         assert nfl_team_stats(team="KC", season=2024) == {
-            "error": f"{_ALL_FOUR} have no season_type column. {_REBUILD}"}
+            "error": f"{_STALE} {_ALL_FOUR} have no season_type column. {_REBUILD}"}
 
     def test_the_answer_does_not_depend_on_which_table_the_tool_reads(
             self, tmp_path, monkeypatch):
@@ -291,7 +294,7 @@ class TestStaleDerivedTables:
                   for side in ("offense", "defense", "situational")}
         assert len(errors) == 3
         assert len(set(errors.values())) == 1
-        assert errors["offense"] == f"{_ALL_FOUR} have no season_type column. {_REBUILD}"
+        assert errors["offense"] == f"{_STALE} {_ALL_FOUR} have no season_type column. {_REBUILD}"
 
     def test_one_old_shaped_table_stales_the_whole_database(self, tmp_path, monkeypatch):
         """player_separation_opportunity selects season_type and separation_source, so an old
@@ -299,7 +302,7 @@ class TestStaleDerivedTables:
         tables are current, and that no longer buys nfl_team_stats a read: the database needs a
         rebuild either way."""
         _derived_shape_db(tmp_path, monkeypatch, without=("player_separation_opportunity",))
-        expected = {"error": "player_separation_opportunity has no season_type column. "
+        expected = {"error": f"{_STALE} player_separation_opportunity has no season_type column. "
                              f"{_REBUILD}"}
         assert nfl_separation_opportunity() == expected
         assert nfl_team_stats(team="KC", season=2024) == expected
@@ -307,7 +310,7 @@ class TestStaleDerivedTables:
     def test_compare_team_names_the_command_to_rebuild_it(self, tmp_path, monkeypatch):
         _derived_shape_db(tmp_path, monkeypatch, without=_ALL_PROBED)
         assert nfl_compare(entity1="KC", entity2="BAL", compare_type="team", season=2024) == {
-            "error": f"{_ALL_FOUR} have no season_type column. {_REBUILD}"}
+            "error": f"{_STALE} {_ALL_FOUR} have no season_type column. {_REBUILD}"}
 
     @pytest.mark.parametrize("tool,kwargs", [
         pytest.param(nfl_team_stats, {"team": "KC", "season": 2024}, id="nfl_team_stats"),
@@ -331,7 +334,7 @@ class TestStaleDerivedTables:
         names the stamp proves the guard answered first.
         """
         _derived_shape_db(tmp_path, monkeypatch, stamp=DERIVED_SHAPE_VERSION - 1)
-        assert tool(**kwargs) == {"error": f"{_STAMP_OLD}. {_REBUILD}"}
+        assert tool(**kwargs) == {"error": f"{_STALE} {_STAMP_OLD}. {_REBUILD}"}
 
     def test_injury_return_stops_answering_with_old_shaped_rows(self, tmp_path, monkeypatch):
         """The cost the review measured, on a database in the shape that ingest left behind.
@@ -349,7 +352,7 @@ class TestStaleDerivedTables:
                      "('ankle', 'WR', 1, 82.0, 80.0, 41), ('other', 'RB', 1, 74.0, 71.0, 12)")
         conn.close()
         result = nfl_injury_return(injury_type="ankle")
-        assert result == {"error": f"{_ALL_FOUR} have no season_type column. {_REBUILD}"}
+        assert result == {"error": f"{_STALE} {_ALL_FOUR} have no season_type column. {_REBUILD}"}
 
     @pytest.mark.parametrize("stamp", [
         pytest.param(None, id="no_stamp_row"),
@@ -1510,6 +1513,22 @@ class TestNflSeparationOpportunity:
         # Lower case reaches the same place, and ALL is not passed to the database as a filter.
         lower = nfl_separation_opportunity(player_id="00-0036322", season=2024, season_type="all")
         assert len(lower["separation_opportunity"]) == len(both["separation_opportunity"])
+
+    def test_a_blank_value_answers_the_documented_default_not_both_scopes(self):
+        """season_type='' applied no filter, so the tool answered both scopes while its own schema
+        documents REG. Measured here on 2024: the plain call answers the regular-season rows and
+        season_type='ALL' answers more than that. A blank now answers the default, both scopes are
+        still what 'ALL' means, and no row in a blank answer comes from the postseason."""
+        default = nfl_separation_opportunity(season=2024, limit=500)["separation_opportunity"]
+        both = nfl_separation_opportunity(season=2024, season_type="ALL",
+                                          limit=500)["separation_opportunity"]
+        for blank in ("", "   "):
+            rows = nfl_separation_opportunity(season=2024, season_type=blank,
+                                              limit=500)["separation_opportunity"]
+            assert {r["season_type"] for r in rows} == {"REG"}, blank
+            assert len(rows) == len(default), blank
+        assert {r["season_type"] for r in both} == {"REG", "POST"}
+        assert len(both) > len(default)
 
     def test_the_ngs_season_summary_row_is_the_figure(self):
         """Justin Jefferson 2024: NGS's own week = 0 summary row says 3.079 yards of average

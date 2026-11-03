@@ -6,6 +6,8 @@ without touching a real file. The CLI tests point NFL_MCP_DB_PATH at copies -
 a test must never open the suite's database for write.
 """
 
+import shutil
+
 import duckdb
 import pytest
 from click.testing import CliRunner
@@ -13,12 +15,15 @@ from click.testing import CliRunner
 from nfl_mcp.ingest import (
     _PROBE_TABLES,
     DERIVED_SHAPE_VERSION,
+    _create_aggregate_tables,
     _create_fantasy_tables,
     _ensure_metadata_table,
     _record_loaded,
     _write_df_to_table,
     derived_shape_is_stale,
+    probe_missing_season_type,
     rebuild_derived_tables,
+    shape_stamp,
 )
 from tests.team_table_fixtures import load_team_sources
 
@@ -156,6 +161,102 @@ def runner():
     """A fresh Click test runner. Function scope: a session-scoped fixture defined as a
     class instance method is deprecated in pytest, and CliRunner costs nothing to build."""
     return CliRunner()
+
+
+class TestRebuildIsOneTransaction:
+    """A rebuild the process does not finish changes nothing a reader can see.
+
+    Each builder drops its table before it recreates it, so the run used to commit one table at a
+    time: a rebuild interrupted in the middle left some tables rebuilt and some not, and because
+    the column probe only asks about tables that still exist, the guarded tools called that
+    half-rebuilt set current while `nfl-mcp rebuild --check` said stale.
+    """
+
+    def test_a_stamp_written_before_the_failure_is_rolled_back_with_the_tables(
+            self, monkeypatch):
+        """In memory, so the rollback is the only thing under test.
+
+        The stubbed builder stamps the shape and then dies, the way a run killed between the stamp
+        write and the last table would. Nothing it wrote may survive: not the stamp, and not the
+        table _create_aggregate_tables had already dropped and rebuilt.
+        """
+        def stamp_then_die(conn):
+            _create_fantasy_tables(conn)
+            _record_loaded(conn, dataset_id="derived_shape", table_name="derived_shape",
+                           loader_fn="test_rebuild_shape", row_count=DERIVED_SHAPE_VERSION)
+            raise KeyboardInterrupt          # Ctrl-C one second into the run
+
+        conn = duckdb.connect(":memory:")
+        try:
+            load_team_sources(conn, _write_df_to_table)
+            _create_aggregate_tables(conn)        # the four probe tables, in this build's shape
+            conn.execute("ALTER TABLE team_offense_stats DROP COLUMN season_type")
+            assert probe_missing_season_type(conn) == ["team_offense_stats"]
+            monkeypatch.setattr("nfl_mcp.ingest._create_fantasy_tables", stamp_then_die)
+
+            with pytest.raises(KeyboardInterrupt):
+                rebuild_derived_tables(conn, ":memory:")
+
+            assert shape_stamp(conn) is None
+            assert probe_missing_season_type(conn) == ["team_offense_stats"]
+        finally:
+            conn.close()
+
+
+@pytest.mark.integration
+class TestKilledRebuildLeavesTheOldShape:
+    """The reviewer's run, on a copy of the suite's database: killed mid-rebuild, tools refuse.
+
+    NFL_MCP_DB_PATH points at the copy because the tools open their own read-only connection, and
+    a test must never open the suite's database for write.
+    """
+
+    def test_a_rebuild_killed_after_the_probe_tables_still_refuses(self, tmp_path, monkeypatch):
+        from nfl_mcp.config import get_duckdb_path
+        from nfl_mcp.tools import nfl_injury_return
+
+        source = get_duckdb_path()
+        if not source.exists():
+            pytest.skip("No DuckDB database loaded")
+        db = tmp_path / "killed_rebuild.duckdb"
+        shutil.copyfile(source, db)
+
+        conn = duckdb.connect(str(db))
+        try:
+            # The shape this bug arrived in: an unstamped database whose derived tables predate
+            # season_type. team_offense_stats is the one _create_aggregate_tables rebuilds, so it
+            # is the table the interrupted run would have committed before it died.
+            _ensure_metadata_table(conn)
+            conn.execute("DELETE FROM _ingest_metadata WHERE dataset_id = 'derived_shape'")
+            conn.execute("ALTER TABLE team_offense_stats DROP COLUMN season_type")
+            assert shape_stamp(conn) is None
+            assert derived_shape_is_stale(conn) is True
+
+            def die_after_the_aggregate_tables(_conn):
+                raise RuntimeError("killed one second into the rebuild")
+
+            monkeypatch.setattr("nfl_mcp.ingest._create_fantasy_tables", die_after_the_aggregate_tables)
+            with pytest.raises(RuntimeError, match="killed one second"):
+                rebuild_derived_tables(conn, str(db))
+
+            # Nothing the run did is visible: no stamp, and the table it rebuilt is old again.
+            assert shape_stamp(conn) is None
+            assert probe_missing_season_type(conn) == ["team_offense_stats"]
+            assert derived_shape_is_stale(conn) is True
+        finally:
+            conn.close()
+
+        # And the tool that reads a table the probe never lists still refuses. injury_return_curve
+        # is in this copy in the new shape, so the only reason to refuse is that the database as a
+        # whole is still old-shaped. Without the transaction the probe passes here, no stamp row
+        # exists, and the tool answers from rows it should not trust.
+        monkeypatch.setenv("NFL_MCP_DB_PATH", str(db))
+        result = nfl_injury_return(injury_type="ankle")
+        assert result == {
+            "error": "This database's derived tables are older than this build: "
+                     "team_offense_stats has no season_type column. "
+                     "Rebuild the derived tables: nfl-mcp rebuild with the server stopped, or "
+                     "/update_db.sh in a container (builds the idle slot and swaps the symlink)"}
 
 
 @pytest.mark.integration

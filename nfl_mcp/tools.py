@@ -350,14 +350,22 @@ def _team_filter(conditions: list[str], params: list[Any], column: str, team: st
         params.extend(codes)
 
 
-# The four playoff rounds `schedules.game_type` names, in order of play.
-_POSTSEASON_ROUNDS = ("WC", "DIV", "CON", "SB")
-_SEASON_TYPES = ("REG", "POST")
+# The vocabularies a `season_type` parameter accepts, one constant per vocabulary, named for the
+# column behind it. _season_type_filter below refuses anything outside the one its caller names,
+# and tests/test_team_codes_and_truncation.py pins each tool's hand-written schema enum in
+# server.py to the same constant, so a new value is one edit and a drift is one failing test.
+SEASON_TYPES = ("REG", "POST")                  # what plays, player_stats and the derived tables store
+POSTSEASON_ROUNDS = ("WC", "DIV", "CON", "SB")  # the four rounds `schedules.game_type` names, in order
+ALL_SCOPES = "ALL"                              # both scopes at once, as separate rows
+SCHEDULE_SEASON_TYPES = (*SEASON_TYPES, *POSTSEASON_ROUNDS)  # what nfl_schedule accepts
+SEPARATION_SEASON_TYPES = (*SEASON_TYPES, ALL_SCOPES)        # what nfl_separation_opportunity accepts
+SEPARATION_DEFAULT_SEASON_TYPE = SEASON_TYPES[0]  # what nfl_separation_opportunity answers unprompted
 
 
 def _season_type_filter(
     conditions: list[str], params: list[Any], column: str,
     season_type: str | None, rounds: bool = False, allow_all: bool = False,
+    blank_means: str | None = None,
 ) -> dict[str, Any] | None:
     """Append a season-type filter in the vocabulary that column actually stores.
 
@@ -369,24 +377,34 @@ def _season_type_filter(
     rather than widened: the caller who asked for the Super Bowl and the caller who asked
     for the wild card both got 'POST', one answer for two different questions.
 
-    Anything outside that vocabulary is refused rather than bound. 'ALL' is the shape of the
-    shape of the mistake: it is a real value for nfl_separation_opportunity (see `allow_all`), a
-    model carries it to the next tool, and `nfl_schedule(season_type='ALL')` came back with zero
-    games - an empty answer the caller reads as an empty stat. The error names the set this column
-    accepts, which is the answer to the question the caller actually asked. `allow_all` is for the
-    one tool that documents 'ALL' as "both scopes": it applies no filter, because that tool already
-    returns the two scopes as separate rows. A value that is only spaces applies no filter.
-    Returns the error to hand back, or None.
+    Anything outside that vocabulary is refused rather than bound. 'ALL' is the value that most
+    often arrives at the wrong tool: it is a real value for nfl_separation_opportunity (see
+    `allow_all`), a model carries it to the next tool, and `nfl_schedule(season_type='ALL')` came
+    back with zero games - an empty answer the caller reads as an empty stat. The error names the
+    set this column accepts, which is the answer to the question the caller actually asked.
+    `allow_all` is for the one tool that documents 'ALL' as "both scopes": it applies no filter,
+    because that tool already returns the two scopes as separate rows.
+
+    A blank value - nothing, or a string of spaces - applies no filter, which is what the six
+    tools whose default is every scope want. A tool whose documented default is one scope passes
+    that default as `blank_means`, so a blank answers what the tool advertises instead of quietly
+    widening: nfl_separation_opportunity documents REG, and season_type='' on it once returned
+    both scopes. Returns the error to hand back, or None.
     """
     if not season_type or not season_type.strip():
-        return None
+        if blank_means is None:
+            return None
+        season_type = blank_means
     code = season_type.strip().upper()
-    if allow_all and code == "ALL":
+    if allow_all and code == ALL_SCOPES:
         return None
-    accepted = [*_SEASON_TYPES, *_POSTSEASON_ROUNDS] if rounds else list(_SEASON_TYPES)
-    if allow_all:
-        accepted.append("ALL")
-    if not rounds and code in _POSTSEASON_ROUNDS:
+    if rounds:
+        accepted: list[str] = list(SCHEDULE_SEASON_TYPES)
+    elif allow_all:
+        accepted = list(SEPARATION_SEASON_TYPES)
+    else:
+        accepted = list(SEASON_TYPES)
+    if not rounds and code in POSTSEASON_ROUNDS:
         return {
             "error": f"season_type '{code}' names a playoff round, and the table behind this "
                      f"tool stores only 'REG' or 'POST'.",
@@ -394,12 +412,17 @@ def _season_type_filter(
                     "one round: WC, DIV, CON, SB.",
         }
     if code not in accepted:
+        if allow_all:
+            hint = (f"Leaving season_type out gives {SEPARATION_DEFAULT_SEASON_TYPE} only; pass "
+                    f"season_type='{ALL_SCOPES}' for both scopes as separate rows.")
+        else:
+            hint = "Leave season_type out to get every scope this table has, as separate rows."
         return {
             "error": f"season_type '{code}' is not a value the table behind this tool stores. "
                      f"Accepted: {', '.join(accepted)}.",
-            "hint": "Leave season_type out to get every scope this table has, as separate rows.",
+            "hint": hint,
         }
-    values: list[str] = list(_POSTSEASON_ROUNDS) if rounds and code == "POST" else [code]
+    values: list[str] = list(POSTSEASON_ROUNDS) if rounds and code == "POST" else [code]
     if len(values) == 1:
         conditions.append(f"{column} = ?")
         params.append(values[0])
@@ -818,6 +841,11 @@ _REBUILD_HINT = (
     "a container (builds the idle slot and swaps the symlink)"
 )
 
+# Said about the database rather than about the tool that answered: the probe names four tables,
+# and nfl_injury_return, which reads injury_return_curve, is the one that most often quotes them.
+# The list stays, because it is what tells a reader which tables a rebuild has to fix.
+_STALE_SHAPE_LEAD = "This database's derived tables are older than this build:"
+
 
 def _stale_derived_shape() -> dict[str, Any] | None:
     """Return an error naming both rebuild paths when this database's derived shape is old.
@@ -836,10 +864,11 @@ def _stale_derived_shape() -> dict[str, Any] | None:
     20 pre-season_type injury groups, `other` among them, with no error at all.
 
     The command has to reach a DuckDB writer. `nfl-mcp ingest --dataset teams` is wrong here: it
-    takes a write lock on the file this server is reading and re-fetches plays over the network.
-    `nfl-mcp rebuild` rebuilds from rows already loaded, but it still needs the write lock, so the
-    server must be stopped first. In a container the server never stops, so there the path is
-    /update_db.sh, which builds the idle slot and swaps the symlink.
+    takes the same write lock the server holds on the file it is reading, and it goes to the network
+    for the 36-row `teams` dataset instead of rebuilding from the rows already loaded. The remedy the
+    message names is `nfl-mcp rebuild`, which rebuilds from rows already loaded, but it still needs
+    the write lock, so the server must be stopped first. In a container the server never stops, so
+    there the path is /update_db.sh, which builds the idle slot and swaps the symlink.
     """
     # Imported here for the same reason cli.py imports it inside its commands: a reader who only
     # serves tools should not pay for polars and tqdm at import time.
@@ -866,7 +895,7 @@ def _stale_derived_shape() -> dict[str, Any] | None:
     else:
         what = (f"the derived-shape stamp reads {stamp}, this build writes "
                 f"{DERIVED_SHAPE_VERSION}")
-    return {"error": f"{what}. {_REBUILD_HINT}"}
+    return {"error": f"{_STALE_SHAPE_LEAD} {what}. {_REBUILD_HINT}"}
 
 
 def nfl_team_stats(
@@ -2007,7 +2036,7 @@ def nfl_separation_opportunity(
     position: str | None = None,
     team: str | None = None,
     season: int | None = None,
-    season_type: str | None = "REG",
+    season_type: str | None = SEPARATION_DEFAULT_SEASON_TYPE,
     regression_candidate: bool | None = None,
     limit: int = 50,
 ) -> Dict[str, Any]:
@@ -2060,7 +2089,8 @@ def nfl_separation_opportunity(
     if season:
         conditions.append("season = ?")
         params.append(int(season))
-    refused = _season_type_filter(conditions, params, "season_type", season_type, allow_all=True)
+    refused = _season_type_filter(conditions, params, "season_type", season_type,
+                                  allow_all=True, blank_means=SEPARATION_DEFAULT_SEASON_TYPE)
     if refused is not None:
         return refused
     if regression_candidate is not None:

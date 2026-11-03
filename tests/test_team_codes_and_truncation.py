@@ -294,19 +294,69 @@ class TestSeasonTypeVocabulary:
         assert not [sql for sql, _ in recorded if "season_type = ?" in sql]
 
     @pytest.mark.parametrize("name,accepted", [
-        pytest.param("nfl_search_plays", ["REG", "POST"], id="nfl_search_plays"),
-        pytest.param("nfl_team_stats", ["REG", "POST"], id="nfl_team_stats"),
-        pytest.param("nfl_player_stats", ["REG", "POST"], id="nfl_player_stats"),
-        pytest.param("nfl_compare", ["REG", "POST"], id="nfl_compare"),
-        pytest.param("nfl_ftn_charting", ["REG", "POST"], id="nfl_ftn_charting"),
-        pytest.param("nfl_schedule", ["REG", "POST", "WC", "DIV", "CON", "SB"], id="nfl_schedule"),
-        pytest.param("nfl_separation_opportunity", ["REG", "POST", "ALL"],
+        pytest.param("nfl_search_plays", tools.SEASON_TYPES, id="nfl_search_plays"),
+        pytest.param("nfl_team_stats", tools.SEASON_TYPES, id="nfl_team_stats"),
+        pytest.param("nfl_player_stats", tools.SEASON_TYPES, id="nfl_player_stats"),
+        pytest.param("nfl_compare", tools.SEASON_TYPES, id="nfl_compare"),
+        pytest.param("nfl_ftn_charting", tools.SEASON_TYPES, id="nfl_ftn_charting"),
+        pytest.param("nfl_schedule", tools.SCHEDULE_SEASON_TYPES, id="nfl_schedule"),
+        pytest.param("nfl_separation_opportunity", tools.SEPARATION_SEASON_TYPES,
                      id="nfl_separation_opportunity"),
     ])
     def test_the_schema_enum_offers_exactly_what_the_tool_accepts(self, name, accepted):
-        """A client must not be offered a value the tool refuses, nor refused one it accepts."""
+        """A client must not be offered a value the tool refuses, nor refused one it accepts.
+
+        `accepted` is the vocabulary the tool's own filter uses (nfl_mcp.tools
+        ._season_type_filter reads the same constants), not a second list typed in here. Change
+        one entry in one of those constants and this is the test that reports the schema a model
+        reads no longer matches the set the code accepts.
+        """
         tool = next(tool for tool in server.TOOLS if tool.name == name)
-        assert tool.inputSchema["properties"]["season_type"]["enum"] == accepted
+        assert tool.inputSchema["properties"]["season_type"]["enum"] == list(accepted)
+
+    def test_the_hint_on_the_tool_that_defaults_to_one_scope_says_so(self, monkeypatch):
+        """The hint told every caller to leave season_type out for every scope.
+
+        On nfl_separation_opportunity that instruction is wrong: leaving it out gives the regular
+        season, and season_type='ALL' gives both. Measured on the full database, the plain call
+        answers 198 rows and season_type='ALL' answers 234.
+        """
+        calls = _record_queries(monkeypatch)
+        result = nfl_separation_opportunity(season=2024, season_type="playoffs")
+        assert result["hint"] == ("Leaving season_type out gives REG only; pass "
+                                  "season_type='ALL' for both scopes as separate rows.")
+        assert not [sql for sql, _ in calls if "player_separation_opportunity" in sql]
+
+    def test_the_hint_elsewhere_still_offers_every_scope(self, monkeypatch):
+        """The six tools with no scope default keep the old hint, because for them it is true."""
+        _record_queries(monkeypatch)
+        result = nfl_team_stats(team="KC", season=2024, season_type="playoffs")
+        assert result["hint"] == ("Leave season_type out to get every scope this table has, "
+                                  "as separate rows.")
+
+    def test_a_blank_value_on_the_tool_that_defaults_answers_that_default(self, recorded):
+        """season_type='' and '   ' applied no filter, so the tool answered both scopes while its
+        own schema documented REG. A blank now binds the default the tool advertises."""
+        for blank in ("", "   "):
+            result = nfl_separation_opportunity(season=2024, season_type=blank)
+            assert "error" not in result, blank
+            sql, params = recorded[-1]
+            assert "season_type = ?" in sql, blank
+            assert params[-1] == tools.SEPARATION_DEFAULT_SEASON_TYPE, blank
+            recorded.clear()
+
+    def test_a_blank_value_elsewhere_still_applies_no_filter(self, recorded):
+        """For the tools whose default is no filter, a blank stays no filter."""
+        calls = {"nfl_team_stats": lambda st: nfl_team_stats(team="KC", season=2024,
+                                                             season_type=st),
+                 "nfl_schedule": lambda st: nfl_schedule(team="KC", season=2024, season_type=st)}
+        for name, call in calls.items():
+            for blank in (None, "", "   "):
+                call(blank)
+                sql = recorded[-1][0]
+                assert "season_type = ?" not in sql, (name, blank)
+                assert "game_type" not in sql.split(" WHERE ")[-1], (name, blank)
+                recorded.clear()
 
 
 class TestPlayoffFilterOnRealData:

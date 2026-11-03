@@ -1366,16 +1366,37 @@ def rebuild_derived_tables(conn: duckdb.DuckDBPyConnection, db_path: str) -> Non
     Stamps _ingest_metadata with the version these builders produce. The only
     integer columns there are row_count and season, and season stays NULL
     because the shape covers every season, so the version rides in row_count.
+
+    One transaction, stamp included. Each builder drops a table before it recreates it, so a run
+    interrupted between the two leaves the database with fewer derived tables than it started
+    with - and a reader cannot see that, because the column probe only asks about tables that are
+    still there. The review measured the result: a rebuild killed one second in had already
+    rebuilt player_separation_opportunity, so the probe passed and every guarded tool answered
+    from the still-old-shaped injury_return_curve, while `nfl-mcp rebuild --check` said stale.
+    Wrapped here, a reader sees either the whole old set of tables or the whole new one, and a
+    half-finished run leaves no stamp behind: the stamp upsert commits with the tables it
+    describes. DuckDB takes the DROP, the CREATE TABLE AS and the metadata upsert in one
+    transaction, and rolls all of them back when the connection closes without a commit, which is
+    what a killed process leaves. This function starts the transaction itself, so a caller must
+    hand it a connection with no transaction open: DuckDB refuses a nested BEGIN.
     """
     print("Rebuilding derived tables (no network)...")
     _apply_duckdb_pragmas(conn, db_path)
     _ensure_metadata_table(conn)
-    _create_aggregate_tables(conn)
-    _create_fantasy_tables(conn)
-    _create_team_records(conn)
-    _record_loaded(conn, dataset_id="derived_shape", table_name="derived_shape",
-                   loader_fn="nfl_mcp.ingest.rebuild_derived_tables",
-                   row_count=DERIVED_SHAPE_VERSION)
+    conn.begin()
+    try:
+        _create_aggregate_tables(conn)
+        _create_fantasy_tables(conn)
+        _create_team_records(conn)
+        _record_loaded(conn, dataset_id="derived_shape", table_name="derived_shape",
+                       loader_fn="nfl_mcp.ingest.rebuild_derived_tables",
+                       row_count=DERIVED_SHAPE_VERSION)
+        conn.commit()
+    except BaseException:
+        # Any exit but the commit above - an exception, a Ctrl-C, or a caller that dies - undoes
+        # every table this run touched, so the database keeps the one shape it started with.
+        conn.rollback()
+        raise
 
 
 def _create_indexes(conn: duckdb.DuckDBPyConnection):
