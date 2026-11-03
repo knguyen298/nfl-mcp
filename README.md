@@ -61,6 +61,7 @@ Notes on the updater:
 - **The updater inherits the runtime memory caps** (`512MB`, 1 thread), so raise the container memory to 2 GB if that log shows the ingest being killed.
 - **Check what a running container actually holds** with the `nfl_status` tool: `last_refreshed` reports the newest `_ingest_metadata` timestamp.
 - **Run one container per database.** Every instance keeps its own `/data` slots, so scaling out replicates both the ingest work and the storage.
+- **A new image fixes an old `/data` volume at start.** Pulling an image over a volume written by an older image keeps the existing slot, so its derived tables can predate the image. `entrypoint.sh` asks `nfl-mcp rebuild --check` before it starts the server and rebuilds locally when the answer is stale — about 1.3 s measured on a 582 MB database, no network. To land an update immediately rather than at the next scheduled window, run `docker exec <container> /update_db.sh`: it ingests into the idle slot and then swaps the symlink, and the server keeps answering from the current slot the whole time.
 
 **Publishing and pulling the image:**
 
@@ -182,6 +183,17 @@ nfl-mcp ingest --list                   # show all available dataset names
 ```
 
 Ingest is **idempotent** — re-running skips completed seasons already in the database. The current season and the static snapshot tables (rankings, players, contracts, teams) are re-fetched on every run, so run `nfl-mcp ingest` after a game week to pick up new stats. The current season is computed from today's date (the league year rolls over in March), so a new season is picked up automatically.
+
+### Rebuild options
+
+```bash
+nfl-mcp rebuild --check   # prints current or stale, exits 1 when stale, writes nothing
+nfl-mcp rebuild           # rebuilds the derived tables from the rows already loaded
+```
+
+Every `nfl-mcp ingest` run ends by rebuilding the derived tables (`team_offense_stats`, `team_defense_stats`, `situational_stats`, the `player_*` tables, `injury_return_curve`, `team_records`), so a normal refresh keeps them current. `nfl-mcp rebuild` does that step alone, with no network and no download, and it takes about a second on a full database.
+
+**If you updated from an older version:** a database ingested before the update holds the previous column shapes, and the nine tools that read those tables answer with a rebuild message rather than wrong numbers. Stop the server, run `nfl-mcp rebuild`, and start again — DuckDB takes an exclusive lock for a write, so do not run it while the server is serving the same file. In a container, run `/update_db.sh` instead, or just restart the container: `entrypoint.sh` checks the shape and rebuilds it before the server starts.
 
 ## Datasets
 

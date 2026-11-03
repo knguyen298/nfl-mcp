@@ -149,6 +149,15 @@ Each entry in `REGISTRY` is a `DatasetDef` with:
 
 The ingest loop checks `_ingest_metadata` before every dataset+season. Re-running the same ingest command is safe — already-loaded combinations are skipped. Use `--fresh` to force re-ingest.
 
+## Derived Table Shape
+
+The derived tables (`team_offense_stats`, `team_defense_stats`, `situational_stats`, `formation_effectiveness`, the five `player_*` tables, `injury_return_curve` and `team_records`) are rebuilt from rows already in the database. `nfl-mcp ingest` rebuilds them at the end of every run, whether or not any dataset was fetched, and `nfl-mcp rebuild` rebuilds them on its own with no network at all.
+
+- `nfl_mcp/ingest.py::DERIVED_SHAPE_VERSION` describes the column shape this code writes. Raise it in the same commit that changes a derived table's columns; `rebuild_derived_tables` stamps the number into `_ingest_metadata`.
+- `nfl_mcp/cli.py::rebuild` with `--check` prints `current` or `stale` and exits 0 or 1 without a write lock, so a startup probe or a health check can ask it. `entrypoint.sh` asks it before `exec nfl-mcp serve`, because a container that pulls a new image over an existing `/data` volume keeps the slot it already had.
+- A rebuild is local arithmetic, not an ingest: 1.3 s measured on a 582 MB database holding 521,905 plays. A cold ingest is still forbidden at container start — see the container section.
+- Nine tools refuse to answer from a stale shape instead of guessing: `nfl_team_stats`, `nfl_compare`, `nfl_separation_opportunity`, `nfl_team_records`, `nfl_td_luck`, `nfl_role_trend`, `nfl_drop_rate`, `nfl_contract_value` and `nfl_injury_return`. Their message names the stale table or the stamp, and gives both remedies — `nfl-mcp rebuild` with the server stopped, or `/update_db.sh` in a container. `Dockerfile` runs the same probe on the seed, so an image whose build produced the old shape fails the build.
+
 ## Team Records & Franchise Identity
 
 `franchises.py` is the single source of truth for team identity. Never map team codes by
@@ -223,7 +232,7 @@ Rules:
 
 - **Claude Desktop can't access `~/Desktop`** due to macOS sandboxing. The Claude Desktop venv must be outside Desktop — currently `~/nfl-mcp-venv`. Any code changes require `pip install --force-reinstall` into that venv.
 - **DuckDB write lock**: the server opens read-only connections. Ingest opens a write connection. Don't run ingest while the server is running against the same DB file.
-- **Player names are abbreviated** (`'P.Mahomes'`, `'T.Hill'`) and are not unique: resolve a name with `nfl_resolve_player` and filter rows by `gsis_id` (`pfr_id` in `snap_counts`), never with `ILIKE '%name%'`. A name that covers several players returns `ambiguous` plus labelled candidates. Keep `ILIKE` only as the fallback in a raw `nfl_query` over a table that has no id column.
+- **Player names are abbreviated** (`'P.Mahomes'`, `'T.Hill'`) and are not unique: `nfl_resolve_player` in `tools.py` settles a name into one player. It is an internal function and not an MCP tool, so no client calls it directly; every tool with a `player` parameter runs it before it queries and returns the resolved id with the rows. Filter rows by `gsis_id` (`pfr_id` in `snap_counts`), never with `ILIKE '%name%'`. A name that covers several players returns `ambiguous` plus labelled candidates. Keep `ILIKE` only as the fallback in a raw `nfl_query` over a table that has no id column.
 - **Team codes are historical**: `plays` and `schedules` carry the code of the era (`OAK`, `SD`, `STL`). Normalize with `franchises.canonical_team()` instead of comparing raw codes across decades, or a Raiders-through-2024 query silently returns two franchises' worth of gaps.
 - **Pre-1999 game results are not in the database**, and ESPN's archived scores for 1970–2001 are not a substitute: the Monday-night game of every week is filed `0-0` with no box score. Only ESPN's cumulative per-club record is trustworthy for those years — see `espn.py`.
 - **Boolean columns are `DOUBLE PRECISION` 0/1** in the plays table — filter with `= 1`, not `IS TRUE`.
