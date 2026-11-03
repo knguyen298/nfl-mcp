@@ -1102,67 +1102,69 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
     """),
 
     # 6. Injury return curve — post-return snap-share recovery (as % of pre-injury
-    #    baseline) at +1..+8 weeks, bucketed by normalized injury type and position.
-    ("injury_return_curve", ["injuries", "snap_counts", "players"], """
+    #    baseline) at +1..+8 weeks, grouped by the injury text as reported and position.
+    ("injury_return_curve", ["injuries", "snap_counts", "players", "schedules"], """
         WITH outs AS (
             SELECT
                 i.gsis_id,
                 pl.pfr_id,
                 i.full_name,
                 i.position,
+                i.team,
                 CAST(i.season AS INTEGER) AS season,
                 CAST(i.week AS INTEGER)   AS week,
-                LOWER(TRIM(COALESCE(i.report_primary_injury, i.practice_primary_injury))) AS injury_raw
+                TRIM(COALESCE(i.report_primary_injury, i.practice_primary_injury)) AS injury_type
             FROM injuries i
             LEFT JOIN players pl ON pl.gsis_id = i.gsis_id
             WHERE i.report_status = 'Out'
               AND i.gsis_id IS NOT NULL
               AND COALESCE(i.report_primary_injury, i.practice_primary_injury) IS NOT NULL
         ),
-        typed AS (
-            SELECT *,
-                CASE
-                    WHEN injury_raw LIKE '%hamstring%'  THEN 'hamstring'
-                    WHEN injury_raw LIKE '%knee%'       THEN 'knee'
-                    WHEN injury_raw LIKE '%ankle%'      THEN 'ankle'
-                    WHEN injury_raw LIKE '%shoulder%'   THEN 'shoulder'
-                    WHEN injury_raw LIKE '%concussion%' THEN 'concussion'
-                    WHEN injury_raw LIKE '%groin%'      THEN 'groin'
-                    WHEN injury_raw LIKE '%foot%'       THEN 'foot'
-                    WHEN injury_raw LIKE '%calf%'       THEN 'calf'
-                    WHEN injury_raw LIKE '%hip%'        THEN 'hip'
-                    WHEN injury_raw LIKE '%back%'       THEN 'back'
-                    WHEN injury_raw LIKE '%quad%'       THEN 'quadriceps'
-                    WHEN injury_raw LIKE '%achilles%'   THEN 'achilles'
-                    WHEN injury_raw LIKE '%wrist%'      THEN 'wrist'
-                    WHEN injury_raw LIKE '%hand%'       THEN 'hand'
-                    WHEN injury_raw LIKE '%elbow%'      THEN 'elbow'
-                    WHEN injury_raw LIKE '%toe%'        THEN 'toe'
-                    WHEN injury_raw LIKE '%thigh%'      THEN 'thigh'
-                    WHEN injury_raw LIKE '%neck%'       THEN 'neck'
-                    WHEN injury_raw LIKE '%rib%'        THEN 'ribs'
-                    WHEN injury_raw LIKE '%pectoral%'   THEN 'pectoral'
-                    ELSE 'other'
-                END AS injury_type
-            FROM outs
+        team_games AS (
+            -- One row per week the club actually played, numbered in order. A bye week
+            -- has no row, so it adds no gap between the games on either side of it.
+            SELECT season, team, week,
+                   ROW_NUMBER() OVER (PARTITION BY season, team ORDER BY week) AS game_no
+            FROM (
+                SELECT CAST(season AS INTEGER) AS season, away_team AS team,
+                       CAST(week AS INTEGER) AS week
+                FROM schedules
+                UNION
+                SELECT CAST(season AS INTEGER) AS season, home_team AS team,
+                       CAST(week AS INTEGER) AS week
+                FROM schedules
+            ) g
         ),
         islands AS (
-            SELECT *,
-                week - ROW_NUMBER() OVER (PARTITION BY gsis_id, season ORDER BY week) AS island
-            FROM typed
+            -- Consecutive games with no played game in between are one 'Out' spell. Team is
+            -- in the partition: game_no numbers one club's games, so a trade starts a spell.
+            SELECT o.*,
+                   tg.game_no - ROW_NUMBER() OVER (
+                       PARTITION BY o.gsis_id, o.season, o.team ORDER BY tg.game_no
+                   ) AS island
+            FROM outs o
+            JOIN team_games tg
+              ON  tg.season = o.season
+              AND tg.team   = o.team
+              AND tg.week   = o.week
         ),
         spells AS (
+            -- More than one candidate? Take the value from the latest reported week of the
+            -- spell, ties alphabetically. MODE() and ANY_VALUE() pick among ties in scan
+            -- order, which changed the row set on every build: 22 spells hold two injury
+            -- texts and 9 two positions (none hold two names or two pfr ids today).
             SELECT
                 gsis_id,
-                ANY_VALUE(pfr_id)    AS pfr_id,
-                ANY_VALUE(full_name) AS full_name,
-                ANY_VALUE(position)  AS position,
+                team,
                 season,
-                MODE(injury_type)    AS injury_type,
+                (MIN(STRUCT_PACK(w := -week, v := pfr_id))).v    AS pfr_id,
+                (MIN(STRUCT_PACK(w := -week, v := full_name))).v AS full_name,
+                (MIN(STRUCT_PACK(w := -week, v := injury_type))).v AS injury_type,
+                (MIN(STRUCT_PACK(w := -week, v := position))).v    AS position,
                 MIN(week)            AS first_out_week,
                 MAX(week)            AS last_out_week
             FROM islands
-            GROUP BY gsis_id, season, island
+            GROUP BY gsis_id, season, team, island
         ),
         baseline AS (
             SELECT

@@ -781,9 +781,11 @@ TOOLS = [
         description=(
             "PREFERRED for injury recovery / return-to-form questions. Returns post-return "
             "snap-share recovery as a percent of pre-injury baseline at +1..+8 weeks after an "
-            "'Out' spell, bucketed by normalized injury type (hamstring, knee, ankle, …) and "
-            "position. 100 = fully back to baseline usage. Use for 'how long until players "
-            "recover snaps after a hamstring injury'. Default sort is by weeks since return."
+            "'Out' spell, grouped by the reported injury text (Concussion, Hamstring, Knee, "
+            "…) and position. 100 = fully back to baseline usage. Use for 'how long until "
+            "players recover snaps after a hamstring injury'. Default sort is by weeks since "
+            "return. week_post_return counts calendar weeks, not games, so a spell that ends "
+            "before a bye has no +1 row and its first point lands at +2."
         ),
         inputSchema={
             "type": "object",
@@ -791,17 +793,15 @@ TOOLS = [
                 "injury_type": {
                     "type": "string",
                     "description": (
-                        "Normalized injury bucket (partial match). Valid buckets: hamstring, "
-                        "knee, ankle, shoulder, concussion, groin, foot, calf, hip, back, "
-                        "quadriceps, achilles, wrist, hand, elbow, toe, thigh, neck, ribs, "
-                        "pectoral, other. Specific diagnoses are mapped to these buckets "
-                        "(e.g. 'ACL' -> knee, 'hammy' -> hamstring); anything unmatched -> other."
+                        "Injury text to match, case-insensitive and partial (e.g. "
+                        "'Concussion', 'Hamstring', 'Knee'). It matches the injury as the "
+                        "report states it; there is no group list to choose from."
                     ),
                 },
                 "position": {"type": "string", "description": "Position filter (e.g. WR, RB)."},
                 "week_post_return": {
                     "type": "integer",
-                    "description": "Specific week offset after return (1–8).",
+                    "description": "Week offset after return (1–8), counted in calendar weeks.",
                 },
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
             },

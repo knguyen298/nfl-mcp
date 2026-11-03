@@ -331,7 +331,7 @@ SELECT season, team, wins, losses, ties FROM team_records WHERE season = 1972 AN
 | `nfl_separation_opportunity` | Next Gen Stats separation/YAC joined to fantasy opportunity (2016+) — flags receivers getting open but under-producing |
 | `nfl_drop_rate` | Catchable-target drop rate per receiver-season from FTN charting (2022+), plus contested targets and created receptions |
 | `nfl_contract_value` | Fantasy points per $M of average per year (APY) — best value-for-money players |
-| `nfl_injury_return` | Post-return snap-share recovery (% of pre-injury baseline) at +1..+8 weeks, by normalized injury type and position |
+| `nfl_injury_return` | Post-return snap-share recovery (% of pre-injury baseline) at +1..+8 weeks, by reported injury text and position |
 | `nfl_catalog` | List all loaded tables with row counts and last refresh time |
 
 ## Key columns in `plays`

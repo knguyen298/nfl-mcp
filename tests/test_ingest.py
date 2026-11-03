@@ -23,6 +23,7 @@ from nfl_mcp.ingest import (
     _ingest_espn_records,
     _ensure_metadata_table,
     _ESPN_RECORDS_DDL,
+    _FANTASY_TABLES,
     _ingest_generic_dataset,
     _ingest_pbp_season,
     _is_loaded,
@@ -50,6 +51,14 @@ def conn():
     _ensure_metadata_table(c)
     yield c
     c.close()
+
+
+def _curve_rows(conn) -> list:
+    """injury_return_curve as (weeks since return, avg recovery %, sample size)."""
+    return conn.execute(
+        "SELECT week_post_return, avg_snap_pct_recovery, sample_size "
+        "FROM injury_return_curve ORDER BY week_post_return"
+    ).fetchall()
 
 
 def _small_df(**cols) -> pl.DataFrame:
@@ -923,11 +932,20 @@ class TestFantasyTablesJoinById:
             "gsis_id": ["00-1", "00-1"],
             "full_name": ["Justin Jefferson", "Justin Jefferson"],
             "position": ["TE", "TE"],
+            "team": ["MIN", "MIN"],
             "season": [2024, 2024],
             "week": [3, 4],
             "report_status": ["Out", "Out"],
             "report_primary_injury": ["hamstring", "hamstring"],
             "practice_primary_injury": [None, None],
+        }), replace=True)
+        # MIN played every week 1-6 (no bye), so weeks 3 and 4 are two consecutive
+        # games and stay one spell.
+        _write_df_to_table(conn, "schedules", pl.DataFrame({
+            "season": [2024] * 6,
+            "week": [1, 2, 3, 4, 5, 6],
+            "away_team": ["MIN"] * 6,
+            "home_team": ["DET"] * 6,
         }), replace=True)
         _write_df_to_table(conn, "snap_counts", pl.DataFrame({
             "pfr_player_id": ["JeffJu00", "JeffJu00", "JeffJu00", "JeffJu00",
@@ -949,6 +967,347 @@ class TestFantasyTablesJoinById:
         # +1 is his own usage and +2 is half of it, one sample each. The old name join
         # pooled both players: it gave every bucket sample_size 2 and +2 as 62.5%.
         assert curve == [(1, 100.0, 1), (2, 50.0, 1)]
+
+
+class TestInjuryReturnCurveSpellsAndText:
+    """The curve groups by the injury text as reported, and spells follow the schedule.
+
+    The old build pushed each injury through a chain of LIKE checks, so 'Foot/Ankle'
+    became 'ankle' (ankle is checked before foot) and any text the chain did not know
+    became 'other'. It also found spells from consecutive week numbers, so a bye week
+    in the middle of an injury cut one spell into two and the phantom first half handed
+    the second half's return weeks a second sample.
+    """
+
+    @staticmethod
+    def _write_season(conn, out_rows, game_weeks=(1, 2, 3, 4, 5, 6),
+                      snaps=((1, 0.8), (2, 0.4), (5, 0.6), (6, 0.3))):
+        """One MIN tight end and the schedule around him.
+
+        out_rows: [(week, report_primary_injury, practice_primary_injury)] with
+        report_status 'Out'. game_weeks: every week MIN played, so a week missing from
+        it is a bye. snaps: the player's own snap share, 80%/40% before the injury
+        (baseline 60%) and 60%/30% after he returns.
+        """
+        _write_df_to_table(conn, "players", pl.DataFrame({
+            "gsis_id": ["00-1"], "pfr_id": ["TestTe00"],
+        }), replace=True)
+        _write_df_to_table(conn, "injuries", pl.DataFrame({
+            "gsis_id": ["00-1"] * len(out_rows),
+            "full_name": ["Test Tee"] * len(out_rows),
+            "position": ["TE"] * len(out_rows),
+            "team": ["MIN"] * len(out_rows),
+            "season": [2024] * len(out_rows),
+            "week": [w for w, _, _ in out_rows],
+            "report_status": ["Out"] * len(out_rows),
+            "report_primary_injury": [r for _, r, _ in out_rows],
+            "practice_primary_injury": [p for _, _, p in out_rows],
+        }), replace=True)
+        _write_df_to_table(conn, "schedules", pl.DataFrame({
+            "season": [2024] * len(game_weeks),
+            "week": list(game_weeks),
+            "away_team": ["MIN"] * len(game_weeks),
+            "home_team": ["DET"] * len(game_weeks),
+        }), replace=True)
+        _write_df_to_table(conn, "snap_counts", pl.DataFrame({
+            "pfr_player_id": ["TestTe00"] * len(snaps),
+            "player": ["Test Tee"] * len(snaps),
+            "team": ["MIN"] * len(snaps),
+            "season": [2024] * len(snaps),
+            "week": [w for w, _ in snaps],
+            "offense_pct": [p for _, p in snaps],
+        }), replace=True)
+
+    def test_reported_text_is_kept_and_never_becomes_a_group(self, conn):
+        self._write_season(conn, [(3, "Foot/Ankle", None), (4, "Foot/Ankle", None)])
+        _create_fantasy_tables(conn)
+
+        rows = conn.execute(
+            "SELECT injury_type, week_post_return, avg_snap_pct_recovery, sample_size "
+            "FROM injury_return_curve ORDER BY week_post_return"
+        ).fetchall()
+        # 'Foot/Ankle' is its own group. The old CASE read 'ankle' first and filed it
+        # there, and never left the reported wording anywhere at all.
+        assert {r[0] for r in rows} == {"Foot/Ankle"}
+        assert [r[1:] for r in rows] == [(1, 100.0, 1), (2, 50.0, 1)]
+
+    def test_unmatched_text_is_not_filed_under_other(self, conn):
+        self._write_season(
+            conn, [(3, None, "Not injury related - personal matter"),
+                   (4, None, "Not injury related - personal matter")],
+        )
+        _create_fantasy_tables(conn)
+
+        types = {r[0] for r in conn.execute(
+            "SELECT injury_type FROM injury_return_curve").fetchall()}
+        assert types == {"Not injury related - personal matter"}
+
+    def test_text_is_trimmed_and_keeps_its_case(self, conn):
+        self._write_season(conn, [(3, "  Knee  ", None), (4, "Knee", None)])
+        _create_fantasy_tables(conn)
+
+        types = {r[0] for r in conn.execute(
+            "SELECT injury_type FROM injury_return_curve").fetchall()}
+        assert types == {"Knee"}
+
+    def test_a_bye_week_does_not_split_a_spell(self, conn):
+        # Out weeks 3 and 5, MIN's bye in week 4: he never returned between them, so
+        # this is one spell that ends at week 5 and one return at week 6.
+        self._write_season(
+            conn,
+            [(3, "Knee", None), (5, "Knee", None)],
+            game_weeks=(1, 2, 3, 5, 6),
+            snaps=((1, 0.8), (2, 0.4), (6, 0.6)),
+        )
+        _create_fantasy_tables(conn)
+
+        # The old week-number islands also made a spell of week 3 alone, and counted
+        # the week-6 return twice (offset 1 and offset 3).
+        assert _curve_rows(conn) == [(1, 100.0, 1)]
+
+    def test_a_game_between_two_out_weeks_still_splits_the_spell(self, conn):
+        # Same Out weeks 3 and 5, but MIN played week 4 and he was back that week, so
+        # these are two spells and week 6 is the second return.
+        self._write_season(
+            conn,
+            [(3, "Knee", None), (5, "Knee", None)],
+            game_weeks=(1, 2, 3, 4, 5, 6),
+            snaps=((1, 0.8), (2, 0.4), (4, 0.6), (6, 0.6)),
+        )
+        _create_fantasy_tables(conn)
+
+        assert _curve_rows(conn) == [(1, 100.0, 2), (3, 100.0, 1)]
+
+    @staticmethod
+    def _write_tie_season(conn, out_rows, snaps=((1, 0.8), (2, 0.4), (6, 0.6))):
+        """One MIN player, one spell, and out_rows = [(week, text, position)]."""
+        _write_df_to_table(conn, "players", pl.DataFrame({
+            "gsis_id": ["00-1"], "pfr_id": ["TestTe00"],
+        }), replace=True)
+        _write_df_to_table(conn, "injuries", pl.DataFrame({
+            "gsis_id": ["00-1"] * len(out_rows),
+            "full_name": ["Test Tee"] * len(out_rows),
+            "position": [p for _, _, p in out_rows],
+            "team": ["MIN"] * len(out_rows),
+            "season": [2024] * len(out_rows),
+            "week": [w for w, _, _ in out_rows],
+            "report_status": ["Out"] * len(out_rows),
+            "report_primary_injury": [t for _, t, _ in out_rows],
+            "practice_primary_injury": [None] * len(out_rows),
+        }), replace=True)
+        _write_df_to_table(conn, "schedules", pl.DataFrame({
+            "season": [2024] * 6,
+            "week": [1, 2, 3, 4, 5, 6],
+            "away_team": ["MIN"] * 6,
+            "home_team": ["DET"] * 6,
+        }), replace=True)
+        _write_df_to_table(conn, "snap_counts", pl.DataFrame({
+            "pfr_player_id": ["TestTe00"] * len(snaps),
+            "player": ["Test Tee"] * len(snaps),
+            "team": ["MIN"] * len(snaps),
+            "season": [2024] * len(snaps),
+            "week": [w for w, _ in snaps],
+            "offense_pct": [p for _, p in snaps],
+        }), replace=True)
+
+    def _grouped(self, conn):
+        return conn.execute(
+            "SELECT injury_type, position, week_post_return, avg_snap_pct_recovery, "
+            "       sample_size FROM injury_return_curve "
+            "ORDER BY injury_type, position, week_post_return"
+        ).fetchall()
+
+    def test_a_spell_with_no_majority_text_uses_the_latest_week_and_stays_put(self, conn):
+        # Weeks 3 and 4 report different texts and different positions, so the spell holds
+        # no majority text at all and MODE() has a two-way tie to resolve.
+        self._write_tie_season(conn, [
+            (3, "Ribs", "TE"),
+            (4, "Rib", "WR"),
+        ], snaps=((1, 0.8), (2, 0.4), (5, 0.6)))
+        _create_fantasy_tables(conn)
+        first = self._grouped(conn)
+        _create_fantasy_tables(conn)
+        assert self._grouped(conn) == first
+        # Both values come from week 4, the last week he was reported Out; a remaining
+        # tie would break alphabetically.
+        assert first == [("Rib", "WR", 1, 100.0, 1)]
+
+    def test_the_latest_week_beats_the_most_frequent_text(self, conn):
+        # 'Rib' is the mode (2 rows to 1), but week 5 says 'Ribs', and that is the text the
+        # player was still out for when the spell ended.
+        self._write_tie_season(conn, [
+            (3, "Rib", "TE"),
+            (4, "Rib", "TE"),
+            (5, "Ribs", "TE"),
+        ])
+        _create_fantasy_tables(conn)
+        assert [r[0] for r in self._grouped(conn)] == ["Ribs"]
+
+
+@pytest.mark.integration
+class TestInjuryReturnCurveFromRealRows:
+    """Group E's two rules checked against rows the local database actually holds.
+
+    Both tests read the loaded database read-only and build into memory, so the
+    shared file is never written. They skip when the database is absent.
+    """
+
+    def test_every_group_is_a_reported_injury_text(self, rebuilt_db):
+        # No value in the table may be a made-up group name: each one has to equal,
+        # character for character, some injury text in the report.
+        with duckdb.connect(str(rebuilt_db), read_only=True) as src:
+            orphans = src.execute("""
+                SELECT DISTINCT c.injury_type
+                FROM injury_return_curve c
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM injuries i
+                    WHERE TRIM(COALESCE(i.report_primary_injury, i.practice_primary_injury))
+                          = c.injury_type
+                )
+            """).fetchall()
+        assert orphans == []
+
+    def test_the_table_is_identical_on_two_builds(self, rebuilt_db):
+        """Same rows every build: the real data has ties, and they must break one way.
+
+        The review found 14 spells whose injury text has no majority and 9 that carry more
+        than one position. MODE() and ANY_VALUE() read those in scan order, which gave the
+        table 762, 761, 760 and 760 rows on four builds of the old code.
+        """
+        body = next(b for name, _s, b in _FANTASY_TABLES if name == "injury_return_curve")
+        order = "ORDER BY injury_type, position, week_post_return"
+        with duckdb.connect(str(rebuilt_db), read_only=True) as src:
+            first = src.execute(f"CREATE TEMP TABLE curve_a AS {body}").execute(
+                f"SELECT * FROM curve_a {order}").fetchall()
+            second = src.execute(f"CREATE TEMP TABLE curve_b AS {body}").execute(
+                f"SELECT * FROM curve_b {order}").fetchall()
+        assert len(first) > 0
+        assert first == second
+
+    @staticmethod
+    def _spells(db, gsis_id, season):
+        """Spell boundaries for one player-season, as (team, first Out week, last).
+
+        Runs the curve's own CTEs up to `spells` and reads them back, so the test checks
+        the spelling in the table definition rather than a copy of it.
+        """
+        body = next(b for name, _s, b in _FANTASY_TABLES if name == "injury_return_curve")
+        prefix = body.split("        baseline AS (")[0].rstrip().rstrip(",")
+        with duckdb.connect(str(db), read_only=True) as src:
+            if not src.execute(
+                "SELECT COUNT(*) FROM injuries WHERE gsis_id = ? AND season = ? "
+                "AND report_status = 'Out'", [gsis_id, season],
+            ).fetchone()[0]:
+                pytest.skip(f"{gsis_id} has no 'Out' rows for {season} in this database")
+            return src.execute(
+                prefix + "\nSELECT team, first_out_week, last_out_week FROM spells "
+                         "WHERE gsis_id = ? AND season = ? ORDER BY first_out_week, team",
+                [gsis_id, season],
+            ).fetchall()
+
+    def test_a_trade_starts_a_new_spell(self, rebuilt_db):
+        """Marshon Lattimore, 2024: Out for New Orleans week 9, then Washington 10 to 12.
+
+        game_no numbers one club's games, and both clubs had their bye in week 9, so his
+        two spells happened to share an island and merged into one that ended at week 12.
+        He never went back to New Orleans, so the New Orleans spell ends at week 9.
+
+        The pin sits at the spell level: his 2024 snap share is 0.0 every week, so the
+        baseline filter (baseline_pct > 0) drops both spells out of the curve table.
+        """
+        assert self._spells(rebuilt_db, "00-0033874", 2024) == [
+            ("NO", 9, 9), ("WAS", 10, 12), ("WAS", 17, 18),
+        ]
+
+    def test_a_traded_player_whose_out_weeks_are_already_apart_stays_apart(self, rebuilt_db):
+        # Diontae Johnson, 2024: Out for Carolina week 8, traded, Out for Baltimore week 16.
+        assert self._spells(rebuilt_db, "00-0035216", 2024) == [("CAR", 8, 8), ("BAL", 16, 16)]
+
+    def test_a_player_traded_mid_season_keeps_each_club_apart(self, rebuilt_db):
+        # Sauce Gardner, 2025: Out for New York week 8, then Indianapolis 14 to 16, and
+        # again at week 18 because he was listed back in week 17.
+        assert self._spells(rebuilt_db, "00-0037190", 2025) == [
+            ("NYJ", 8, 8), ("IND", 14, 16), ("IND", 18, 18),
+        ]
+
+    def test_no_spell_carries_two_teams(self, rebuilt_db):
+        """Whole-table check: an island never mixes two clubs' game sequences."""
+        body = next(b for name, _s, b in _FANTASY_TABLES if name == "injury_return_curve")
+        prefix = body.split("        spells AS (")[0].rstrip().rstrip(",")
+        with duckdb.connect(str(rebuilt_db), read_only=True) as src:
+            mixed = src.execute(
+                prefix + "\nSELECT gsis_id, season, island FROM islands "
+                         "GROUP BY gsis_id, season, island HAVING COUNT(DISTINCT team) > 1"
+            ).fetchall()
+        assert mixed == []
+
+    def test_one_player_spell_across_a_real_bye_week(self, conn, rebuilt_db):
+        """Ashton Dulin (00-0035021), 2024: Out weeks 13 and 15, Indianapolis' bye in week 14.
+
+        His real rows go into the in-memory database and the curve is rebuilt there. The
+        filter is his id, because names in these tables are abbreviated and not unique.
+        The expectation comes from the same rows: one spell that ends at week 15, so
+        each snap week after it is measured once against the pre-injury baseline.
+        Cutting the spell at the bye (the old rule) measured those same three weeks
+        against week 13 too, at offsets 3, 4 and 5.
+        """
+        with duckdb.connect(str(rebuilt_db), read_only=True) as src:
+            injury_rows = src.execute(
+                "SELECT '00-0035021' AS gsis_id, 'Ashton Dulin' AS full_name, season, "
+                "       week, team, position, report_status, report_primary_injury, "
+                "       practice_primary_injury "
+                "FROM injuries WHERE gsis_id = '00-0035021' AND season = 2024 "
+                "ORDER BY week").fetchall()
+            snaps = src.execute(
+                "SELECT week, offense_pct FROM snap_counts "
+                "WHERE pfr_player_id = 'DuliAs00' AND season = 2024 ORDER BY week").fetchall()
+            schedule = src.execute(
+                "SELECT season, week, away_team, home_team FROM schedules "
+                "WHERE season = 2024 AND (away_team = 'IND' OR home_team = 'IND') "
+                "ORDER BY week").fetchall()
+        if not injury_rows or not snaps:
+            pytest.skip("2024 injury or snap rows not loaded")
+
+        injury_columns = ["gsis_id", "full_name", "season", "week", "team", "position",
+                          "report_status", "report_primary_injury",
+                          "practice_primary_injury"]
+        schedule_columns = ["season", "week", "away_team", "home_team"]
+        _write_df_to_table(conn, "injuries", pl.DataFrame(
+            [dict(zip(injury_columns, row)) for row in injury_rows]), replace=True)
+        _write_df_to_table(conn, "players", pl.DataFrame({
+            "gsis_id": ["00-0035021"], "pfr_id": ["DuliAs00"],
+        }), replace=True)
+        _write_df_to_table(conn, "snap_counts", pl.DataFrame({
+            "pfr_player_id": ["DuliAs00"] * len(snaps),
+            "player": ["Ashton Dulin"] * len(snaps),
+            "team": ["IND"] * len(snaps),
+            "season": [2024] * len(snaps),
+            "week": [w for w, _ in snaps],
+            "offense_pct": [p for _, p in snaps],
+        }), replace=True)
+        _write_df_to_table(conn, "schedules", pl.DataFrame(
+            [dict(zip(schedule_columns, row)) for row in schedule]), replace=True)
+        _create_fantasy_tables(conn)
+
+        out_weeks = sorted(row[3] for row in injury_rows if row[6] == "Out")
+        game_weeks = {row[1] for row in schedule}
+        first_out, last_out = min(out_weeks), max(out_weeks)
+        assert any(w not in game_weeks for w in range(first_out, last_out)), \
+            "expected a bye week inside the spell"
+
+        pre = [p for w, p in snaps if w < first_out]
+        baseline = sum(pre) / len(pre)
+        rows = _curve_rows(conn)
+        expected = sorted(
+            (w - last_out, 100.0 * pct / baseline)
+            for w, pct in snaps if last_out < w <= last_out + 8
+        )
+        assert [(w, n) for w, _, n in rows] == [(w, 1) for w, _ in expected]
+        for (_, got, _), (_, want) in zip(rows, expected):
+            assert abs(got - want) <= 0.1          # the table rounds to one decimal
+        # Each of his snap weeks back is counted once. Cut at the bye, the old rule also
+        # measured the same three weeks against week 13, so 5 samples would carry 3 weeks.
+        assert sum(n for _, _, n in rows) == len([1 for w, _ in snaps if w > last_out])
 
 
 # ── run_ingest_datasets orchestration ──────────────────────────────────────────

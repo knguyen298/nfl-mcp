@@ -1571,39 +1571,76 @@ class TestNflContractValue:
 
 
 @pytest.mark.integration
-@pytest.mark.usefixtures("require_db")
 class TestNflInjuryReturn:
-    def test_filter_by_injury_type(self):
+    """Reads injury_return_curve through the rebuilt copy (tests/conftest.py).
+
+    The shared database holds the table in the shape the ingest that built it produced,
+    with the old body-part group names, so these tests rebuild it first.
+    """
+
+    def test_filter_matches_the_reported_text_any_case(self, rebuilt_db):
+        # 'hamstring' is a partial, case-insensitive match; each row carries the text the
+        # report gave ('Hamstring'), never the old all-lowercase bucket name.
         result = nfl_injury_return(injury_type="hamstring")
         assert "error" not in result
         assert result["count"] > 0
+        names = {r["injury_type"] for r in result["injury_return"]}
+        assert all("hamstring" in name.lower() for name in names)
+        assert "hamstring" not in names
 
-    def test_default_sorted_by_week_post_return(self):
-        result = nfl_injury_return(injury_type="hamstring", position="WR")
+    def test_output_has_no_group_names_from_the_old_case(self, rebuilt_db):
+        # The whole table, not the first 500 rows of it: the table holds about 760 rows,
+        # so reading the tool at its maximum limit checked two thirds of what it can say.
+        with duckdb.connect(str(rebuilt_db), read_only=True) as src:
+            names = {r[0] for r in src.execute(
+                "SELECT DISTINCT injury_type FROM injury_return_curve").fetchall()}
+        assert names
+        for dropped in ("other", "quadriceps", "ribs", "knee", "hamstring", "ankle"):
+            assert dropped not in names
+
+    def test_example_values_named_by_the_schema_return_rows(self, rebuilt_db):
+        """Every injury text the schema offers as an example has to match something real.
+
+        The description used to offer 'Foot/Ankle', a text no injury row carries, so a
+        model that followed the example got an empty answer.
+        """
+        import re
+
+        from nfl_mcp.server import TOOLS
+        schema = next(t for t in TOOLS if t.name == "nfl_injury_return")
+        text = schema.inputSchema["properties"]["injury_type"]["description"]
+        examples = re.findall(r"'([^']+)'", text)
+        assert len(examples) >= 3
+        for example in examples:
+            result = nfl_injury_return(injury_type=example, limit=500)
+            assert result["count"] > 0, example
+
+    def test_default_sorted_by_week_post_return(self, rebuilt_db):
+        result = nfl_injury_return(injury_type="Hamstring", position="WR")
         weeks = [r["week_post_return"] for r in result["injury_return"]]
         assert weeks == sorted(weeks)
 
-    def test_filter_by_position_and_week(self):
-        result = nfl_injury_return(injury_type="knee", position="RB", week_post_return=1)
+    def test_filter_by_position_and_week(self, rebuilt_db):
+        result = nfl_injury_return(injury_type="Knee", position="RB", week_post_return=1)
         assert "error" not in result
         for r in result["injury_return"]:
             assert r["week_post_return"] == 1
 
-    def test_rows_have_expected_fields(self):
-        result = nfl_injury_return(injury_type="ankle", limit=1)
+    def test_rows_have_expected_fields(self, rebuilt_db):
+        result = nfl_injury_return(injury_type="Ankle", limit=1)
         if result["count"] > 0:
             row = result["injury_return"][0]
             for field in ("injury_type", "position", "week_post_return",
                           "avg_snap_pct_recovery", "median_snap_pct_recovery", "sample_size"):
                 assert field in row
 
-    def test_invalid_limit_falls_back(self):
-        result = nfl_injury_return(injury_type="hamstring", limit="oops")
+    def test_invalid_limit_falls_back(self, rebuilt_db):
+        result = nfl_injury_return(injury_type="Hamstring", limit="oops")
         assert "error" not in result
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):
-            result = nfl_injury_return(injury_type="hamstring")
+            result = nfl_injury_return(injury_type="Hamstring")
         assert "boom" in result["error"]
 
 

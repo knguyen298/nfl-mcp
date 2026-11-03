@@ -2147,7 +2147,7 @@ def nfl_injury_return(
     """
     Injury return curve — post-return snap-share recovery, expressed as a percent of
     each player's pre-injury baseline, at +1..+8 weeks after returning from an 'Out'
-    spell, bucketed by normalized injury type and position (injury_return_curve).
+    spell, grouped by the reported injury text and position (injury_return_curve).
     100 means fully back to baseline usage. Default sort is by weeks since return
     (week_post_return ASC). sample_size shows how many player-spells back each point.
     """
