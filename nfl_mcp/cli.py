@@ -438,9 +438,11 @@ def doctor():
             # A warning, not a failure: a rebuild cannot fill these, only a re-fetch of the seasons can.
             for row in null_columns:
                 seasons = row["seasons"]
+                advice = ("the source published them without it, so a re-fetch cannot fill it"
+                          if row["file_lacked_column"] else
+                          f"re-fetch them with 'nfl-mcp ingest --fresh --start {seasons[0]} --end {seasons[-1]}'")
                 click.secho(f"  ! {row['table_name']}.{row['column_name']} is null for every row of seasons "
-                            f"{seasons}: re-fetch them with 'nfl-mcp ingest --fresh --start {seasons[0]} "
-                            f"--end {seasons[-1]}'", fg="yellow")
+                            f"{seasons}: {advice}", fg="yellow")
             all_ok = shape_ok and status["matches_raw_rows"]
         except Exception as e:
             click.secho(f"  ✗ Database error: {e}", fg="red")

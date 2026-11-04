@@ -188,6 +188,10 @@ TOOLS = [
                     "type": "boolean",
                     "description": "Only turnover plays (INT or fumble lost)",
                 },
+                "is_scramble": {
+                    "type": "boolean",
+                    "description": "Only quarterback scrambles (qb_scramble = 1). Pair with player to count one quarterback's scrambles.",
+                },
                 "min_yards": {
                     "type": "integer",
                     "description": "Minimum yards gained",

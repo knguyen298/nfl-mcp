@@ -205,6 +205,7 @@ class TestRebuildIsOneTransaction:
         conn = duckdb.connect(":memory:")
         try:
             load_team_sources(conn, _write_df_to_table)
+            _ensure_metadata_table(conn)          # rebuild_derived_tables makes it before this builder runs
             _create_aggregate_tables(conn)        # the four probe tables, in this build's shape
             conn.execute("ALTER TABLE team_offense_stats DROP COLUMN season_type")
             assert probe_missing_season_type(conn) == ["team_offense_stats"]

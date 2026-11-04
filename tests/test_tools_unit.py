@@ -240,6 +240,27 @@ def stub_resolver(monkeypatch, identity=None):
     return player
 
 
+def test_a_resolved_player_names_the_season_club_beside_the_current_one(monkeypatch):
+    # players.latest_team says where he plays now; rosters says where he played that season.
+    stub_resolver(monkeypatch, {**RESOLVED_JEFFERSON, "team": "BAL"})
+    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [{"team": "TEN"}])
+    identity = tools._player_filter(player="Derrick Henry", season=2020)["identity"]
+    assert (identity["team"], identity["season_team"]) == ("BAL", "TEN")
+    assert identity["team_note"] == "team and label name the current club, not the club of a past season"
+
+
+@pytest.mark.parametrize("answer", [[], duckdb.CatalogException("Table with name rosters does not exist!")])
+def test_a_season_with_no_roster_row_names_no_season_club(monkeypatch, answer):
+    def fake_execute(sql, params=None):
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+    stub_resolver(monkeypatch)
+    monkeypatch.setattr(tools, "_execute", fake_execute)
+    identity = tools._player_filter(player="Justin Jefferson", season=1990)["identity"]
+    assert "season_team" not in identity and "team_note" in identity
+
+
 def test_search_plays_uses_parameterized_filters(monkeypatch):
     captured = {}
 
@@ -375,7 +396,8 @@ def test_player_stats_names_the_source_of_every_metric_it_returns(monkeypatch):
 
     assert result["source"] == tools._PLAYER_STATS_SOURCE
     assert result["unavailable"] == {}                     # this database has every column
-    assert len(calls) == 2 and "avg_cpoe" not in result["metric_sources"]  # no plays query
+    stats_calls = [c for c in calls if "FROM rosters" not in c[0]]   # the season's club is a roster read
+    assert len(stats_calls) == 2 and "avg_cpoe" not in result["metric_sources"]  # no plays query
     sql = calls[-1][0]
     assert sql.count(" AS ") == len(result["metric_sources"])   # nothing asked for goes unnamed
     assert all(f"{formula} AS {key}" in sql
@@ -533,13 +555,18 @@ def test_nfl_status_names_a_column_an_ingest_left_null(monkeypatch):
     def fake_execute(sql, params=None):
         if "_null_columns" in sql:
             return [{"table_name": "team_stats_raw", "column_name": "passing_first_downs",
-                     "seasons": [2024, 2025]}]
+                     "seasons": [2024, 2025], "file_lacked_column": False},
+                    {"table_name": "rosters", "column_name": "gsis_id",
+                     "seasons": [1966, 2001], "file_lacked_column": True}]
         return [{"built_at": None, "last_fetch": None}] if "built_at" in sql else []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
-    assert tools.nfl_status()["null_columns"] == [{
-        "table_name": "team_stats_raw", "column_name": "passing_first_downs", "seasons": [2024, 2025],
-        "remedy": "nfl-mcp ingest --fresh --start 2024 --end 2025 with the server stopped"}]
+    refetch, lacked = tools.nfl_status()["null_columns"]
+    assert refetch["remedy"] == "nfl-mcp ingest --fresh --start 2024 --end 2025 with the server stopped"
+    # The source never had the column for these seasons, so no re-fetch is offered.
+    assert "remedy" not in lacked
+    assert lacked["reason"] == ("the source published these seasons without this column; "
+                                "a re-fetch returns the same file")
 
 
 def test_nfl_status_without_a_null_columns_table_reports_none(monkeypatch):
@@ -731,6 +758,7 @@ def test_search_plays_applies_all_numeric_and_boolean_filters(monkeypatch):
         play_type="pass",
         is_touchdown=True,
         is_turnover=True,
+        is_scramble=True,
         min_yards=7,
         max_rows=999,
     )
@@ -744,6 +772,7 @@ def test_search_plays_applies_all_numeric_and_boolean_filters(monkeypatch):
     assert "play_type = ?" in captured["sql"]
     assert "touchdown = 1" in captured["sql"]
     assert "(interception = 1 OR fumble_lost = 1)" in captured["sql"]
+    assert "qb_scramble = 1" in captured["sql"]
     assert "yards_gained >= ?" in captured["sql"]
     assert "LIMIT 501" in captured["sql"]      # max_rows is capped at _MAX_ROWS
     assert captured["params"] == ["BAL", 2020, 2021, 1, "REG", "pass", 7]
@@ -858,7 +887,8 @@ def test_compare_player_blocks_come_from_one_stats_call_per_stat_type(monkeypatc
         rows = [] if stype == "rushing" else [{first: 5}]   # no rows back, no block
         return {"seasons": rows, "metric_sources": {first: f"SUM(player_stats.{first})"}}
 
-    monkeypatch.setattr(tools, "_execute", lambda *a, **k: pytest.fail(
+    # The one read allowed is _player_filter's lookup of the season's club.
+    monkeypatch.setattr(tools, "_execute", lambda sql, *a, **k: [] if "FROM rosters" in sql else pytest.fail(
         "nfl_compare must not count plays for itself any more"))
     monkeypatch.setattr(
         tools,

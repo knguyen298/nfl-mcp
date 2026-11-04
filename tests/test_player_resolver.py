@@ -630,6 +630,17 @@ class TestCollisionsThatStayOpen:
         assert stats["player"]["team"] in {row["team"] for row in stats["role_trend"]}
 
 
+class TestTheSeasonClubSitsBesideTheCurrentOne:
+    """team stays players.latest_team, which the xfail above records; season_team names the
+    club of the season asked, from rosters, so a reader need not take today's club for it."""
+
+    def test_a_historical_query_names_the_season_club(self):
+        stats = nfl_role_trend(player="Aaron Rodgers", season=2024, limit=5)
+        assert stats["role_trend"], stats
+        assert stats["player"]["season_team"] in {row["team"] for row in stats["role_trend"]}
+        assert stats["player"]["season_team"] != stats["player"]["team"]
+
+
 class TestOneLetterHeadTokenIsNeverSpelledOut:
     """Batch 2 fix 1: a head token is compared with a stored first name only when it holds
     more than one letter, so 'A.St. Brown' cannot borrow A.J. Brown's stored 'A.J.'."""

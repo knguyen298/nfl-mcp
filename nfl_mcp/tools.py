@@ -575,6 +575,16 @@ def _player_filter(
     if sql is not None and conditions is not None and params is not None:
         conditions.append(sql)
         params.extend([value] * value_count)
+    # team is players.latest_team, so Derrick Henry 2020 read BAL beside rows that were Tennessee's.
+    identity = {**identity, "team_note": "team and label name the current club, not the club of a past season"}
+    if season is not None:
+        try:
+            club = _execute("SELECT team FROM rosters WHERE gsis_id = ? AND season = ? LIMIT 1",
+                            [identity.get("gsis_id"), int(season)])
+        except duckdb.Error:      # no rosters table: say nothing rather than guess
+            club = []
+        if club and club[0].get("team"):
+            identity["season_team"] = club[0]["team"]
     return {"identity": identity}
 
 
@@ -664,8 +674,12 @@ def nfl_status() -> Dict[str, Any]:
         except duckdb.CatalogException:   # no ingest ever left a column null, so there is no table
             null_columns = []
         for row in null_columns:
-            row["remedy"] = (f"nfl-mcp ingest --fresh --start {row['seasons'][0]} --end {row['seasons'][-1]}"
-                             " with the server stopped")
+            if row["file_lacked_column"]:
+                row["reason"] = ("the source published these seasons without this column; "
+                                 "a re-fetch returns the same file")
+            else:
+                row["remedy"] = (f"nfl-mcp ingest --fresh --start {row['seasons'][0]} "
+                                 f"--end {row['seasons'][-1]} with the server stopped")
         return {
             "plays": {
                 "total_plays": total[0]["total_plays"] if total else 0,
@@ -857,6 +871,7 @@ def nfl_search_plays(
     situation: str | None = None,
     is_touchdown: bool = False,
     is_turnover: bool = False,
+    is_scramble: bool = False,
     min_yards: int | None = None,
     max_rows: int = 50,
 ) -> Dict[str, Any]:
@@ -907,6 +922,8 @@ def nfl_search_plays(
         conditions.append("touchdown = 1")
     if is_turnover:
         conditions.append("(interception = 1 OR fumble_lost = 1)")
+    if is_scramble:
+        conditions.append("qb_scramble = 1")
     if min_yards is not None:
         conditions.append("yards_gained >= ?")
         params.append(int(min_yards))
@@ -934,7 +951,7 @@ def nfl_search_plays(
                 "team": team, "opponent": opponent, "player": player, "player_id": player_id,
                 "week": week, "season_type": season_type, "play_type": play_type,
                 "situation": situation, "is_touchdown": is_touchdown, "is_turnover": is_turnover,
-                "min_yards": min_yards})[1]
+                "is_scramble": is_scramble, "min_yards": min_yards})[1]
         return _echo_player(result, identity)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)

@@ -148,6 +148,14 @@ class TestNflSearchPlays:
         assert "error" not in result
         assert result["row_count"] > 0
 
+    def test_search_scrambles_counts_one_quarterback(self):
+        # Question 28 of the suite needed raw SQL for this before the filter existed.
+        result = nfl_search_plays(player_id="00-0034796", season=2024, season_type="REG",
+                                  is_scramble=True, max_rows=500)
+        assert "error" not in result
+        assert result["row_count"] == 46
+        assert all(r["rusher_player_id"] == "00-0034796" for r in result["rows"])
+
     def test_search_situation_red_zone(self):
         result = nfl_search_plays(situation="red_zone", team="KC", season=2024, max_rows=5)
         assert "error" not in result

@@ -293,8 +293,8 @@ class TestNulledSeasonsWarning:
     def test_the_nulled_seasons_are_stored_for_the_readers(self, conn):
         conn.execute("CREATE TABLE t AS SELECT * FROM (VALUES (2024, 1), (2025, 2)) v(season, x)")
         _reconcile_schema(conn, "t", pl.DataFrame({"season": [2026], "x": [3], "first_downs": [9]}), "season")
-        assert read_null_columns(conn) == [
-            {"table_name": "t", "column_name": "first_downs", "seasons": [2024, 2025]}]
+        assert read_null_columns(conn) == [{"table_name": "t", "column_name": "first_downs",
+                                            "seasons": [2024, 2025], "file_lacked_column": False}]
 
     def test_a_re_fetched_season_clears_only_its_own_note(self, conn):
         conn.execute("CREATE TABLE t AS SELECT * FROM (VALUES (2024, 1), (2025, 2)) v(season, x)")
@@ -302,8 +302,34 @@ class TestNulledSeasonsWarning:
         # A 2024 re-fetch that carries the column fills it for 2024; one that does not, does not.
         _reconcile_schema(conn, "t", pl.DataFrame({"season": [2025], "x": [2]}), "season", 2025)
         _reconcile_schema(conn, "t", pl.DataFrame({"season": [2024], "first_downs": [5]}), "season", 2024)
+        assert read_null_columns(conn) == [{"table_name": "t", "column_name": "first_downs",
+                                            "seasons": [2025], "file_lacked_column": False}]
+
+    def test_a_season_this_run_loaded_is_kept_apart_from_an_earlier_one(self, conn, capsys):
+        # 2024 came from an earlier run; 2025 from this one, from a file that had no first_downs.
+        conn.execute("CREATE TABLE t AS SELECT * FROM (VALUES (2024, 1), (2025, 2)) v(season, x)")
+        _record_loaded(conn, "t", "t", "load_t", 1, 2024)
+        conn.execute("UPDATE _ingest_metadata SET loaded_at = loaded_at - INTERVAL 1 DAY")
+        conn.execute("SET VARIABLE ingest_started_at = now()::TIMESTAMP - INTERVAL 1 HOUR")
+        _record_loaded(conn, "t", "t", "load_t", 1, 2025)
+        _reconcile_schema(conn, "t", pl.DataFrame({"season": [2026], "x": [3], "first_downs": [9]}), "season")
+        assert ("null for every row of seasons [2024, 2025]; the source published [2025] without it; "
+                "re-fetch [2024] with --fresh --start/--end") in capsys.readouterr().out
         assert read_null_columns(conn) == [
-            {"table_name": "t", "column_name": "first_downs", "seasons": [2025]}]
+            {"table_name": "t", "column_name": "first_downs", "seasons": [2024], "file_lacked_column": False},
+            {"table_name": "t", "column_name": "first_downs", "seasons": [2025], "file_lacked_column": True}]
+
+    def test_an_older_release_table_gains_the_column_and_still_reads(self):
+        c = duckdb.connect(":memory:")       # no _ingest_metadata either, so no season counts as this run's
+        c.execute("CREATE TABLE _null_columns (table_name VARCHAR NOT NULL, column_name VARCHAR NOT NULL, "
+                  "season INTEGER NOT NULL, seen_at TIMESTAMP NOT NULL)")
+        c.execute("INSERT INTO _null_columns VALUES ('t', 'old_col', 2020, now())")
+        assert read_null_columns(c) == [
+            {"table_name": "t", "column_name": "old_col", "seasons": [2020], "file_lacked_column": None}]
+        c.execute("CREATE TABLE t AS SELECT 2020 AS season")
+        _reconcile_schema(c, "t", pl.DataFrame({"season": [2026], "new_col": [1]}), "season")
+        assert read_null_columns(c)[0]["file_lacked_column"] is False
+        assert read_null_columns(c)[1]["file_lacked_column"] is None
 
     def test_nothing_null_reads_empty(self, conn):
         conn.execute("CREATE TABLE t AS SELECT 2024 AS season, 1 AS x")
@@ -883,6 +909,11 @@ class TestAggregateAndIndexBuilders:
         ).fetchall()}
         assert {"team_offense_stats", "team_defense_stats",
                 "situational_stats", "formation_effectiveness"} <= created
+        # nfl_catalog reads _ingest_metadata, so each table needs a row there to be listed.
+        recorded = {r[0] for r in conn.execute(
+            "SELECT table_name FROM _ingest_metadata WHERE loader_fn = 'derived'").fetchall()}
+        assert recorded == {"team_offense_stats", "team_defense_stats",
+                            "situational_stats", "formation_effectiveness"}
 
     def test_aggregate_tables_are_skipped_without_plays(self, conn):
         _create_aggregate_tables(conn)  # should not raise

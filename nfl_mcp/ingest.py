@@ -300,34 +300,49 @@ def _reconcile_schema(conn: duckdb.DuckDBPyConnection, table: str, df: pl.DataFr
             nulled = [r[0] for r in conn.execute(
                 f'SELECT DISTINCT {season_sql} FROM "{table}" ORDER BY 1').fetchall()]
             if nulled:
-                print(f"    WARNING: null for every row of seasons {nulled}; "
-                      "re-fetch them with --fresh --start/--end")
+                # A season this run already loaded came from a file without the column, so a
+                # re-fetch returns the same file. One from an earlier run may have been filled since.
+                same_run = {r[0] for r in conn.execute(
+                    "SELECT season FROM _ingest_metadata WHERE table_name = ? "
+                    "AND loaded_at >= getvariable('ingest_started_at')", [table]).fetchall()
+                } if _table_exists(conn, "_ingest_metadata") else set()
+                lacked = [s for s in nulled if s in same_run]
+                refetch = [s for s in nulled if s not in same_run]
+                print(f"    WARNING: null for every row of seasons {nulled}"
+                      + (f"; the source published {lacked} without it" if lacked else "")
+                      + (f"; re-fetch {refetch} with --fresh --start/--end" if refetch else ""))
                 conn.execute(_NULL_COLUMNS_DDL)
                 now = datetime.datetime.now(datetime.timezone.utc)
-                conn.executemany("INSERT INTO _null_columns VALUES (?, ?, ?, ?)",
-                                 [[table, name, s, now] for name, _ in added for s in nulled])
+                conn.executemany("INSERT INTO _null_columns BY NAME SELECT ? AS table_name, ? AS column_name, "
+                                 "? AS season, ? AS seen_at, ? AS file_lacked_column",
+                                 [[table, name, s, now, s in same_run] for name, _ in added for s in nulled])
 
 
 # Columns an ingest added while older seasons stayed in the table, so they read null there. Created
-# on first use: a database that never drifted has no such table.
+# on first use: a database that never drifted has no such table. file_lacked_column is true when the
+# season was loaded in the run that added the column, and null in a table an older release wrote.
 _NULL_COLUMNS_DDL = """
     CREATE TABLE IF NOT EXISTS _null_columns (
         table_name  VARCHAR NOT NULL,
         column_name VARCHAR NOT NULL,
         season      INTEGER NOT NULL,
         seen_at     TIMESTAMP NOT NULL
-    )
+    );
+    ALTER TABLE _null_columns ADD COLUMN IF NOT EXISTS file_lacked_column BOOLEAN
 """
-_NULL_COLUMNS_SQL = ("SELECT table_name, column_name, LIST(season ORDER BY season) AS seasons "
-                     "FROM _null_columns GROUP BY table_name, column_name ORDER BY table_name, column_name")
+# Read through to_json so a read-only reader of an older release's table, which has no
+# file_lacked_column, gets null instead of a binder error.
+_NULL_COLUMNS_SQL = ("SELECT table_name, column_name, LIST(season ORDER BY season) AS seasons, "
+                     "(to_json(n)->>'file_lacked_column')::BOOLEAN AS file_lacked_column "
+                     "FROM _null_columns n GROUP BY ALL ORDER BY table_name, column_name, file_lacked_column")
 
 
 def read_null_columns(conn: duckdb.DuckDBPyConnection) -> list[dict]:
-    """What _null_columns holds, one entry per column; empty when the table does not exist."""
+    """What _null_columns holds, one entry per column and kind; empty when the table does not exist."""
     if not _table_exists(conn, "_null_columns"):
         return []
-    return [{"table_name": t, "column_name": c, "seasons": list(s)}
-            for t, c, s in conn.execute(_NULL_COLUMNS_SQL).fetchall()]
+    return [{"table_name": t, "column_name": c, "seasons": list(s), "file_lacked_column": f}
+            for t, c, s, f in conn.execute(_NULL_COLUMNS_SQL).fetchall()]
 
 
 # ── PBP ingestion (season-by-season with enhanced_description) ─────────────────
@@ -717,6 +732,9 @@ def _points_cte(conn: duckdb.DuckDBPyConnection) -> str:
             f" WHERE pts IS NOT NULL GROUP BY 1, 2, 3)")
 
 
+_AGGREGATE_TABLES = ["team_offense_stats", "team_defense_stats", "situational_stats", "formation_effectiveness"]
+
+
 def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
     """Build the derived team tables from plays, the week-level team box, and the schedule.
 
@@ -729,8 +747,7 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
         print("    plays not loaded yet, skipping")
         return
 
-    for table in ["team_offense_stats", "team_defense_stats",
-                  "situational_stats", "formation_effectiveness"]:
+    for table in _AGGREGATE_TABLES:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
 
     box, opp, points = _box_cte(conn), _opp_box_cte(conn), _points_cte(conn)
@@ -978,6 +995,10 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
     """)
     print("    formation_effectiveness ✓")
 
+    # A 'derived' row per table, like the fantasy tables, so nfl_catalog lists them.
+    for table in _AGGREGATE_TABLES:
+        row_count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchall()[0][0]
+        _record_loaded(conn, table, table, "derived", row_count, season=None)
     print("  Aggregate tables done")
 
 
@@ -1654,6 +1675,9 @@ def run_ingest_datasets(
     _apply_duckdb_pragmas(conn, path)
 
     _ensure_metadata_table(conn)
+    # _reconcile_schema compares loaded_at with this to tell a season this run fetched.
+    # Both are wall-clock times in the session time zone, which is how loaded_at stores its value.
+    conn.execute("SET VARIABLE ingest_started_at = now()::TIMESTAMP")
     _failed_fetches.clear()
 
     pbp_ingested = 0

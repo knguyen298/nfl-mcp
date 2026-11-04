@@ -614,6 +614,7 @@ class TestDoctorCommand:
         self._stamped_db(db_path, fetched_after_build=False)
         conn = duckdb.connect(str(db_path))
         _reconcile_schema(conn, "plays", pl.DataFrame({"season": [2025], "first_downs": [9]}), "season")
+        conn.execute("INSERT INTO _null_columns VALUES ('plays', 'first_downs', 2023, now(), true)")
         conn.close()
         monkeypatch.setattr("nfl_mcp.config.config_exists", lambda: True)
         monkeypatch.setattr("nfl_mcp.config.get_duckdb_path", lambda: db_path)
@@ -624,6 +625,8 @@ class TestDoctorCommand:
         assert result.exit_code == 0
         assert ("! plays.first_downs is null for every row of seasons [2024]: re-fetch them with "
                 "'nfl-mcp ingest --fresh --start 2024 --end 2024'") in result.output
+        assert ("! plays.first_downs is null for every row of seasons [2023]: the source published them "
+                "without it, so a re-fetch cannot fill it") in result.output
         # A rebuild cannot fill the column, so the updater must still be able to swap.
         monkeypatch.setenv("NFL_MCP_DB_PATH", str(db_path))
         check = runner.invoke(main, ["rebuild", "--check"])
