@@ -12,6 +12,7 @@ import duckdb
 import pytest
 from click.testing import CliRunner
 
+from nfl_mcp import ingest
 from nfl_mcp.ingest import (
     _PROBE_TABLES,
     DERIVED_SHAPE_VERSION,
@@ -401,5 +402,61 @@ class TestIngestStampsTheShape:
         try:
             assert shape_stamp(conn) == DERIVED_SHAPE_VERSION
             assert not derived_shape_is_stale(conn)
+        finally:
+            conn.close()
+
+
+class TestRebuildPragmas:
+    """The rebuild must not set DuckDB's caps on a connection that already carries them.
+
+    A container runs with NFL_MCP_DUCKDB_MEMORY_LIMIT=512MB, so a full ingest spills into
+    /data/.duckdb_spill, and DuckDB then refuses a second SET temp_directory. The tail call
+    that stamps the shape used to set the caps again, and a 4 November `ingest --fresh` died
+    there after downloading everything: 'Cannot switch temporary directory after the current
+    one has been used', which under set -eu also meant update_db.sh never swapped the slot.
+    """
+
+    @staticmethod
+    def _stub_builders(monkeypatch):
+        monkeypatch.setattr(ingest, "_create_aggregate_tables", lambda c: None)
+        monkeypatch.setattr(ingest, "_create_fantasy_tables", lambda c: None)
+        monkeypatch.setattr(ingest, "_create_team_records", lambda c: None)
+
+    def test_a_caller_that_already_set_the_caps_is_not_asked_again(self, monkeypatch, tmp_path):
+        applied = []
+        self._stub_builders(monkeypatch)
+        monkeypatch.setattr(ingest, "_apply_duckdb_pragmas", lambda c, p: applied.append(p))
+        conn = duckdb.connect(":memory:")
+        try:
+            ingest.rebuild_derived_tables(conn, str(tmp_path / "x.duckdb"), apply_pragmas=False)
+        finally:
+            conn.close()
+        assert applied == []
+
+    def test_a_rebuild_that_owns_the_connection_still_sets_the_caps(self, monkeypatch, tmp_path):
+        applied = []
+        self._stub_builders(monkeypatch)
+        monkeypatch.setattr(ingest, "_apply_duckdb_pragmas", lambda c, p: applied.append(p))
+        conn = duckdb.connect(":memory:")
+        try:
+            ingest.rebuild_derived_tables(conn, str(tmp_path / "x.duckdb"))
+        finally:
+            conn.close()
+        assert applied == [str(tmp_path / "x.duckdb")]
+
+    def test_duckdb_refuses_a_second_temp_directory_once_it_has_spilled(self, tmp_path):
+        # The reason the flag exists, measured here rather than quoted from the container.
+        spill_a, spill_b = tmp_path / "spill_a", tmp_path / "spill_b"
+        spill_a.mkdir()
+        conn = duckdb.connect(str(tmp_path / "spill.duckdb"))
+        try:
+            conn.execute("SET memory_limit='24MB'")
+            conn.execute(f"SET temp_directory='{spill_a}'")
+            conn.execute("SET preserve_insertion_order=false")
+            conn.execute("CREATE OR REPLACE TABLE big AS SELECT i, i % 101 k FROM range(5000000) t(i)")
+            conn.execute("SELECT count(*) FROM (SELECT * FROM big ORDER BY k DESC)").fetchall()
+            assert list(spill_a.iterdir()), "the sort did not spill, so this test proves nothing"
+            with pytest.raises(duckdb.Error, match="temporary directory"):
+                conn.execute(f"SET temp_directory='{spill_b}'")
         finally:
             conn.close()

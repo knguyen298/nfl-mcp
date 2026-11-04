@@ -1354,7 +1354,7 @@ class TestRunIngestOrchestration:
         monkeypatch.setattr("nfl_mcp.ingest._create_indexes", lambda c: calls.__setitem__("idx", calls["idx"] + 1))
         monkeypatch.setattr(
             "nfl_mcp.ingest.rebuild_derived_tables",
-            lambda c, p: calls.__setitem__("rebuild", calls.get("rebuild", 0) + 1),
+            lambda c, p=None, **kw: calls.__setitem__("rebuild", calls.get("rebuild", 0) + 1),
         )
         monkeypatch.setattr(
             "nfl_mcp.ingest._ingest_generic_dataset",
@@ -1393,7 +1393,7 @@ class TestRunIngestOrchestration:
         monkeypatch.setattr("nfl_mcp.ingest._ingest_pbp_season", lambda c, season: pbp_calls.append(season) or 1)
         monkeypatch.setattr("nfl_mcp.ingest._create_indexes", lambda c: None)
         monkeypatch.setattr("nfl_mcp.ingest.rebuild_derived_tables",
-                            lambda c, p: agg_calls.append(True))
+                            lambda c, p=None, **kw: agg_calls.append(True))
 
         run_ingest_datasets(
             dataset_ids=["pbp"],
@@ -1422,7 +1422,7 @@ class TestRunIngestOrchestration:
         monkeypatch.setattr("nfl_mcp.ingest._create_aggregate_tables", lambda c: None)
         monkeypatch.setattr("nfl_mcp.ingest._create_fantasy_tables", lambda c: None)
         monkeypatch.setattr("nfl_mcp.ingest._create_team_records", lambda c: None)
-        monkeypatch.setattr("nfl_mcp.ingest.rebuild_derived_tables", lambda c, p: None)
+        monkeypatch.setattr("nfl_mcp.ingest.rebuild_derived_tables", lambda c, p=None, **kw: None)
 
         run_ingest_datasets(
             dataset_ids=["schedules"],

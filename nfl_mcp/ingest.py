@@ -1360,7 +1360,8 @@ def probe_missing_season_type(conn: duckdb.DuckDBPyConnection) -> list[str]:
     return [str(row[0]) for row in conn.execute(_SHAPE_PROBE_SQL, _PROBE_PARAMS).fetchall()]
 
 
-def rebuild_derived_tables(conn: duckdb.DuckDBPyConnection, db_path: str) -> None:
+def rebuild_derived_tables(conn: duckdb.DuckDBPyConnection, db_path: str, *,
+                           apply_pragmas: bool = True) -> None:
     """Rebuild every derived table from rows already in the database: no network.
 
     Stamps _ingest_metadata with the version these builders produce. The only
@@ -1381,7 +1382,12 @@ def rebuild_derived_tables(conn: duckdb.DuckDBPyConnection, db_path: str) -> Non
     hand it a connection with no transaction open: DuckDB refuses a nested BEGIN.
     """
     print("Rebuilding derived tables (no network)...")
-    _apply_duckdb_pragmas(conn, db_path)
+    if apply_pragmas:
+        # A caller that opened this connection already set the caps. Re-setting temp_directory is not
+        # merely redundant: once DuckDB has spilled into the directory, SET temp_directory fails with
+        # 'Cannot switch temporary directory after the current one has been used'. A full ingest inside
+        # the container's 512MB cap spills, so a rebuild at the end of that run must pass False.
+        _apply_duckdb_pragmas(conn, db_path)
     _ensure_metadata_table(conn)
     conn.begin()
     try:
@@ -1538,7 +1544,10 @@ def run_ingest_datasets(
         # them here means a run that ingests those two is reflected in the same run. This call also
         # stamps DERIVED_SHAPE_VERSION, so a database that a plain ingest has just refreshed answers
         # `nfl-mcp rebuild --check` as current instead of asking for a rebuild it no longer needs.
-        rebuild_derived_tables(conn, path)
+        # apply_pragmas=False because this connection got its caps at line 1463 and the ingest has
+        # probably spilled by now: DuckDB refuses a second SET temp_directory once the first one has
+        # been used, and a container capped at 512MB crashed on exactly that after a full --fresh run.
+        rebuild_derived_tables(conn, path, apply_pragmas=False)
 
     conn.close()
     print("\n" + "=" * 60)
