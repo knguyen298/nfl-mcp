@@ -315,7 +315,9 @@ def _sim(tmp_path, *, with_seed=True, existing_baked=False):
     (bin_dir / "nfl-mcp").write_text(_NFL_MCP_STUB)
     (bin_dir / "supercronic").write_text('#!/bin/sh\necho "[stub supercronic]"\n')
     # update_db.sh's row check; tests below run the real snippet against real DuckDB files.
-    (bin_dir / "python").write_text('#!/bin/sh\nexit "${STUB_ROWS_EXIT:-0}"\n')
+    (bin_dir / "python").write_text(
+        '#!/bin/sh\nif [ -n "${STUB_ROWS_ERR:-}" ]; then echo "$STUB_ROWS_ERR" >&2; fi\nexit "${STUB_ROWS_EXIT:-0}"\n'
+    )
     for tool in ("nfl-mcp", "supercronic", "python"):
         (bin_dir / tool).chmod(0o755)
 
@@ -409,10 +411,10 @@ class TestContainerLifecycle:
         _run(entrypoint, bin_dir)
         assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
 
-    def _refused_update(self, tmp_path, stub_var):
+    def _refused_update(self, tmp_path, stub_var, code="1", **extra):
         entrypoint, updater, data, bin_dir = _sim(tmp_path)
         _run(entrypoint, bin_dir)
-        env = {**_child_env(bin_dir), stub_var: "1"}
+        env = {**_child_env(bin_dir), stub_var: code, **extra}
         result = subprocess.run(["sh", str(updater)], capture_output=True, text=True, env=env, check=False)
 
         assert result.returncode != 0
@@ -424,7 +426,17 @@ class TestContainerLifecycle:
         assert "ingest failed or missed a fetch" in self._refused_update(tmp_path, "STUB_INGEST_EXIT")
 
     def test_updater_keeps_the_live_slot_when_the_target_has_no_rows(self, tmp_path):
-        assert "has no rows in plays or team_offense_stats" in self._refused_update(tmp_path, "STUB_ROWS_EXIT")
+        out = self._refused_update(tmp_path, "STUB_ROWS_EXIT", "3")
+        assert "has no rows in plays or team_offense_stats" in out
+        assert "row check" not in out
+
+    def test_a_failed_row_check_names_its_own_error_not_empty_tables(self, tmp_path):
+        out = self._refused_update(
+            tmp_path, "STUB_ROWS_EXIT", STUB_ROWS_ERR="ModuleNotFoundError: No module named 'duckdb'"
+        )
+        assert "row check on" in out and "failed (exit 1)" in out
+        assert "No module named 'duckdb'" in out
+        assert "has no rows" not in out
 
     def test_updater_keeps_the_live_slot_when_the_target_is_stale(self, tmp_path):
         assert "derived tables in" in self._refused_update(tmp_path, "STUB_REBUILD_EXIT")
@@ -442,8 +454,8 @@ class TestContainerLifecycle:
 
         codes = [subprocess.run([sys.executable, "-c", snippet, p], capture_output=True, check=False).returncode
                  for p in (full, empty, missing)]
-        assert codes[0] == 0
-        assert codes[1] != 0 and codes[2] != 0
+        # 3 means empty; a missing table is a failed check, which the updater reports apart.
+        assert codes == [0, 3, 1]
 
     def test_updater_refuses_to_run_without_the_symlink(self, tmp_path):
         _, updater, data, bin_dir = _sim(tmp_path)

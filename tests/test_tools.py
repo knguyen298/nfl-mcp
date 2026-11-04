@@ -1794,6 +1794,12 @@ class TestInputValidation:
         assert "error" in result
 
 
+def _records_read(execute):
+    """The last query an empty nfl_team_records answer ran, before the season span it reads to
+    explain itself (nfl_mcp.tools._coverage_reason)."""
+    return [c[0] for c in execute.call_args_list if "AS lo" not in c[0][0]][-1]
+
+
 class TestNflTeamRecords:
     """Unit tests — franchise availability and query building, no database needed."""
 
@@ -1808,7 +1814,7 @@ class TestNflTeamRecords:
     def test_historical_codes_resolve_to_the_current_franchise(self):
         with patch("nfl_mcp.tools._execute", return_value=[]) as execute:
             nfl_team_records(team="OAK", season=2019)
-        assert execute.call_args[0][1] == ["LV", 2019]
+        assert _records_read(execute)[1] == ["LV", 2019]
 
     def test_franchise_that_did_not_exist_yet(self):
         with patch("nfl_mcp.tools._execute", side_effect=AssertionError("no DB hit")):
@@ -1852,14 +1858,14 @@ class TestNflTeamRecords:
     def test_range_filters_are_passed_as_parameters(self):
         with patch("nfl_mcp.tools._execute", return_value=[]) as execute:
             nfl_team_records(team="LV", from_season=1970, to_season=1980)
-        sql, params = execute.call_args[0]
+        sql, params = _records_read(execute)
         assert "season >= ?" in sql and "season <= ?" in sql
         assert params == ["LV", 1970, 1980]
 
     def test_all_teams_in_one_season_has_no_team_filter(self):
         with patch("nfl_mcp.tools._execute", return_value=[]) as execute:
             nfl_team_records(season=2024)
-        sql, params = execute.call_args[0]
+        sql, params = _records_read(execute)
         assert "team = ?" not in sql
         assert params == [2024]
 

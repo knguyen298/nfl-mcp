@@ -44,10 +44,17 @@ if ! NFL_MCP_DB_PATH="$TARGET" nfl-mcp ingest; then
     exit 1
 fi
 
-# Check the slot before it goes live. Exit 1 when either table is missing or empty.
-ROWS_CHECK="import duckdb,sys; c=duckdb.connect(sys.argv[1],read_only=True); sys.exit(0 if all(c.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0] for t in ('plays','team_offense_stats')) else 1)"
-if ! python -c "$ROWS_CHECK" "$TARGET"; then
+# Check the slot before it goes live. Exit 3 when either table is empty; any other
+# non-zero exit means the check itself failed (no duckdb, a missing table, a bad file).
+ROWS_CHECK="import duckdb,sys; c=duckdb.connect(sys.argv[1],read_only=True); sys.exit(0 if all(c.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0] for t in ('plays','team_offense_stats')) else 3)"
+ROWS_STATUS=0
+ROWS_OUT=$(python -c "$ROWS_CHECK" "$TARGET" 2>&1) || ROWS_STATUS=$?
+if [ "$ROWS_STATUS" -eq 3 ]; then
     echo "[$(date -u)] ERROR: $TARGET has no rows in plays or team_offense_stats. Keeping $CURRENT live."
+    exit 1
+elif [ "$ROWS_STATUS" -ne 0 ]; then
+    echo "[$(date -u)] ERROR: the row check on $TARGET failed (exit $ROWS_STATUS): $ROWS_OUT"
+    echo "[$(date -u)] Keeping $CURRENT live."
     exit 1
 fi
 if ! NFL_MCP_DB_PATH="$TARGET" nfl-mcp rebuild --check; then

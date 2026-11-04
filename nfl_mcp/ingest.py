@@ -269,13 +269,20 @@ def _build_enhanced_description(row: dict) -> str:
 
 
 def _reconcile_schema(conn: duckdb.DuckDBPyConnection, table: str, df: pl.DataFrame,
-                      season_sql: str | None = None) -> None:
+                      season_sql: str | None = None, season: int | None = None) -> None:
     """Add any new incoming columns to an existing table before insert-by-name.
 
     With season_sql, also name the seasons already in the table: the new columns are null for every
     one of them until it is fetched again. A one-season re-ingest after team_stats_raw gained
     passing_first_downs read Kansas City 2024 at 131 first downs instead of 350.
+
+    Those seasons go into _null_columns as well, so nfl_status and `nfl-mcp doctor` still say so
+    after the ingest output is gone. `season` is the one being written now: the columns its rows
+    carry are filled for it, so its notes go.
     """
+    if season is not None and _table_exists(conn, "_null_columns"):
+        conn.execute("DELETE FROM _null_columns WHERE table_name = ? AND season = ? "
+                     "AND list_contains(?, column_name)", [table, season, list(df.columns)])
     existing_rows = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
     existing_cols = {row[1] for row in existing_rows}
 
@@ -285,16 +292,42 @@ def _reconcile_schema(conn: duckdb.DuckDBPyConnection, table: str, df: pl.DataFr
             continue
         duck_type = _duckdb_type_for_polars(dtype)
         conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col_name}" {duck_type}')
-        added.append(f"{col_name} ({duck_type})")
+        added.append((col_name, duck_type))
 
     if added:
-        print(f"    Schema drift: added {', '.join(added)}")
+        print(f"    Schema drift: added {', '.join(f'{name} ({kind})' for name, kind in added)}")
         if season_sql:
             nulled = [r[0] for r in conn.execute(
                 f'SELECT DISTINCT {season_sql} FROM "{table}" ORDER BY 1').fetchall()]
             if nulled:
                 print(f"    WARNING: null for every row of seasons {nulled}; "
                       "re-fetch them with --fresh --start/--end")
+                conn.execute(_NULL_COLUMNS_DDL)
+                now = datetime.datetime.now(datetime.timezone.utc)
+                conn.executemany("INSERT INTO _null_columns VALUES (?, ?, ?, ?)",
+                                 [[table, name, s, now] for name, _ in added for s in nulled])
+
+
+# Columns an ingest added while older seasons stayed in the table, so they read null there. Created
+# on first use: a database that never drifted has no such table.
+_NULL_COLUMNS_DDL = """
+    CREATE TABLE IF NOT EXISTS _null_columns (
+        table_name  VARCHAR NOT NULL,
+        column_name VARCHAR NOT NULL,
+        season      INTEGER NOT NULL,
+        seen_at     TIMESTAMP NOT NULL
+    )
+"""
+_NULL_COLUMNS_SQL = ("SELECT table_name, column_name, LIST(season ORDER BY season) AS seasons "
+                     "FROM _null_columns GROUP BY table_name, column_name ORDER BY table_name, column_name")
+
+
+def read_null_columns(conn: duckdb.DuckDBPyConnection) -> list[dict]:
+    """What _null_columns holds, one entry per column; empty when the table does not exist."""
+    if not _table_exists(conn, "_null_columns"):
+        return []
+    return [{"table_name": t, "column_name": c, "seasons": list(s)}
+            for t, c, s in conn.execute(_NULL_COLUMNS_SQL).fetchall()]
 
 
 # ── PBP ingestion (season-by-season with enhanced_description) ─────────────────
@@ -348,7 +381,7 @@ def _ingest_pbp_season(conn: duckdb.DuckDBPyConnection, season: int) -> int:
     # Replace, not append: the fetch above succeeded, so it is safe to drop the stale
     # copy of this season (a partial in-progress season, or a --fresh re-run).
     conn.execute("DELETE FROM plays WHERE season = ?", [season])
-    _reconcile_schema(conn, "plays", df, "season")
+    _reconcile_schema(conn, "plays", df, "season", season)
     conn.register("_ingest_df", df.to_arrow())
     conn.execute("INSERT INTO plays BY NAME SELECT * FROM _ingest_df")
     conn.unregister("_ingest_df")
@@ -364,6 +397,7 @@ def _write_df_to_table(
     df: pl.DataFrame,
     replace: bool = False,
     season_sql: str | None = None,
+    season: int | None = None,
 ) -> None:
     """Create or append df into a DuckDB table."""
     if replace:
@@ -373,7 +407,7 @@ def _write_df_to_table(
     exists = _table_exists(conn, table)
     conn.register("_load_df", df.to_arrow())
     if exists:
-        _reconcile_schema(conn, table, df, season_sql)
+        _reconcile_schema(conn, table, df, season_sql, season)
         conn.execute(f"INSERT INTO {table} BY NAME SELECT * FROM _load_df")
     else:
         conn.execute(f"CREATE TABLE {table} AS SELECT * FROM _load_df")
@@ -449,7 +483,7 @@ def _ingest_generic_dataset(
             with _one_transaction(conn):
                 if _table_exists(conn, table):
                     conn.execute(f"DELETE FROM {table} WHERE {dataset_def.season_sql} = ?", [season])
-                _write_df_to_table(conn, table, df, season_sql=dataset_def.season_sql)
+                _write_df_to_table(conn, table, df, season_sql=dataset_def.season_sql, season=season)
                 _record_loaded(conn, dataset_def.dataset_id, table, dataset_def.loader_fn, len(df), season)
             total_rows += len(df)
             print(f"    {len(df):,} rows inserted")

@@ -339,11 +339,14 @@ def _reversed_range(low_name: str, low: int | None, high_name: str, high: int | 
 
 
 def _coverage_reason(table: str, season: int | None = None, season_from: int | None = None,
-                     season_to: int | None = None, column: str = "season") -> tuple[bool, str]:
+                     season_to: int | None = None, column: str = "season",
+                     filters: dict[str, Any] | None = None) -> tuple[bool, str]:
     """Say why a read of `table` came back empty: what was asked, what the table holds, what to change.
 
     The first value is True when the seasons asked for lie outside what the table holds, the
     case where a list of other names or an empty list is a wrong answer rather than a thin one.
+    `filters` are the caller's other filters; a value of None, False or '' was not applied, and
+    the rest are named when the seasons are inside the span, because then they emptied the answer.
     """
     if season is not None:
         asked = f"season {season}"
@@ -368,7 +371,11 @@ def _coverage_reason(table: str, season: int | None = None, season_from: int | N
     if outside:
         return True, (f"No {table} rows for {asked}. {held} Ask for a season in that range, or "
                       "load the seasons you need with `nfl-mcp ingest --start <first> --end <last>`.")
-    return False, f"No {table} rows match these filters for {asked}. {held} Loosen the other filters."
+    named = ", ".join(f"{k}={v!r}" for k, v in (filters or {}).items()
+                      if v is not None and v is not False and v != "")   # 0 is a filter
+    if not named:
+        return False, f"No {table} rows match these filters for {asked}. {held} Loosen the other filters."
+    return False, f"No {table} rows match {named} for {asked}. {held} Loosen those filters."
 
 
 def _team_filter(conditions: list[str], params: list[Any], column: str, team: str | None) -> None:
@@ -620,6 +627,7 @@ def nfl_status() -> Dict[str, Any]:
         from .config import get_duckdb_path
         from .ingest import (
             _FRESHNESS_SQL,
+            _NULL_COLUMNS_SQL,
             _SHAPE_STAMP_SQL,
             active_slot,
             derived_status,
@@ -628,6 +636,13 @@ def nfl_status() -> Dict[str, Any]:
         freshness = _execute(_FRESHNESS_SQL)[0]
         stamp = _execute(_SHAPE_STAMP_SQL)
         derived = derived_status(stamp=stamp[0]["row_count"] if stamp else None, **freshness)
+        try:
+            null_columns = _execute(_NULL_COLUMNS_SQL)
+        except duckdb.CatalogException:   # no ingest ever left a column null, so there is no table
+            null_columns = []
+        for row in null_columns:
+            row["remedy"] = (f"nfl-mcp ingest --fresh --start {row['seasons'][0]} --end {row['seasons'][-1]}"
+                             " with the server stopped")
         return {
             "plays": {
                 "total_plays": total[0]["total_plays"] if total else 0,
@@ -642,6 +657,8 @@ def nfl_status() -> Dict[str, Any]:
                 "loaded": datasets,
             },
             "derived": derived,
+            # Columns an ingest added after these seasons were loaded: they read null, not zero.
+            "null_columns": null_columns,
             "active_slot": active_slot(get_duckdb_path()),
         }
     except (duckdb.Error, ValueError, TimeoutError) as e:
@@ -870,7 +887,14 @@ def nfl_search_plays(
         if identity:
             for row in rows:
                 row["label"] = identity["label"]
-        return _echo_player({"rows": rows, "row_count": len(rows), **flag}, identity)
+        result = {"rows": rows, "row_count": len(rows), **flag}
+        if not rows:
+            result["reason"] = _coverage_reason("plays", season, season_from, season_to, filters={
+                "team": team, "opponent": opponent, "player": player, "player_id": player_id,
+                "week": week, "season_type": season_type, "play_type": play_type,
+                "situation": situation, "is_touchdown": is_touchdown, "is_turnover": is_turnover,
+                "min_yards": min_yards})[1]
+        return _echo_player(result, identity)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1021,7 +1045,8 @@ def nfl_team_stats(
             results["situational"] = _execute(sql, params)
 
         if not any(results.get(key) for key in ("offense", "defense", "situational")):
-            results["reason"] = _coverage_reason("team_offense_stats", season, column="season_year")[1]
+            results["reason"] = _coverage_reason("team_offense_stats", season, column="season_year",
+                                                 filters={"team": team, "season_type": season_type})[1]
         return results
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -1261,7 +1286,7 @@ def nfl_player_stats(
                 row["cpoe_plays"] = got.get("cpoe_plays", 0)
         for row in rows:
             row["label"] = identity["label"]
-        return {
+        result = {
             "player": identity,
             "stat_type": stat_type,
             "source": _PLAYER_STATS_SOURCE,
@@ -1269,6 +1294,10 @@ def nfl_player_stats(
             "unavailable": unavailable,
             "seasons": rows,
         }
+        if not rows:
+            result["reason"] = _coverage_reason("player_stats", season, season_from, season_to, filters={
+                "player_id": identity["gsis_id"], "season_type": season_type, "stat_type": stat_type})[1]
+        return result
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1540,7 +1569,8 @@ def nfl_roster(
         rows, flag = _execute_limited(sql, params if params else None, _MAX_ROWS)
         result = {"players": rows, "count": len(rows), **flag}
         if not rows:
-            result["reason"] = _coverage_reason("rosters", season)[1]
+            result["reason"] = _coverage_reason("rosters", season,
+                                                filters={"team": team, "position": position})[1]
         return result
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -1591,7 +1621,9 @@ def nfl_injuries(
         rows, flag = _execute_limited(sql, params if params else None, _MAX_ROWS)
         result = {"injuries": _label_players(rows), "count": len(rows), **flag}
         if not rows:
-            result["reason"] = _coverage_reason("injuries", season)[1]
+            result["reason"] = _coverage_reason("injuries", season, filters={
+                "team": team, "week": week, "player": player, "player_id": player_id,
+                "report_status": report_status})[1]
         return _echo_player(result, identity)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -1740,8 +1772,9 @@ def nfl_team_records(
                 f"{RECORDS_FIRST_NFLVERSE_SEASON} come from the opt-in ESPN pull: "
                 "run 'nfl-mcp ingest --pre1999'."
             )
-        else:
-            result["reason"] = "No stored record for that franchise and season."
+    if not rows and "reason" not in result:
+        result["reason"] = _coverage_reason("team_records", season, from_season, to_season,
+                                            filters={"team": key})[1]
     return result
 
 
@@ -2104,7 +2137,9 @@ def nfl_td_luck(
         rows, flag = _execute_limited(sql, params if params else None, limit)
         result = {"td_luck": _label_players(rows), "count": len(rows), **flag}
         if not rows:
-            result["reason"] = _coverage_reason("player_td_luck", season)[1]
+            result["reason"] = _coverage_reason("player_td_luck", season, filters={
+                "player": player, "player_id": player_id, "position": position, "team": team,
+                "season_type": season_type})[1]
         return _echo_player(result, identity)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -2395,7 +2430,9 @@ def nfl_contract_value(
         rows, flag = _execute_limited(sql, params if params else None, limit)
         result = {"contract_value": _label_players(rows), "count": len(rows), **flag}
         if not rows:
-            result["reason"] = _coverage_reason("player_contract_value", season)[1]
+            result["reason"] = _coverage_reason("player_contract_value", season, filters={
+                "player": player, "player_id": player_id, "position": position, "team": team,
+                "season_type": season_type, "min_apy": min_apy, "max_apy": max_apy})[1]
         return _echo_player(result, identity)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)

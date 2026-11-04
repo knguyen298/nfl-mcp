@@ -415,13 +415,14 @@ def doctor():
         try:
             import duckdb
 
-            from .ingest import active_slot, read_derived_status
+            from .ingest import active_slot, read_derived_status, read_null_columns
             conn = duckdb.connect(str(db_path), read_only=True)
             count = conn.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
             seasons = conn.execute(
                 "SELECT MIN(season), MAX(season) FROM plays"
             ).fetchone()
             status = read_derived_status(conn)
+            null_columns = read_null_columns(conn)
             conn.close()
             click.secho(f"  ✓ {count:,} plays loaded (seasons {seasons[0]}–{seasons[1]})", fg="green")
             shape_ok = status["shape_version"] == status["code_shape_version"]
@@ -434,6 +435,12 @@ def doctor():
                             "run 'nfl-mcp rebuild'", fg="red")
             click.echo(f"  – Last real fetch: {status['last_fetch']}")
             click.echo(f"  – Active slot: {active_slot(db_path) or 'none (a plain database file)'}")
+            # A warning, not a failure: a rebuild cannot fill these, only a re-fetch of the seasons can.
+            for row in null_columns:
+                seasons = row["seasons"]
+                click.secho(f"  ! {row['table_name']}.{row['column_name']} is null for every row of seasons "
+                            f"{seasons}: re-fetch them with 'nfl-mcp ingest --fresh --start {seasons[0]} "
+                            f"--end {seasons[-1]}'", fg="yellow")
             all_ok = shape_ok and status["matches_raw_rows"]
         except Exception as e:
             click.secho(f"  ✗ Database error: {e}", fg="red")

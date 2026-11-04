@@ -30,6 +30,7 @@ from nfl_mcp.ingest import (
     _record_loaded,
     _reconcile_schema,
     _safe_rename,
+    read_null_columns,
     _FANTASY_TABLES,
     _str,
     _table_exists,
@@ -287,6 +288,27 @@ class TestNulledSeasonsWarning:
         conn.execute("CREATE TABLE t (season BIGINT)")
         _reconcile_schema(conn, "t", pl.DataFrame({"season": [2026], "first_downs": [9]}), "season")
         assert "null for every row" not in capsys.readouterr().out
+        assert read_null_columns(conn) == []     # and nothing is stored, not even the table
+
+    def test_the_nulled_seasons_are_stored_for_the_readers(self, conn):
+        conn.execute("CREATE TABLE t AS SELECT * FROM (VALUES (2024, 1), (2025, 2)) v(season, x)")
+        _reconcile_schema(conn, "t", pl.DataFrame({"season": [2026], "x": [3], "first_downs": [9]}), "season")
+        assert read_null_columns(conn) == [
+            {"table_name": "t", "column_name": "first_downs", "seasons": [2024, 2025]}]
+
+    def test_a_re_fetched_season_clears_only_its_own_note(self, conn):
+        conn.execute("CREATE TABLE t AS SELECT * FROM (VALUES (2024, 1), (2025, 2)) v(season, x)")
+        _reconcile_schema(conn, "t", pl.DataFrame({"season": [2026], "x": [3], "first_downs": [9]}), "season")
+        # A 2024 re-fetch that carries the column fills it for 2024; one that does not, does not.
+        _reconcile_schema(conn, "t", pl.DataFrame({"season": [2025], "x": [2]}), "season", 2025)
+        _reconcile_schema(conn, "t", pl.DataFrame({"season": [2024], "first_downs": [5]}), "season", 2024)
+        assert read_null_columns(conn) == [
+            {"table_name": "t", "column_name": "first_downs", "seasons": [2025]}]
+
+    def test_nothing_null_reads_empty(self, conn):
+        conn.execute("CREATE TABLE t AS SELECT 2024 AS season, 1 AS x")
+        _reconcile_schema(conn, "t", pl.DataFrame({"season": [2024], "x": [3]}), "season", 2024)
+        assert read_null_columns(conn) == []
 
 
 class TestStringAndDescriptionHelpers:

@@ -244,8 +244,9 @@ def test_search_plays_uses_parameterized_filters(monkeypatch):
     captured = {}
 
     def fake_execute(sql, params=None):
-        captured["sql"] = sql
-        captured["params"] = params
+        if "AS lo" not in sql:   # the season span an empty answer reads to explain itself
+            captured["sql"] = sql
+            captured["params"] = params
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
@@ -304,8 +305,11 @@ def player_stats_column_rows(drop=()):
 
 def fake_player_stats_execute(calls, rows, *, drop=(), cpoe_rows=()):
     """Record every query, answer the column lookup, hand back `rows` for the sum and
-    `cpoe_rows` for the one plays query."""
+    `cpoe_rows` for the one plays query. The season span an empty answer reads is answered
+    and not recorded."""
     def _fake(sql, params=None):
+        if "AS lo" in sql:
+            return [{"lo": 2024, "hi": 2026}]
         calls.append((sql, params))
         if "information_schema.columns" in sql:
             return player_stats_column_rows(drop=drop)
@@ -510,16 +514,41 @@ def test_nfl_status_happy_path(monkeypatch):
         [{"dataset_id": "pbp", "table_name": "plays", "total_rows": 123}],
         [{"built_at": "2026-03-02", "last_fetch": "2026-03-01"}],
         [{"row_count": 3}],
+        [],
     ])
     monkeypatch.setattr(tools, "_execute", lambda sql, params=None: next(responses))
 
     result = tools.nfl_status()
+    assert result["null_columns"] == []
     assert result["plays"]["total_plays"] == 123
     assert result["plays"]["season_range"]["first_season"] == 2024
     assert result["datasets"]["total_loaded"] == 1
     assert result["datasets"]["last_refreshed"] == "2026-03-01"
     assert result["derived"]["matches_raw_rows"] is True
     assert result["active_slot"] is None
+
+
+def test_nfl_status_names_a_column_an_ingest_left_null(monkeypatch):
+    def fake_execute(sql, params=None):
+        if "_null_columns" in sql:
+            return [{"table_name": "team_stats_raw", "column_name": "passing_first_downs",
+                     "seasons": [2024, 2025]}]
+        return [{"built_at": None, "last_fetch": None}] if "built_at" in sql else []
+
+    monkeypatch.setattr(tools, "_execute", fake_execute)
+    assert tools.nfl_status()["null_columns"] == [{
+        "table_name": "team_stats_raw", "column_name": "passing_first_downs", "seasons": [2024, 2025],
+        "remedy": "nfl-mcp ingest --fresh --start 2024 --end 2025 with the server stopped"}]
+
+
+def test_nfl_status_without_a_null_columns_table_reports_none(monkeypatch):
+    def fake_execute(sql, params=None):
+        if "_null_columns" in sql:
+            raise duckdb.CatalogException("Table with name _null_columns does not exist!")
+        return [{"built_at": None, "last_fetch": None}] if "built_at" in sql else []
+
+    monkeypatch.setattr(tools, "_execute", fake_execute)
+    assert tools.nfl_status()["null_columns"] == []
 
 
 def test_nfl_status_returns_error_on_timeout(monkeypatch):
@@ -646,8 +675,9 @@ def test_search_plays_situations(monkeypatch, situation, expected_sql):
     captured = {}
 
     def fake_execute(sql, params=None):
-        captured["sql"] = sql
-        captured["params"] = params
+        if "AS lo" not in sql:   # the season span an empty answer reads to explain itself
+            captured["sql"] = sql
+            captured["params"] = params
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
@@ -659,8 +689,9 @@ def test_search_plays_applies_all_numeric_and_boolean_filters(monkeypatch):
     captured = {}
 
     def fake_execute(sql, params=None):
-        captured["sql"] = sql
-        captured["params"] = params
+        if "AS lo" not in sql:   # the season span an empty answer reads to explain itself
+            captured["sql"] = sql
+            captured["params"] = params
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
@@ -1509,12 +1540,54 @@ def test_coverage_reason_on_an_empty_or_unreadable_table(monkeypatch):
     (lambda: tools.nfl_td_luck(season=2010), "player_td_luck"),
     (lambda: tools.nfl_contract_value(season=2010), "player_contract_value"),
     (lambda: tools.nfl_team_stats(team="KC", season=2010), "team_offense_stats"),
-], ids=["roster", "injuries", "td_luck", "contract_value", "team_stats"])
+    (lambda: tools.nfl_search_plays(team="KC", season=2010, week=0), "plays"),
+    (lambda: tools.nfl_team_records(team="KC", season=2010), "team_records"),
+    (lambda: tools.nfl_team_records(season=2010), "team_records"),
+], ids=["roster", "injuries", "td_luck", "contract_value", "team_stats", "search_plays",
+        "team_records", "team_records_all_teams"])
 def test_an_empty_answer_says_what_the_database_holds(monkeypatch, call, table):
     monkeypatch.setattr(tools, "_execute", lambda sql, params=None:
                         [{"lo": 2024, "hi": 2026}] if "AS lo" in sql else [])
     reason = call()["reason"]
     assert reason.startswith(f"No {table} rows for season 2010.") and "2024 to 2026" in reason
+
+
+def test_coverage_reason_names_the_filters_that_emptied_an_answer_inside_the_span(monkeypatch):
+    _span(monkeypatch, 2024, 2026)
+    outside, reason = tools._coverage_reason(
+        "plays", 2024, filters={"team": "KC", "week": 0, "player": None, "is_touchdown": False, "play_type": ""})
+    assert outside is False
+    assert reason == ("No plays rows match team='KC', week=0 for season 2024. "
+                      "This database holds plays for seasons 2024 to 2026. Loosen those filters.")
+    # Outside the span the season is the cause, so the filters are not blamed.
+    outside, reason = tools._coverage_reason("plays", 2010, filters={"team": "KC", "week": 0})
+    assert outside is True and "week" not in reason and "nfl-mcp ingest" in reason
+
+
+@pytest.mark.parametrize("call,named", [
+    (lambda: tools.nfl_search_plays(team="KC", season=2024, week=0), "team='KC', week=0"),
+    (lambda: tools.nfl_roster(team="KC", season=2024, position="ZZ"), "team='KC', position='ZZ'"),
+    (lambda: tools.nfl_injuries(team="KC", season=2024, week=0), "team='KC', week=0"),
+    (lambda: tools.nfl_td_luck(team="KC", season=2024), "team='KC', season_type='REG'"),
+    (lambda: tools.nfl_contract_value(season=2024, min_apy=0), "season_type='REG', min_apy=0"),
+    (lambda: tools.nfl_team_stats(team="KC", season=2024, season_type="POST"), "team='KC', season_type='POST'"),
+    (lambda: tools.nfl_team_records(team="KC", season=2024), "team='KC'"),
+], ids=["search_plays", "roster", "injuries", "td_luck", "contract_value", "team_stats", "team_records"])
+def test_an_empty_answer_inside_the_span_names_the_filters(monkeypatch, call, named):
+    monkeypatch.setattr(tools, "_execute", lambda sql, params=None:
+                        [{"lo": 2024, "hi": 2026}] if "AS lo" in sql else [])
+    reason = call()["reason"]
+    assert f"match {named} for season 2024." in reason and "Loosen those filters." in reason
+
+
+def test_player_stats_found_but_empty_says_why(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tools, "_execute", fake_player_stats_execute(calls, []))
+    stub_resolver(monkeypatch)
+    result = tools.nfl_player_stats("P.Mahomes", season=2025, season_type="POST", stat_type="rushing")
+    assert result["seasons"] == []
+    assert result["reason"].startswith(
+        "No player_stats rows match player_id='00-0036322', season_type='POST', stat_type='rushing' for season 2025.")
 
 
 def test_player_stats_out_of_range_says_so_instead_of_offering_other_names(monkeypatch):

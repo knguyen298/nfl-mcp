@@ -134,8 +134,10 @@ class TestMyNewTool:
 
 - **Path**: `~/.nfl-mcp/nflread.duckdb` (override with `NFL_MCP_DB_PATH` env var)
 - **Access**: always read-only at query time via `get_db_connection()` in `database.py`
-- **Metadata**: `_ingest_metadata` table tracks what datasets/seasons have been loaded
-- **Tables**: 42 tables in the local database in November 2026, `_ingest_metadata` included. The
+- **Metadata**: `_ingest_metadata` table tracks what datasets/seasons have been loaded, and `_null_columns`
+  records columns that are null for whole seasons (it is created only when such a column is first seen)
+- **Tables**: 42 tables in the local database in November 2026, `_ingest_metadata` included, and 43 once
+  `_null_columns` exists. The
   number changes with the registry, so use `nfl_schema()` to list them or `nfl_schema(table=<name>)`
   for columns.
 

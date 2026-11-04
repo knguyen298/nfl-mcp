@@ -603,6 +603,30 @@ class TestDoctorCommand:
         assert "Active slot: nflread_b.duckdb" in result.output
         assert "All checks passed!" in result.output
 
+    def test_doctor_warns_of_a_null_column_and_check_stays_current(self, runner, monkeypatch, tmp_path):
+        import duckdb
+        import polars as pl
+
+        from nfl_mcp.ingest import _reconcile_schema
+        db_path = tmp_path / "nflread.duckdb"
+        self._stamped_db(db_path, fetched_after_build=False)
+        conn = duckdb.connect(str(db_path))
+        _reconcile_schema(conn, "plays", pl.DataFrame({"season": [2025], "first_downs": [9]}), "season")
+        conn.close()
+        monkeypatch.setattr("nfl_mcp.config.config_exists", lambda: True)
+        monkeypatch.setattr("nfl_mcp.config.get_duckdb_path", lambda: db_path)
+        monkeypatch.setattr("nfl_mcp.cli._claude_desktop_config_path", lambda: None)
+        monkeypatch.setattr("nfl_mcp.cli.Path.cwd", lambda: tmp_path)
+
+        result = runner.invoke(main, ["doctor"])
+        assert result.exit_code == 0
+        assert ("! plays.first_downs is null for every row of seasons [2024]: re-fetch them with "
+                "'nfl-mcp ingest --fresh --start 2024 --end 2024'") in result.output
+        # A rebuild cannot fill the column, so the updater must still be able to swap.
+        monkeypatch.setenv("NFL_MCP_DB_PATH", str(db_path))
+        check = runner.invoke(main, ["rebuild", "--check"])
+        assert (check.exit_code, check.stdout.strip()) == (0, "current")
+
     def test_doctor_fails_when_derived_tables_lag_the_rows(self, runner, monkeypatch, tmp_path):
         db_path = tmp_path / "nflread.duckdb"
         self._stamped_db(db_path, fetched_after_build=True)
