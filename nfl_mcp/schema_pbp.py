@@ -482,7 +482,11 @@ AGGREGATE TABLES  (pre-aggregated, much faster for team/season queries)
     --   read only from plays inside the 20, so a drive pushed back before it scores counts as a trip
     --   with no touchdown: 11 drives did that in the 2024 regular season. The standard
     --   rate divides by trips, not by red zone plays, and a trip that ends in a field goal stays in
-    --   the denominator.
+    --   the denominator. No published source defines a trip, so a site's count can differ from this
+    --   one. Compared for 2024, this table reads two to three trips per team above what ESPN and
+    --   TeamRankings show, which is the direction a rule that also counts drives starting inside the
+    --   20 after a turnover would give; that explanation is unproven, and the numbers here are what
+    --   this definition produces.
 
   team_defense_stats
     (team, season_year, season_type, plays_against, yards_allowed, yards_per_play_allowed,
