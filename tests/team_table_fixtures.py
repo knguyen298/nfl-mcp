@@ -77,8 +77,8 @@ TEAM_PLAYS = {
 }
 
 # The week-level team box. It is the authority for a counting stat, so a value here wins over what
-# counting plays would say: KC's defense is credited with 1 sack below and no play in this data is
-# a sack, and that 1 is what the table has to show.
+# counting plays would say. A defence's sacks are its opponents' sacks_suffered, not its own
+# def_sacks: KC's def_sacks below is 1, but BAL suffered 0 sacks, and 0 is what the table shows.
 TEAM_BOX = {
     "team": ["KC", "BAL", "BAL"],
     "opponent_team": ["BAL", "KC", "KC"],

@@ -358,8 +358,9 @@ SEASON_TYPES = ("REG", "POST")                  # what plays, player_stats and t
 POSTSEASON_ROUNDS = ("WC", "DIV", "CON", "SB")  # the four rounds `schedules.game_type` names, in order
 ALL_SCOPES = "ALL"                              # both scopes at once, as separate rows
 SCHEDULE_SEASON_TYPES = (*SEASON_TYPES, *POSTSEASON_ROUNDS)  # what nfl_schedule accepts
-SEPARATION_SEASON_TYPES = (*SEASON_TYPES, ALL_SCOPES)        # what nfl_separation_opportunity accepts
-SEPARATION_DEFAULT_SEASON_TYPE = SEASON_TYPES[0]  # what nfl_separation_opportunity answers unprompted
+# what nfl_separation_opportunity, nfl_td_luck and nfl_contract_value accept, and answer unprompted
+SEPARATION_SEASON_TYPES = (*SEASON_TYPES, ALL_SCOPES)
+SEPARATION_DEFAULT_SEASON_TYPE = SEASON_TYPES[0]
 
 
 def _season_type_filter(
@@ -827,7 +828,12 @@ _TEAM_STAT_SOURCES = {
         "first_downs column and no penalty first-down column, so the total is its "
         "passing_first_downs + rushing_first_downs plus the penalty first downs from plays "
         "(its receiving_first_downs is the same events as passing_first_downs, credited to the "
-        "receiver as well as the quarterback, so adding it counts every passing first down twice)"
+        "receiver as well as the quarterback, so adding it counts every passing first down twice). "
+        "total_yards, pass_yards, yards_per_play, yards_allowed and yards_per_play_allowed are net "
+        "of sacks: sack_yards is negative, so the gross figure ESPN prints is total_yards - "
+        "sack_yards (Kansas City 2024 regular season 5570 net, 5836 gross). touchdowns is "
+        "passing_tds + rushing_tds, the offence's own scores: defensive and return touchdowns are "
+        "not in it (special_teams_tds is its own column; the box's def_tds is in team_stats_raw)"
     ),
     "schedules": "points_for, points_against, points_allowed (game_type REG is REG; WC, DIV, CON, SB are POST)",
     "plays": (
@@ -848,7 +854,7 @@ _REBUILD_HINT = (
     "a container (builds the idle slot and swaps the symlink)"
 )
 
-# Said about the database rather than about the tool that answered: the probe names four tables,
+# Said about the database rather than about the tool that answered: the probe names seven tables,
 # and nfl_injury_return, which reads injury_return_curve, is the one that most often quotes them.
 # The list stays, because it is what tells a reader which tables a rebuild has to fix.
 _STALE_SHAPE_LEAD = "This database's derived tables are older than this build:"
@@ -1923,6 +1929,7 @@ def nfl_td_luck(
     position: str | None = None,
     team: str | None = None,
     season: int | None = None,
+    season_type: str | None = SEPARATION_DEFAULT_SEASON_TYPE,
     limit: int = 50,
 ) -> Dict[str, Any]:
     """
@@ -1930,6 +1937,10 @@ def nfl_td_luck(
     player_td_luck table. Negative total_td_luck_score = scored fewer TDs than
     expected (positive-regression / "unlucky" candidate); positive = over-performed.
     Default sort is most unlucky first (total_td_luck_score ASC).
+
+    Each row is one player, season and season_type, and season_type defaults to 'REG', the same
+    vocabulary as nfl_separation_opportunity: pass 'POST' for the playoffs or 'ALL' for both as
+    separate rows.
     """
     try:
         limit = max(1, min(int(limit), _MAX_ROWS))
@@ -1951,10 +1962,14 @@ def nfl_td_luck(
     if season:
         conditions.append("season = ?")
         params.append(int(season))
+    refused = _season_type_filter(conditions, params, "season_type", season_type,
+                                  allow_all=True, blank_means=SEPARATION_DEFAULT_SEASON_TYPE)
+    if refused is not None:
+        return refused
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
-        SELECT player_id, full_name, position, team, season,
+        SELECT player_id, full_name, position, team, season, season_type,
                rec_td, rec_td_exp, rec_td_luck,
                rush_td, rush_td_exp, rush_td_luck,
                total_td_luck_score
@@ -2195,14 +2210,19 @@ def nfl_contract_value(
     position: str | None = None,
     team: str | None = None,
     season: int | None = None,
+    season_type: str | None = SEPARATION_DEFAULT_SEASON_TYPE,
     min_apy: float | None = None,
     max_apy: float | None = None,
     limit: int = 50,
 ) -> Dict[str, Any]:
     """
     Contract value efficiency — fantasy points per $M of average per year (APY),
-    using each player's active contract joined to seasonal fantasy production
-    (player_contract_value). apy and cap_pct reflect the current active contract.
+    using the contract in force that season joined to seasonal fantasy production
+    (player_contract_value). A contract is in force from year_signed through
+    year_signed + years - 1; when two cover one season the later signing wins, and
+    contract_year_signed names it. A season no contract covers keeps its row with apy,
+    cap_pct and fp_per_million null; it does not borrow another season's contract.
+    Each row is one season_type, 'REG' by default ('POST', or 'ALL' for both).
     Default sort is best value first (fp_per_million DESC).
     """
     try:
@@ -2225,6 +2245,10 @@ def nfl_contract_value(
     if season:
         conditions.append("season = ?")
         params.append(int(season))
+    refused = _season_type_filter(conditions, params, "season_type", season_type,
+                                  allow_all=True, blank_means=SEPARATION_DEFAULT_SEASON_TYPE)
+    if refused is not None:
+        return refused
     if min_apy is not None:
         conditions.append("apy >= ?")
         params.append(float(min_apy))
@@ -2234,7 +2258,7 @@ def nfl_contract_value(
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
-        SELECT player_id, full_name, position, team, season,
+        SELECT player_id, full_name, position, team, season, season_type, contract_year_signed,
                apy, cap_pct, total_fp, total_fp_exp, fp_per_million
         FROM player_contract_value
         WHERE {where}
@@ -2263,6 +2287,8 @@ def nfl_injury_return(
     spell, grouped by the reported injury text and position (injury_return_curve).
     100 means fully back to baseline usage. Default sort is by weeks since return
     (week_post_return ASC). sample_size shows how many player-spells back each point.
+    The sample holds only players whose baseline was at least 25% of the offensive snaps:
+    a backup's tiny baseline turned a promotion into a recovery of several hundred percent.
     """
     try:
         limit = max(1, min(int(limit), _MAX_ROWS))

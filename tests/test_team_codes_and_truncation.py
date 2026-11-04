@@ -302,6 +302,8 @@ class TestSeasonTypeVocabulary:
         pytest.param("nfl_schedule", tools.SCHEDULE_SEASON_TYPES, id="nfl_schedule"),
         pytest.param("nfl_separation_opportunity", tools.SEPARATION_SEASON_TYPES,
                      id="nfl_separation_opportunity"),
+        pytest.param("nfl_td_luck", tools.SEPARATION_SEASON_TYPES, id="nfl_td_luck"),
+        pytest.param("nfl_contract_value", tools.SEPARATION_SEASON_TYPES, id="nfl_contract_value"),
     ])
     def test_the_schema_enum_offers_exactly_what_the_tool_accepts(self, name, accepted):
         """A client must not be offered a value the tool refuses, nor refused one it accepts.
@@ -864,9 +866,10 @@ class TestTruncationOnRealData:
     @pytest.mark.usefixtures("require_db")
     def test_the_rows_a_capped_tool_keeps_are_the_rows_its_own_sort_puts_first(self):
         result = nfl_td_luck(season=2024, limit=3)
-        top = nfl_query("SELECT player_id, full_name, position, team, season, rec_td, rec_td_exp, "
-                        "rec_td_luck, rush_td, rush_td_exp, rush_td_luck, total_td_luck_score "
-                        "FROM player_td_luck WHERE season = 2024 "
+        top = nfl_query("SELECT player_id, full_name, position, team, season, season_type, "
+                        "rec_td, rec_td_exp, rec_td_luck, rush_td, rush_td_exp, rush_td_luck, "
+                        "total_td_luck_score FROM player_td_luck "
+                        "WHERE season = 2024 AND season_type = 'REG' "
                         "ORDER BY total_td_luck_score ASC NULLS LAST LIMIT 3")["rows"]
         kept = [{k: v for k, v in row.items() if k != "label"} for row in result["td_luck"]]
         assert kept == top

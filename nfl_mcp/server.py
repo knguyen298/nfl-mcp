@@ -656,6 +656,7 @@ TOOLS = [
             "total_td_luck_score = scored fewer TDs than expected (positive-regression / "
             "'unlucky' bounce-back candidate); positive = over-performed (sell-high). Use "
             "for 'who was unlucky on TDs in 2024' or 'is player X due for TD regression'. "
+            "Each row is one player, season and season_type; season_type defaults to REG. "
             "Default sort is most unlucky first."
         ),
         inputSchema={
@@ -666,6 +667,11 @@ TOOLS = [
                 "position": {"type": "string", "description": "Position filter (e.g. WR, RB, TE)."},
                 "team": {"type": "string", "description": "Team abbreviation (e.g. KC)."},
                 "season": {"type": "integer", "description": "Exact season year."},
+                "season_type": {
+                    "type": "string",
+                    "enum": ["REG", "POST", "ALL"],
+                    "description": "REG (regular season, the default), POST (playoffs), or ALL for both scopes - they stay separate rows.",
+                },
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
             },
         },
@@ -758,10 +764,13 @@ TOOLS = [
         name="nfl_contract_value",
         description=(
             "PREFERRED for contract value / cost-efficiency questions. Returns fantasy points "
-            "per $M of average per year (APY) using each player's active contract joined to "
-            "seasonal fantasy production. Use for 'best fantasy value per dollar' or 'is player "
-            "X worth his contract'. apy and cap_pct reflect the current active contract. Default "
-            "sort is best value first (fp_per_million DESC)."
+            "per $M of average per year (APY) using the contract in force that season (signed in "
+            "or before it, and not yet run out) joined to seasonal fantasy production. Use for "
+            "'best fantasy value per dollar' or 'is player X worth his contract'. When two contracts "
+            "cover a season the later signing wins; contract_year_signed names it. A season no "
+            "contract covers keeps its row with apy, cap_pct and fp_per_million null. Each row is "
+            "one season_type; season_type defaults to REG. Default sort is best value first "
+            "(fp_per_million DESC)."
         ),
         inputSchema={
             "type": "object",
@@ -771,6 +780,11 @@ TOOLS = [
                 "position": {"type": "string", "description": "Position filter (e.g. RB, WR)."},
                 "team": {"type": "string", "description": "Team abbreviation."},
                 "season": {"type": "integer", "description": "Exact season year."},
+                "season_type": {
+                    "type": "string",
+                    "enum": ["REG", "POST", "ALL"],
+                    "description": "REG (regular season, the default), POST (playoffs), or ALL for both scopes - they stay separate rows.",
+                },
                 "min_apy": {"type": "number", "description": "Minimum APY in $millions."},
                 "max_apy": {"type": "number", "description": "Maximum APY in $millions."},
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
@@ -786,7 +800,10 @@ TOOLS = [
             "…) and position. 100 = fully back to baseline usage. Use for 'how long until "
             "players recover snaps after a hamstring injury'. Default sort is by weeks since "
             "return. week_post_return counts calendar weeks, not games, so a spell that ends "
-            "before a bye has no +1 row and its first point lands at +2."
+            "before a bye has no +1 row and its first point lands at +2. The sample holds only "
+            "players whose pre-injury baseline was at least 25% of the offensive snaps, so a "
+            "backup promoted after the injury does not count as a recovery of several hundred "
+            "percent."
         ),
         inputSchema={
             "type": "object",

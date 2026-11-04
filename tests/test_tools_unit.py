@@ -1230,14 +1230,16 @@ def test_td_luck_builds_filters(monkeypatch):
     assert "position ILIKE ?" in captured["sql"]
     assert "team = ?" in captured["sql"]
     assert "total_td_luck_score ASC" in captured["sql"]
-    assert captured["params"] == ["00-0036322", "WR", "MIN", 2024]
+    # season_type defaults to REG, so a playoff team's postseason is not summed into its season.
+    assert "season_type = ?" in captured["sql"]
+    assert captured["params"] == ["00-0036322", "WR", "MIN", 2024, "REG"]
 
 
 def test_td_luck_invalid_limit_falls_back(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
     tools.nfl_td_luck(limit="oops")
     assert "LIMIT 51" in captured["sql"]           # the default 50, plus the probe row
-    assert captured["params"] is None
+    assert captured["params"] == ["REG"]           # the default season_type
 
 
 def test_td_luck_returns_error_on_timeout(monkeypatch):
@@ -1355,7 +1357,18 @@ def test_contract_value_builds_filters(monkeypatch):
     assert "apy >= ?" in captured["sql"]
     assert "apy <= ?" in captured["sql"]
     assert "fp_per_million DESC" in captured["sql"]
-    assert captured["params"] == ["00-0036322", "RB", "DET", 2024, 2.0, 10.0]
+    assert "contract_year_signed" in captured["sql"]
+    assert captured["params"] == ["00-0036322", "RB", "DET", 2024, "REG", 2.0, 10.0]
+
+
+@pytest.mark.parametrize("tool", [tools.nfl_td_luck, tools.nfl_contract_value])
+def test_td_luck_and_contract_value_take_the_separation_season_types(monkeypatch, tool):
+    """Both tables are now one row per season_type, in nfl_separation_opportunity's vocabulary:
+    REG by default, ALL for both scopes without a filter, and a round name refused."""
+    captured = _capture_execute(monkeypatch, [])
+    tool(season_type="ALL")
+    assert "season_type = ?" not in captured["sql"]
+    assert "WC" in tool(season_type="WC")["error"]
 
 
 def test_contract_value_invalid_limit_falls_back(monkeypatch):

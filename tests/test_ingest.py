@@ -1213,7 +1213,7 @@ class TestInjuryReturnCurveFromRealRows:
         He never went back to New Orleans, so the New Orleans spell ends at week 9.
 
         The pin sits at the spell level: his 2024 snap share is 0.0 every week, so the
-        baseline filter (baseline_pct > 0) drops both spells out of the curve table.
+        baseline floor (baseline_pct >= 0.25) drops both spells out of the curve table.
         """
         assert self._spells(rebuilt_db, "00-0033874", 2024) == [
             ("NO", 9, 9), ("WAS", 10, 12), ("WAS", 17, 18),
@@ -1267,6 +1267,10 @@ class TestInjuryReturnCurveFromRealRows:
                 "ORDER BY week").fetchall()
         if not injury_rows or not snaps:
             pytest.skip("2024 injury or snap rows not loaded")
+        # His real baseline is 22% of the snaps, under the curve's 25% floor, so the table would
+        # hold no row for him. Doubling every share (the largest becomes 0.86) clears the floor and
+        # changes no recovery: each one is a share divided by the baseline, and both double.
+        snaps = [(w, 2 * pct) for w, pct in snaps]
 
         injury_columns = ["gsis_id", "full_name", "season", "week", "team", "position",
                           "report_status", "report_primary_injury",
@@ -1740,10 +1744,11 @@ class TestTeamTables:
         # punt replayed after defensive pass interference). The box's receiving_first_downs is also
         # 2 - the same two completions credited to the receivers - and is deliberately not added:
         # with it the row would read 6, and with the penalty row left out it would read 3.
-        # The box says the defense got 1 sack; no play in this data is a sack, and 1 still wins.
+        # sacks is the opponent's sacks_suffered: Baltimore's REG box row suffered 0. Kansas City's
+        # own def_sacks of 1 is not read, so the defence total always equals the offence total.
         kc_def = rows(conn, "SELECT * FROM team_defense_stats WHERE team='KC' AND season_year=2024 "
                             "AND season_type='REG'")[0]
-        assert (kc_def["sacks"], kc_def["interceptions"]) == (1, 0)
+        assert (kc_def["sacks"], kc_def["interceptions"]) == (0, 0)
         bal_def = rows(conn, "SELECT * FROM team_defense_stats WHERE team='BAL' AND season_year=2024 "
                              "AND season_type='REG'")[0]
         assert (bal_def["sacks"], bal_def["interceptions"]) == (0, 1)

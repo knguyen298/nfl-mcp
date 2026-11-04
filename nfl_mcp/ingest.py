@@ -553,10 +553,11 @@ _OFFENSIVE_TD = "(COALESCE(pass_touchdown,0)=1 OR COALESCE(rush_touchdown,0)=1)"
 # population dropped all of them. A punt or a field-goal attempt never carries a flag, so kicks stay
 # out of the denominator. A play a penalty undid nearly always carries none either: of the 6,569
 # no_play rows in the table exactly one carries a flag - game 2024_15_MIA_HOU, a Houston fake punt on
-# 4th and 2 for 35 yards, fourth_down_converted = 1 - and the conversion columns do count it. That row
-# is why the Houston 2024 regular-season 4th Down row of situational_stats reports 18 attempts over 17
-# plays; the other 83 rows in that table where attempts exceed plays come from kneels and spikes, which
-# carry a flag and are not scrimmage plays.
+# 4th and 2 for 35 yards, fourth_down_converted = 1. The team tables' third-down columns do not count
+# it, because their downs filter excludes no_play. situational_stats does not exclude no_play, so it
+# counts it: that row is why the Houston 2024 regular-season 4th Down row reports 18 attempts over 17
+# plays. The other 83 rows in that table where attempts exceed plays come from kneels and spikes,
+# which carry a flag and are not scrimmage plays.
 _DOWN_FLAGS = ("COALESCE(third_down_converted,0)=1 OR COALESCE(third_down_failed,0)=1 "
                "OR COALESCE(fourth_down_converted,0)=1 OR COALESCE(fourth_down_failed,0)=1")
 
@@ -576,7 +577,7 @@ _TEAM_BOX_SUMS = {
     "rushing_yards": "rushing_yards", "passing_tds": "passing_tds", "rushing_tds": "rushing_tds",
     "special_teams_tds": "special_teams_tds", "passing_interceptions": "passing_interceptions",
     "fumbles_lost": "fumbles_lost_total", "penalties": "penalties",
-    "penalty_yards": "penalty_yards", "def_sacks": "def_sacks",
+    "penalty_yards": "penalty_yards",
     "def_interceptions": "def_interceptions",
     "passing_first_downs": "passing_first_downs",
     "rushing_first_downs": "rushing_first_downs",
@@ -621,7 +622,8 @@ def _opp_box_cte(conn: duckdb.DuckDBPyConnection) -> str:
     return ("opp AS (SELECT opponent_team AS team, season AS season_year, season_type, "
             "COALESCE(SUM(attempts + sacks_suffered + carries), 0) AS plays_against, "
             "COALESCE(SUM(passing_yards + rushing_yards + sack_yards_lost), 0) AS yards_allowed, "
-            "COALESCE(SUM(passing_interceptions + fumbles_lost_total), 0) AS turnovers_forced "
+            "COALESCE(SUM(passing_interceptions + fumbles_lost_total), 0) AS turnovers_forced, "
+            "COALESCE(SUM(sacks_suffered), 0) AS sacks "
             f"FROM {src} GROUP BY 1, 2, 3)")
 
 
@@ -824,7 +826,10 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
             -- by as much as 0.33. Null when the box counts no plays against this defence.
             o.plays_against, o.yards_allowed,
             ROUND(1.0*o.yards_allowed / NULLIF(o.plays_against, 0), 2) AS yards_per_play_allowed,
-            b.def_sacks AS sacks, b.def_interceptions AS interceptions,
+            -- sacks are the opponents' sacks_suffered, like every other count here. The defence's own
+            -- def_sacks leaves out a sack credited to no player and counts half-sacks as halves:
+            -- Buffalo 2024 regular season 37 against the 39 its opponents suffered, 9 of 46 rows off.
+            o.sacks, b.def_interceptions AS interceptions,
             o.turnovers_forced,
             d.third_down_stops, d.third_down_attempts,
             ROUND(100.0*d.third_down_stops/NULLIF(d.third_down_attempts,0), 1)
@@ -877,18 +882,22 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
 
     conn.execute(f"""
         CREATE TABLE formation_effectiveness AS
+        -- Keyed by season_type like the other team tables, on scrimmage plays only, and a touchdown
+        -- is one the offence scored. Before: Kansas City 2024 pass rows held 739 plays (641 regular
+        -- season + 98 postseason), 2024 held 148 two-point tries and 51 touchdowns the defence scored.
         SELECT
-            posteam AS team, season AS season_year,
+            posteam AS team, season AS season_year, season_type,
             {_FORMATION_EXPR} AS formation,
             play_type,
             COUNT(*) AS plays,
             ROUND(AVG(yards_gained), 2) AS avg_yards,
-            SUM(CASE WHEN touchdown=1 THEN 1 ELSE 0 END) AS touchdowns,
+            SUM(CASE WHEN {_OFFENSIVE_TD} THEN 1 ELSE 0 END) AS touchdowns,
             SUM(CASE WHEN interception=1 OR fumble_lost=1 THEN 1 ELSE 0 END) AS turnovers,
             ROUND(AVG(epa), 3) AS avg_epa
         FROM plays
         WHERE posteam IS NOT NULL AND play_type IN ('pass','run') AND shotgun IS NOT NULL
-        GROUP BY posteam, season, {_FORMATION_EXPR}, play_type
+          AND {_SCRIMMAGE}
+        GROUP BY posteam, season, season_type, {_FORMATION_EXPR}, play_type
         HAVING COUNT(*) >= 5
     """)
     print("    formation_effectiveness ✓")
@@ -910,6 +919,9 @@ def _table_exists(conn: duckdb.DuckDBPyConnection, name: str) -> bool:
 # All are built at ingest time so the MCP tools never compute at query time.
 _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
     # 1. TD luck — actual vs expected touchdowns per player-season (most "unlucky" first).
+    #    One row per player, season and season_type, split on week the way
+    #    player_separation_opportunity does: Saquon Barkley 2024 read 18 rushing touchdowns, 13 in the
+    #    regular season and 5 in the postseason.
     ("player_td_luck", ["ff_opportunity"], """
         SELECT
             player_id,
@@ -917,6 +929,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
             ANY_VALUE(position)             AS position,
             ANY_VALUE(posteam)              AS team,
             CAST(season AS INTEGER)         AS season,
+            CASE WHEN week >= 19 THEN 'POST' ELSE 'REG' END AS season_type,
             SUM(rec_touchdown)              AS rec_td,
             SUM(rec_touchdown_exp)          AS rec_td_exp,
             SUM(rec_touchdown_diff)         AS rec_td_luck,
@@ -926,7 +939,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
             ROUND(SUM(rec_touchdown_diff) + SUM(rush_touchdown_diff), 3) AS total_td_luck_score
         FROM ff_opportunity
         WHERE player_id IS NOT NULL
-        GROUP BY player_id, CAST(season AS INTEGER)
+        GROUP BY player_id, CAST(season AS INTEGER), CASE WHEN week >= 19 THEN 'POST' ELSE 'REG' END
     """),
 
     # 2. Rolling 3-week role trend — snap / target / carry / air-yards share with
@@ -1088,45 +1101,54 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
     """),
 
     # 5. Contract value efficiency — fantasy points per $M of average per year (APY),
-    #    using each player's active contract joined to seasonal fantasy production.
+    #    using the contract in force that season joined to seasonal fantasy production, one row per
+    #    player, season and season_type. It used to divide every season by the current active
+    #    contract: Saquon Barkley 2024 was charged the 20.6 APY he signed in 2025, not the 12.58 he
+    #    played 2024 under. A contract covers year_signed through year_signed + years - 1, and when
+    #    two cover one season (an extension signed during a deal) the later signing wins. A season
+    #    no contract covers keeps its row with apy, cap_pct and fp_per_million null.
     ("player_contract_value", ["contracts", "ff_opportunity"], """
-        WITH active AS (
-            SELECT
-                gsis_id,
-                ANY_VALUE(position)   AS position,
-                ANY_VALUE(team)       AS team,
-                MAX(apy)              AS apy,
-                MAX(apy_cap_pct)      AS cap_pct
-            FROM contracts
-            WHERE is_active = TRUE AND gsis_id IS NOT NULL
-            GROUP BY gsis_id
-        ),
-        opp AS (
+        WITH opp AS (
             SELECT
                 player_id,
                 ANY_VALUE(full_name)   AS full_name,
                 ANY_VALUE(position)    AS position,
                 ANY_VALUE(posteam)     AS team,
                 CAST(season AS INTEGER) AS season,
+                CASE WHEN week >= 19 THEN 'POST' ELSE 'REG' END AS season_type,
                 SUM(total_fantasy_points)     AS total_fp,
                 SUM(total_fantasy_points_exp) AS total_fp_exp
             FROM ff_opportunity
             WHERE player_id IS NOT NULL
-            GROUP BY player_id, CAST(season AS INTEGER)
+            GROUP BY player_id, CAST(season AS INTEGER), CASE WHEN week >= 19 THEN 'POST' ELSE 'REG' END
+        ),
+        in_force AS (
+            SELECT * EXCLUDE (rn) FROM (
+                SELECT opp.player_id, opp.season, opp.season_type, c.position, c.year_signed,
+                       c.apy, c.apy_cap_pct AS cap_pct,
+                       ROW_NUMBER() OVER (PARTITION BY opp.player_id, opp.season, opp.season_type
+                                          ORDER BY c.year_signed DESC, c.apy DESC) AS rn
+                FROM opp
+                JOIN contracts c
+                  ON c.gsis_id = opp.player_id
+                 AND opp.season BETWEEN c.year_signed AND c.year_signed + c.years - 1)
+            WHERE rn = 1
         )
         SELECT
             opp.player_id,
             opp.full_name,
-            COALESCE(opp.position, active.position) AS position,
+            COALESCE(opp.position, k.position) AS position,
             opp.team,
             opp.season,
-            ROUND(active.apy, 4)       AS apy,
-            ROUND(active.cap_pct, 4)   AS cap_pct,
+            opp.season_type,
+            k.year_signed              AS contract_year_signed,
+            ROUND(k.apy, 4)            AS apy,
+            ROUND(k.cap_pct, 4)        AS cap_pct,
             ROUND(opp.total_fp, 2)     AS total_fp,
             ROUND(opp.total_fp_exp, 2) AS total_fp_exp,
-            ROUND(opp.total_fp / NULLIF(active.apy, 0), 2) AS fp_per_million
+            ROUND(opp.total_fp / NULLIF(k.apy, 0), 2) AS fp_per_million
         FROM opp
-        JOIN active ON active.gsis_id = opp.player_id
+        LEFT JOIN in_force k USING (player_id, season, season_type)
     """),
 
     # 6. Injury return curve — post-return snap-share recovery (as % of pre-injury
@@ -1219,7 +1241,11 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
              AND sn.season = b.season
              AND sn.week   > b.last_out_week
              AND sn.week  <= b.last_out_week + 8
-            WHERE b.baseline_pct > 0
+            -- A baseline under a quarter of the offensive snaps is a backup, and a ratio over it
+            -- measures a promotion, not a recovery: with no floor the Concussion, WR, +6 mean read
+            -- 535.9 against a median of 106.5, from players at 1.6 to 5.9 percent who came back at
+            -- 62. The floor keeps 1,826 of 2,256 player-weeks and 648 of 764 rows.
+            WHERE b.baseline_pct >= 0.25
         )
         SELECT
             injury_type,
@@ -1314,12 +1340,17 @@ def _create_team_records(conn: duckdb.DuckDBPyConnection):
 # before the stamp exists has no row to compare.
 # 2: team_offense_stats.first_downs lost the doubled receiving term and gained the penalty term,
 # so the derived values changed. A container stamped 1 must rebuild, not serve the doubled column.
-DERIVED_SHAPE_VERSION = 2
+# 3: values and columns changed. Defensive sacks come from the opponents' box; formation_effectiveness,
+# player_td_luck and player_contract_value gained season_type; contract value uses the contract in
+# force that season; injury_return_curve has a baseline floor. A container stamped 2 must rebuild at
+# start.
+DERIVED_SHAPE_VERSION = 3
 
-# Tables that gained season_type together; probing all four catches every
-# database written before that change.
+# Tables that carry season_type; probing them catches every database written
+# before each gained it. The last three gained it at shape 3.
 _PROBE_TABLES = ("team_offense_stats", "team_defense_stats",
-                 "situational_stats", "player_separation_opportunity")
+                 "situational_stats", "player_separation_opportunity",
+                 "formation_effectiveness", "player_td_luck", "player_contract_value")
 
 
 # The two reads the staleness question needs, as SQL rather than as a method, so

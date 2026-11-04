@@ -454,8 +454,12 @@ class TestTeamTablesAreTheOfficialNumbers:
             box["passing_interceptions"] + box["fumbles_lost_total"], box["first_downs"],
             box["penalties"])
         defense = nfl_team_stats(team=team, season=2024, season_type="REG", side="defense")["defense"][0]
-        assert (defense["sacks"], defense["interceptions"]) == (
-            box["def_sacks"], box["def_interceptions"])
+        # sacks is what the opponents suffered, the other end of the same plays; interceptions is
+        # still this defence's own box column.
+        suffered = nfl_query(
+            f"SELECT SUM(sacks_suffered) AS n FROM team_stats_raw WHERE opponent_team = '{team}' "
+            f"AND season = 2024 AND season_type = 'REG'")["rows"][0]["n"]
+        assert (defense["sacks"], defense["interceptions"]) == (suffered, box["def_interceptions"])
 
     def test_a_sack_is_not_a_pass_attempt(self):
         """The old table counted a sack in pass_plays: Kansas City 2024 said 741."""
@@ -751,11 +755,12 @@ class TestTeamTablesAreTheOfficialNumbers:
         as 0.33. avg_epa_allowed is the one figure left on plays: no box carries expected points, and
         the row holds no companion count that it claims to divide.
 
-        The audit turned up one pair that is not a rate but reads like one. plays_against adds the
-        opponents' sacks_suffered while sacks reports this defence's own def_sacks, and the two ends
-        of one sack are not always charged the same way: 9 of the 32 rows of the 2024 regular season
-        differ (Dallas 51 def_sacks against 52 sacks suffered by its opponents), by at most 2, so
-        plays_against cannot be decomposed out of the row. turnovers_forced has no such problem - its        interception half equals interceptions on every one of the 46 team-season rows of 2024."""
+        The audit turned up one pair that read like a rate and was not one. plays_against adds the
+        opponents' sacks_suffered while sacks used to report this defence's own def_sacks, and the
+        box does not charge both ends of a sack the same way: 9 of the 46 rows of 2024 differ, by at
+        most 2. sacks now reads the opponents' sacks_suffered, so the row decomposes; the raw gap
+        below is pinned to show why def_sacks is not the source. turnovers_forced has no such
+        problem - its interception half equals interceptions on every one of the 46 rows of 2024."""
         # Both checks run in SQL: Python rounds 117 / 208 = 56.25 to even (56.2) and DuckDB rounds
         # it away from zero (56.3), which is the value the table holds.
         bad = nfl_query(
@@ -1905,3 +1910,51 @@ class TestNflTeamRecordsIntegration:
         assert all(row["team"] == "PHI" for row in bounded)
         unbounded = nfl_team_records(team="PHI")["records"]
         assert len(bounded) <= len(unbounded)
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("require_db")
+class TestAuditFindingsAreFixed:
+    """The values the three data audits found wrong, read through the rebuilt copy. Every expected
+    number below was printed by the rebuilt tables and checked against the source rows beside it."""
+
+    def test_the_defence_suffers_the_sacks_the_offence_suffered(self):
+        # def_sacks left out sacks credited to no player and counted half-sacks: Buffalo 2024
+        # regular season read 37 where its opponents suffered 39, 9 of 46 rows off.
+        totals = nfl_query(
+            "SELECT (SELECT SUM(sacks) FROM team_defense_stats) AS d, "
+            "(SELECT SUM(sacks_suffered) FROM team_offense_stats) AS o")["rows"][0]
+        assert totals["d"] == totals["o"]
+        buf = nfl_team_stats(team="BUF", season=2024, season_type="REG", side="defense")
+        assert buf["defense"][0]["sacks"] == 39
+
+    def test_formation_rows_are_one_season_type_of_scrimmage_plays(self):
+        # 641 regular-season pass plays less Kansas City's two two-point passes; the old row held
+        # 739, the postseason's 98 included.
+        rows = nfl_query(
+            "SELECT season_type, SUM(plays) AS plays, SUM(touchdowns) AS tds "
+            "FROM formation_effectiveness WHERE team = 'KC' AND season_year = 2024 "
+            "AND play_type = 'pass' GROUP BY 1 ORDER BY 1 DESC")["rows"]
+        assert rows[0]["season_type"] == "REG" and rows[0]["plays"] == 639
+        # Offensive scores only: the same 26 passing touchdowns the team box has.
+        assert rows[0]["tds"] == nfl_team_stats(team="KC", season=2024, season_type="REG",
+                                                side="offense")["offense"][0]["passing_tds"]
+
+    def test_td_luck_keeps_the_playoffs_out_of_the_regular_season(self):
+        # Saquon Barkley 2024 read 18 rushing touchdowns: 13 regular season and 5 postseason.
+        got = nfl_td_luck(player_id="00-0034844", season=2024, season_type="ALL")["td_luck"]
+        assert sorted((r["season_type"], r["rush_td"]) for r in got) == [("POST", 5.0), ("REG", 13.0)]
+        assert [r["season_type"] for r in nfl_td_luck(player_id="00-0034844", season=2024)[
+            "td_luck"]] == ["REG"]
+
+    def test_contract_value_uses_the_contract_in_force_that_season(self):
+        # Barkley played 2024 on the 3-year deal he signed in 2024 (12.58 APY), not the 20.6 APY
+        # extension signed in 2025 that the old table divided every season by.
+        got = nfl_contract_value(player_id="00-0034844", season=2024)["contract_value"][0]
+        assert (got["contract_year_signed"], got["apy"], got["season_type"]) == (2024, 12.5833, "REG")
+
+    def test_the_injury_curve_only_samples_a_quarter_of_the_snaps_or_more(self):
+        # With no floor the largest mean read 20000.0, a near-zero baseline divided into a starter's
+        # share; at 25% the largest recovery any player-week carries is 318.2.
+        worst = nfl_query("SELECT MAX(avg_snap_pct_recovery) AS m FROM injury_return_curve")
+        assert worst["rows"][0]["m"] <= 400
