@@ -193,7 +193,10 @@ nfl-mcp rebuild           # rebuilds the derived tables from the rows already lo
 
 Every `nfl-mcp ingest` run ends by rebuilding the derived tables (`team_offense_stats`, `team_defense_stats`, `situational_stats`, the `player_*` tables, `injury_return_curve`, `team_records`), so a normal refresh keeps them current. `nfl-mcp rebuild` does that step alone, with no network and no download. Measured with the shape version 3 code, wall time including Python start-up: **1.8 s** for a first run against a 200 MB database holding 110,710 plays and **1.1 s** for a repeat run, and **1.2 s** then **1.1 s** against a 92 MB database holding 46,779 plays. The published seed holds plays back to 1999, so allow a few seconds there. The step reads rows already on disk and downloads nothing. One rebuild is one transaction: stop it halfway and the tables stay exactly as they were.
 
-**If you updated from an older version:** a database ingested before the update holds the previous column shapes, and the nine tools that read those tables answer with a rebuild message rather than wrong numbers. Stop the server, run `nfl-mcp rebuild`, and start again — DuckDB takes an exclusive lock for a write, so do not run it while the server is serving the same file. In a container, run `/update_db.sh` instead, or just restart the container: `entrypoint.sh` checks the shape and rebuilds it before the server starts.
+**If you updated from an older version:** a database ingested before the update holds the previous column shapes, and the nine tools that read those tables answer with a rebuild message rather than wrong numbers. Stop the server, run `nfl-mcp rebuild`, and start again — DuckDB takes an exclusive lock for a write, so do not run it while the server is serving the same file. In a container, run `/update_db.sh`, or recreate the container from the new image: `docker pull` followed by
+`docker restart` keeps running the image the container was created from, so it changes nothing on its own. With
+compose, `docker compose pull && docker compose up -d` recreates it for you. Once the new image is running,
+`entrypoint.sh` checks the shape and rebuilds it before the server starts.
 
 ## Datasets
 
