@@ -487,7 +487,7 @@ TOOLS = [
         description=(
             "PREFERRED for snap count questions. Look up how many offensive, defensive, "
             "and special teams snaps a player or team unit played. Filter by player, "
-            "team, season, week, or position."
+            "team, season, week, position, or season type."
         ),
         inputSchema={
             "type": "object",
@@ -516,6 +516,11 @@ TOOLS = [
                     "type": "string",
                     "description": "Position filter (e.g. TE, WR, CB).",
                 },
+                "season_type": {
+                    "type": "string",
+                    "enum": ["REG", "POST", "WC", "DIV", "CON", "SB"],
+                    "description": "REG, POST (every playoff round), or one round: WC, DIV, CON, SB. Omit for every game.",
+                },
             },
         },
     ),
@@ -523,7 +528,9 @@ TOOLS = [
         name="nfl_fantasy_opportunity",
         description=(
             "PREFERRED for fantasy football opportunity questions. Look up target share, "
-            "air yards share, carry share, and opportunity scores per player per week. "
+            "air yards share and carry share (target_share_pct, air_yards_share_pct, "
+            "carry_share_pct, each 0-100 of the team's weekly total), the counts behind them, "
+            "and expected fantasy points per player per week. "
             "Requires ff_opportunity dataset. Available 2006–present. Filter by player, "
             "team, season, week, or position."
         ),
@@ -696,8 +703,9 @@ TOOLS = [
             "PREFERRED for usage-trend / breakout / fade questions. Returns weekly snap %, "
             "target share, carry share, and air-yards share with a trailing 3-week average "
             "and the current-week delta vs that average. Use for 'whose role is trending up' "
-            "or 'is player X's snap share rising'. Default sort is biggest snap-share gain "
-            "first (snap_pct_delta DESC)."
+            "or 'is player X's snap share rising'. season_type defaults to REG, and the 3-week "
+            "window never mixes regular-season and playoff weeks. Default sort is biggest "
+            "snap-share gain first (snap_pct_delta DESC)."
         ),
         inputSchema={
             "type": "object",
@@ -709,6 +717,11 @@ TOOLS = [
                 "season": {"type": "integer", "description": "Exact season year."},
                 "week": {"type": "integer", "description": "Week number."},
                 "min_snap_pct": {"type": "number", "description": "Minimum snap % (0–100) for the week."},
+                "season_type": {
+                    "type": "string",
+                    "enum": ["REG", "POST", "ALL"],
+                    "description": "REG (regular season, the default), POST (playoffs), or ALL for both scopes - they stay separate rows.",
+                },
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
             },
         },
@@ -760,6 +773,7 @@ TOOLS = [
             "plus contested targets and created receptions. Use for 'who drops the most passes' "
             "or 'what is player X's drop rate'. Player names work in full form or the "
             "nflverse short form ('Justin Jefferson' or 'J.Jefferson'). "
+            "Each row is one player, season and season_type; season_type defaults to REG. "
             "Default sort is highest drop rate first."
         ),
         inputSchema={
@@ -770,6 +784,11 @@ TOOLS = [
                 "team": {"type": "string", "description": "Team abbreviation."},
                 "season": {"type": "integer", "description": "Exact season year (2022+)."},
                 "min_targets": {"type": "integer", "description": "Minimum catchable targets to qualify."},
+                "season_type": {
+                    "type": "string",
+                    "enum": ["REG", "POST", "ALL"],
+                    "description": "REG (regular season, the default), POST (playoffs), or ALL for both scopes - they stay separate rows.",
+                },
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
             },
         },

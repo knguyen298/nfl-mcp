@@ -695,7 +695,8 @@ def test_a_row_written_under_the_era_code_is_found_by_the_current_code(tmp_path,
     for table in ("rosters", "rosters_weekly"):
         conn.execute(f"CREATE TABLE {table} AS SELECT 'ERA01' AS gsis_id, 'OAK' AS team, "
                      "2019 AS season")
-    conn.execute('CREATE TABLE plays (season INT, week INT, posteam TEXT, defteam TEXT, down INT, '
+    conn.execute('CREATE TABLE plays (game_id TEXT, season INT, season_type TEXT, week INT, '
+                 'posteam TEXT, defteam TEXT, down INT, '
                  'ydstogo INT, play_type TEXT, yards_gained INT, epa DOUBLE, "desc" TEXT, '
                  'passer_player_name TEXT, rusher_player_name TEXT, receiver_player_name TEXT, '
                  'passer_player_id TEXT, rusher_player_id TEXT, receiver_player_id TEXT, '

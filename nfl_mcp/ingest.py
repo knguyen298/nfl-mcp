@@ -1030,6 +1030,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
                 o.posteam                                   AS team,
                 CAST(o.season AS INTEGER)                   AS season,
                 CAST(o.week AS INTEGER)                      AS week,
+                CASE WHEN o.week >= 19 THEN 'POST' ELSE 'REG' END AS season_type,
                 ROUND(100.0 * s.offense_pct, 2)             AS snap_pct,
                 ROUND(100.0 * o.rec_attempt  / NULLIF(o.rec_attempt_team, 0), 2)   AS target_share_pct,
                 ROUND(100.0 * o.rush_attempt / NULLIF(o.rush_attempt_team, 0), 2)  AS carry_share_pct,
@@ -1045,7 +1046,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
             WHERE o.player_id IS NOT NULL
         )
         SELECT
-            player_id, full_name, position, team, season, week,
+            player_id, full_name, position, team, season, season_type, week,
             snap_pct, target_share_pct, carry_share_pct, air_yards_share_pct,
             ROUND(AVG(snap_pct)            OVER w, 2) AS snap_pct_3wk,
             ROUND(AVG(target_share_pct)    OVER w, 2) AS target_share_pct_3wk,
@@ -1056,7 +1057,9 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
             ROUND(carry_share_pct     - AVG(carry_share_pct)     OVER w, 2) AS carry_share_pct_delta,
             ROUND(air_yards_share_pct - AVG(air_yards_share_pct) OVER w, 2) AS air_yards_share_pct_delta
         FROM base
-        WINDOW w AS (PARTITION BY player_id, season ORDER BY week ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+        -- The window stays inside one season_type, so a January row averages playoff weeks only.
+        WINDOW w AS (PARTITION BY player_id, season, season_type ORDER BY week
+                     ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
     """),
 
     # 3. Separation-adjusted opportunity — joins Next Gen Stats receiving (2016+) to
@@ -1162,6 +1165,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
             ANY_VALUE(p.receiver_player_name)   AS player,
             p.posteam                           AS team,
             p.season                            AS season,
+            p.season_type                       AS season_type,
             COUNT(*)                            AS catchable_targets,
             SUM(CASE WHEN f.is_drop THEN 1 ELSE 0 END)              AS drops,
             ROUND(100.0 * SUM(CASE WHEN f.is_drop THEN 1 ELSE 0 END)
@@ -1174,7 +1178,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
          AND f.nflverse_play_id = p.play_id
         WHERE f.is_catchable_ball = TRUE
           AND p.receiver_player_id IS NOT NULL
-        GROUP BY p.receiver_player_id, p.posteam, p.season
+        GROUP BY p.receiver_player_id, p.posteam, p.season, p.season_type
     """),
 
     # 5. Contract value efficiency — fantasy points per $M of average per year (APY),
@@ -1421,13 +1425,17 @@ def _create_team_records(conn: duckdb.DuckDBPyConnection):
 # player_td_luck and player_contract_value gained season_type; contract value uses the contract in
 # force that season; injury_return_curve has a baseline floor. A container stamped 2 must rebuild at
 # start.
-DERIVED_SHAPE_VERSION = 3
+# 4: player_drop_rate and player_role_trend gained season_type, and the role-trend window stays inside
+# one season_type. A container stamped 3 must rebuild at start.
+DERIVED_SHAPE_VERSION = 4
 
 # Tables that carry season_type; probing them catches every database written
-# before each gained it. The last three gained it at shape 3.
+# before each gained it. formation_effectiveness, player_td_luck and player_contract_value
+# gained it at shape 3, and the last two at shape 4.
 _PROBE_TABLES = ("team_offense_stats", "team_defense_stats",
                  "situational_stats", "player_separation_opportunity",
-                 "formation_effectiveness", "player_td_luck", "player_contract_value")
+                 "formation_effectiveness", "player_td_luck", "player_contract_value",
+                 "player_drop_rate", "player_role_trend")
 
 
 # The two reads the staleness question needs, as SQL rather than as a method, so

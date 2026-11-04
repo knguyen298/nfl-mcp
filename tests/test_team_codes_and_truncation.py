@@ -222,14 +222,14 @@ class TestSeasonTypeVocabulary:
         assert "2013" not in line
 
     def test_no_tool_offers_a_round_name_the_column_cannot_answer(self):
-        # A client that picks a round from the schema must land on the one tool whose
-        # column stores it.
+        # A client that picks a round from the schema must land on a tool whose column stores
+        # it: schedules.game_type and snap_counts.game_type both name the round.
         round_tools = {
             tool.name for tool in server.TOOLS
             if tool.inputSchema.get("properties", {}).get("season_type", {}).get("enum")
             and set(tool.inputSchema["properties"]["season_type"]["enum"]) & set(PLAYOFF_ROUNDS)
         }
-        assert round_tools == {"nfl_schedule"}
+        assert round_tools == {"nfl_schedule", "nfl_snap_counts"}
         for tool in server.TOOLS:
             season_type = tool.inputSchema.get("properties", {}).get("season_type")
             if tool.name in ("nfl_search_plays", "nfl_player_stats", "nfl_ftn_charting",
@@ -261,6 +261,12 @@ class TestSeasonTypeVocabulary:
                      "REG, POST", id="nfl_ftn_charting"),
         pytest.param(lambda c: nfl_separation_opportunity(season=2024, season_type=c),
                      "REG, POST, ALL", id="nfl_separation_opportunity"),
+        pytest.param(lambda c: tools.nfl_snap_counts(team="KC", season=2024, season_type=c),
+                     "REG, POST, WC, DIV, CON, SB", id="nfl_snap_counts"),
+        pytest.param(lambda c: tools.nfl_drop_rate(season=2024, season_type=c),
+                     "REG, POST, ALL", id="nfl_drop_rate"),
+        pytest.param(lambda c: tools.nfl_role_trend(season=2024, season_type=c),
+                     "REG, POST, ALL", id="nfl_role_trend"),
     ])
     def test_a_value_outside_the_column_vocabulary_is_refused_not_bound(
             self, call, accepted, monkeypatch):
@@ -300,10 +306,13 @@ class TestSeasonTypeVocabulary:
         pytest.param("nfl_compare", tools.SEASON_TYPES, id="nfl_compare"),
         pytest.param("nfl_ftn_charting", tools.SEASON_TYPES, id="nfl_ftn_charting"),
         pytest.param("nfl_schedule", tools.SCHEDULE_SEASON_TYPES, id="nfl_schedule"),
+        pytest.param("nfl_snap_counts", tools.SCHEDULE_SEASON_TYPES, id="nfl_snap_counts"),
         pytest.param("nfl_separation_opportunity", tools.SEPARATION_SEASON_TYPES,
                      id="nfl_separation_opportunity"),
         pytest.param("nfl_td_luck", tools.SEPARATION_SEASON_TYPES, id="nfl_td_luck"),
         pytest.param("nfl_contract_value", tools.SEPARATION_SEASON_TYPES, id="nfl_contract_value"),
+        pytest.param("nfl_drop_rate", tools.SEPARATION_SEASON_TYPES, id="nfl_drop_rate"),
+        pytest.param("nfl_role_trend", tools.SEPARATION_SEASON_TYPES, id="nfl_role_trend"),
     ])
     def test_the_schema_enum_offers_exactly_what_the_tool_accepts(self, name, accepted):
         """A client must not be offered a value the tool refuses, nor refused one it accepts.

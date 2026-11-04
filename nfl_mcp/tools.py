@@ -27,6 +27,7 @@ from .franchises import (
     canonical_team,
     era_name,
 )
+from .registry import REGISTRY
 from .schema_pbp import _SCHEMA_SUMMARY, _SCHEMA_CATEGORIES
 
 logger = logging.getLogger("nfl-mcp")
@@ -338,6 +339,21 @@ def _reversed_range(low_name: str, low: int | None, high_name: str, high: int | 
     return None
 
 
+# The registry table that sets a derived table's first season. A table missing here is its own source.
+_FLOOR_SOURCE = {
+    "team_offense_stats": "plays", "team_defense_stats": "plays", "situational_stats": "plays",
+    "player_td_luck": "ff_opportunity", "player_role_trend": "ff_opportunity",
+    "player_contract_value": "ff_opportunity", "player_drop_rate": "ftn_charting",
+    "player_separation_opportunity": "nextgen_stats_receiving", "team_records": "espn_team_records",
+}
+
+
+def _upstream_floor(table: str) -> int | None:
+    """The first season any source publishes for `table`, from the registry, or None if unknown."""
+    source = _FLOOR_SOURCE.get(table, table)
+    return next((d.min_season for d in REGISTRY.values() if d.table_name == source), None)
+
+
 def _coverage_reason(table: str, season: int | None = None, season_from: int | None = None,
                      season_to: int | None = None, column: str = "season",
                      filters: dict[str, Any] | None = None) -> tuple[bool, str]:
@@ -368,6 +384,12 @@ def _coverage_reason(table: str, season: int | None = None, season_from: int | N
         outside = ((season_from is not None and int(season_from) > high)
                    or (season_to is not None and int(season_to) < low))
     held = f"This database holds {table} for seasons {low} to {high}."
+    floor = _upstream_floor(table)
+    last = season if season is not None else season_to
+    if outside and floor is not None and last is not None and int(last) < floor:
+        # An ingest cannot load a season no source publishes, so the remedy is the floor, not a fetch.
+        return True, (f"No {table} rows for {asked}. {held} {table} starts in {floor}: no source "
+                      f"publishes an earlier season, so an ingest cannot load one.")
     if outside:
         return True, (f"No {table} rows for {asked}. {held} Ask for a season in that range, or "
                       "load the seasons you need with `nfl-mcp ingest --start <first> --end <last>`.")
@@ -617,9 +639,10 @@ def nfl_status() -> Dict[str, Any]:
             "COUNT(DISTINCT season) AS num_seasons "
             "FROM plays"
         )
+        # The shape stamp is not a table; "derived" below reports it.
         datasets = _execute(
             "SELECT dataset_id, table_name, SUM(row_count) as total_rows "
-            "FROM _ingest_metadata "
+            "FROM _ingest_metadata WHERE dataset_id <> 'derived_shape' "
             "GROUP BY dataset_id, table_name "
             "ORDER BY dataset_id"
         )
@@ -688,10 +711,10 @@ _TABLE_NAMES_SQL = (
 )
 
 
-def _live_names(sql: str) -> list[str]:
+def _live_names(sql: str, params: list[Any] | None = None) -> list[str]:
     """Names straight from the live schema; empty if the lookup itself fails."""
     try:
-        return [next(iter(row.values())) for row in _execute(sql)]
+        return [next(iter(row.values())) for row in _execute(sql, params)]
     except (duckdb.Error, ValueError, TimeoutError):
         return []
 
@@ -725,7 +748,25 @@ def _nearest(unknown: str, candidates: Iterable[str], limit: int = 5) -> list[st
     return sorted(unique, key=lambda c: (-_similarity(unknown, c), c))[:limit]
 
 
-def _sql_error_detail(exc: Exception) -> Dict[str, Any]:
+def _query_columns(sql: str | None) -> list[str]:
+    """Columns of the tables `sql` reads, or every column when those tables cannot be named.
+
+    Ranked against every table, a wrong column on player_drop_rate ('drop_pct') put two plays
+    columns ahead of drop_rate_pct, the one the query could have meant.
+    """
+    try:
+        tables = sorted(duckdb.get_table_names(sql)) if sql else []
+    except duckdb.Error:
+        tables = []
+    if tables:
+        marks = ", ".join("?" for _ in tables)
+        scoped = _live_names(f"{_COLUMN_NAMES_SQL} AND table_name IN ({marks})", tables)
+        if scoped:
+            return scoped
+    return _live_names(_COLUMN_NAMES_SQL)
+
+
+def _sql_error_detail(exc: Exception, sql: str | None = None) -> Dict[str, Any]:
     """Turn a DuckDB binder/catalog error into fields the caller can act on."""
     message = str(exc)
     spelled = [m.group("name") for m in _QUOTED_NAMES.finditer(message)]
@@ -736,7 +777,7 @@ def _sql_error_detail(exc: Exception) -> Dict[str, Any]:
         return {
             "code": "COLUMN_NOT_FOUND",
             "unknown_column": unknown,
-            "did_you_mean": _nearest(unknown, _live_names(_COLUMN_NAMES_SQL) + spelled),
+            "did_you_mean": _nearest(unknown, _query_columns(sql) + spelled),
             "hint": (
                 "Column names must match the schema exactly. Call "
                 "nfl_schema(table='<table>') for non-pbp tables, or "
@@ -799,7 +840,7 @@ def nfl_query(sql: str, max_rows: int = 100) -> Dict[str, Any]:
 
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
-        return {"error": str(e), **_sql_error_detail(e)}
+        return {"error": str(e), **_sql_error_detail(e, statement.query)}
 
 
 def nfl_search_plays(
@@ -874,7 +915,7 @@ def nfl_search_plays(
     max_rows = max(1, min(max_rows, _MAX_ROWS))   # a cap of zero reads as 'no rows exist'
 
     sql = (
-        f"SELECT season, week, posteam, defteam, down, ydstogo, play_type, "
+        f"SELECT game_id, season, season_type, week, posteam, defteam, down, ydstogo, play_type, "
         f"yards_gained, epa, \"desc\", passer_player_name, rusher_player_name, "
         f"receiver_player_name, passer_player_id, rusher_player_id, "
         f"receiver_player_id, touchdown, interception "
@@ -1381,6 +1422,11 @@ def nfl_compare(
                         " ORDER BY season_year, season_type", args),
                     "sources": _TEAM_STAT_SOURCES,
                 }
+                # The reason sits on the side that came back empty, because the answer is keyed by team.
+                if not out[entity]["offense"] and not out[entity]["defense"]:
+                    out[entity]["reason"] = _coverage_reason(
+                        "team_offense_stats", season, season_from, season_to, column="season_year",
+                        filters={"team": entity, "season_type": season_type})[1]
 
             return out
 
@@ -1527,6 +1573,8 @@ def nfl_catalog() -> Dict[str, Any]:
                 MAX(season)      AS max_season,
                 MAX(loaded_at)   AS last_loaded
             FROM _ingest_metadata
+            -- The shape stamp names no table a query can read; nfl_status reports it under "derived".
+            WHERE dataset_id <> 'derived_shape'
             GROUP BY dataset_id, table_name
             ORDER BY dataset_id
         """)
@@ -1671,7 +1719,11 @@ def nfl_schedule(
     """
     try:
         rows, flag = _execute_limited(sql, params if params else None, _MAX_ROWS)
-        return {"games": rows, "count": len(rows), **flag}
+        result = {"games": rows, "count": len(rows), **flag}
+        if not rows:
+            result["reason"] = _coverage_reason("schedules", season, filters={
+                "team": team, "week": week, "season_type": season_type})[1]
+        return result
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1785,10 +1837,14 @@ def nfl_snap_counts(
     season: int | None = None,
     week: int | None = None,
     position: str | None = None,
+    season_type: str | None = None,
 ) -> Dict[str, Any]:
     """
     Look up snap count data — how many snaps a player or team unit played.
     Returns offense, defense, and special teams snap counts and percentages.
+
+    season_type reads snap_counts.game_type, which names the playoff round, so it takes the
+    nfl_schedule vocabulary: REG, POST (every round), WC, DIV, CON or SB.
     """
     conditions: list[str] = []
     params: list[Any] = []
@@ -1809,6 +1865,9 @@ def nfl_snap_counts(
     if position:
         conditions.append("position ILIKE ?")
         params.append(position.upper())
+    refused = _season_type_filter(conditions, params, "game_type", season_type, rounds=True)
+    if refused is not None:
+        return refused
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
@@ -1823,10 +1882,12 @@ def nfl_snap_counts(
     """
     try:
         rows, flag = _execute_limited(sql, params if params else None, _MAX_ROWS)
-        return _echo_player(
-            {"snap_counts": _label_players(rows, name_key="player"), "count": len(rows), **flag},
-            identity,
-        )
+        result = {"snap_counts": _label_players(rows, name_key="player"), "count": len(rows), **flag}
+        if not rows:
+            result["reason"] = _coverage_reason("snap_counts", season, filters={
+                "player": player, "player_id": player_id, "team": team, "week": week,
+                "position": position, "season_type": season_type})[1]
+        return _echo_player(result, identity)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1870,21 +1931,26 @@ def nfl_fantasy_opportunity(
                receptions, receptions_exp, rec_yards_gained, rush_yards_gained,
                rec_touchdown, rush_touchdown,
                total_fantasy_points, total_fantasy_points_exp, total_fantasy_points_diff,
-               rec_attempt_team, rush_attempt_team
+               rec_attempt_team, rush_attempt_team,
+               -- The same share formulas player_role_trend uses, from the counts beside them.
+               ROUND(100.0 * rec_attempt   / NULLIF(rec_attempt_team, 0), 2)   AS target_share_pct,
+               ROUND(100.0 * rush_attempt  / NULLIF(rush_attempt_team, 0), 2)  AS carry_share_pct,
+               ROUND(100.0 * rec_air_yards / NULLIF(rec_air_yards_team, 0), 2) AS air_yards_share_pct
         FROM ff_opportunity
         WHERE {where}
         ORDER BY season DESC, week DESC, total_fantasy_points_exp DESC NULLS LAST
     """
     try:
         rows, flag = _execute_limited(sql, params if params else None, _MAX_ROWS)
-        return _echo_player(
-            {
-                "fantasy_opportunity": _label_players(rows, team_key="posteam"),
-                "count": len(rows),
-                **flag,
-            },
-            identity,
-        )
+        result = {"fantasy_opportunity": _label_players(rows, team_key="posteam"),
+                  "count": len(rows), **flag}
+        if not rows:
+            # ff_opportunity stores season as text, so the span is read as a number.
+            result["reason"] = _coverage_reason("ff_opportunity", season,
+                                                column="CAST(season AS INTEGER)", filters={
+                "player": player, "player_id": player_id, "team": team, "week": week,
+                "position": position})[1]
+        return _echo_player(result, identity)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -2051,7 +2117,10 @@ def nfl_ftn_charting(
     agg = rows[0] if rows else {}
     total = agg.get("total_plays") or 0
     if not total:
-        return _echo_player({"charting": {}, "total_plays": 0}, identity)
+        return _echo_player({"charting": {}, "total_plays": 0, "reason": _coverage_reason(
+            "ftn_charting", season, season_from, season_to, filters={
+                "player": player, "player_id": player_id, "team": team, "opponent": opponent,
+                "week": week, "season_type": season_type})[1]}, identity)
 
     def _pct(n: Any) -> float:
         return round(100.0 * (n or 0) / total, 1)
@@ -2154,6 +2223,7 @@ def nfl_role_trend(
     season: int | None = None,
     week: int | None = None,
     min_snap_pct: float | None = None,
+    season_type: str | None = SEPARATION_DEFAULT_SEASON_TYPE,
     limit: int = 50,
 ) -> Dict[str, Any]:
     """
@@ -2161,6 +2231,9 @@ def nfl_role_trend(
     trailing 3-week average and the current-week delta vs that average (from
     player_role_trend). Surfaces players whose usage is rising or fading. Default
     sort is biggest snap-share gain first (snap_pct_delta DESC).
+
+    season_type defaults to 'REG' ('POST', or 'ALL' for both). The 3-week window never crosses
+    from the regular season into the playoffs: a week-20 row averages playoff weeks only.
     """
     try:
         limit = max(1, min(int(limit), _MAX_ROWS))
@@ -2188,10 +2261,14 @@ def nfl_role_trend(
     if min_snap_pct is not None:
         conditions.append("snap_pct >= ?")
         params.append(float(min_snap_pct))
+    refused = _season_type_filter(conditions, params, "season_type", season_type,
+                                  allow_all=True, blank_means=SEPARATION_DEFAULT_SEASON_TYPE)
+    if refused is not None:
+        return refused
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
-        SELECT player_id, full_name, position, team, season, week,
+        SELECT player_id, full_name, position, team, season, season_type, week,
                snap_pct, target_share_pct, carry_share_pct, air_yards_share_pct,
                snap_pct_3wk, target_share_pct_3wk, carry_share_pct_3wk, air_yards_share_pct_3wk,
                snap_pct_delta, target_share_pct_delta, carry_share_pct_delta, air_yards_share_pct_delta
@@ -2204,7 +2281,12 @@ def nfl_role_trend(
         if stale is not None:
             return stale
         rows, flag = _execute_limited(sql, params if params else None, limit)
-        return _echo_player({"role_trend": _label_players(rows), "count": len(rows), **flag}, identity)
+        result = {"role_trend": _label_players(rows), "count": len(rows), **flag}
+        if not rows:
+            result["reason"] = _coverage_reason("player_role_trend", season, filters={
+                "player": player, "player_id": player_id, "position": position, "team": team,
+                "week": week, "min_snap_pct": min_snap_pct, "season_type": season_type})[1]
+        return _echo_player(result, identity)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -2307,6 +2389,7 @@ def nfl_drop_rate(
     team: str | None = None,
     season: int | None = None,
     min_targets: int | None = None,
+    season_type: str | None = SEPARATION_DEFAULT_SEASON_TYPE,
     limit: int = 50,
 ) -> Dict[str, Any]:
     """
@@ -2314,6 +2397,8 @@ def nfl_drop_rate(
     charting (2022+) joined to plays (player_drop_rate). Also reports contested
     targets and created receptions. Default sort is highest drop rate first
     (drop_rate_pct DESC).
+
+    Each row is one season_type, 'REG' by default ('POST', or 'ALL' for both as separate rows).
     """
     try:
         limit = max(1, min(int(limit), _MAX_ROWS))
@@ -2338,10 +2423,14 @@ def nfl_drop_rate(
     if min_targets is not None:
         conditions.append("catchable_targets >= ?")
         params.append(int(min_targets))
+    refused = _season_type_filter(conditions, params, "season_type", season_type,
+                                  allow_all=True, blank_means=SEPARATION_DEFAULT_SEASON_TYPE)
+    if refused is not None:
+        return refused
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
-        SELECT player_id, player, team, season,
+        SELECT player_id, player, team, season, season_type,
                (SELECT position FROM players WHERE gsis_id = player_drop_rate.player_id)
                    AS position,
                catchable_targets, drops, drop_rate_pct,

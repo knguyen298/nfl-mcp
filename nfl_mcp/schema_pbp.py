@@ -50,7 +50,7 @@ _SCHEMA_CATEGORIES = {
     "game_context": """
 GAME CONTEXT
   play_id          DOUBLE PRECISION  nflreadpy play identifier
-  game_id          TEXT              e.g. '2024_01_KC_BAL'
+  game_id          TEXT              e.g. '2024_01_BAL_KC' (season_week_away_home)
   old_game_id      TEXT              legacy ESPN/NFL game ID
   nfl_api_id       TEXT              NFL API identifier
   season           INTEGER           1999–current

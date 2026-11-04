@@ -7,6 +7,7 @@ from click.testing import CliRunner
 
 import nfl_mcp.cli as cli
 from nfl_mcp.cli import main, _season_window_label
+from nfl_mcp.ingest import DERIVED_SHAPE_VERSION
 from nfl_mcp.registry import ALL_DATASETS, DEFAULT_DATASETS, REGISTRY
 
 
@@ -573,8 +574,8 @@ class TestDoctorCommand:
         conn.execute("CREATE TABLE _ingest_metadata (dataset_id VARCHAR, table_name VARCHAR, season INTEGER, "
                      "row_count BIGINT, loaded_at TIMESTAMP, loader_fn VARCHAR)")
         conn.execute("INSERT INTO _ingest_metadata VALUES "
-                     "('derived_shape', 'derived_shape', NULL, 3, ?, 'nfl_mcp.ingest.rebuild_derived_tables'), "
-                     "('pbp', 'plays', 2024, 3, ?, 'load_pbp')", [built, fetched])
+                     "('derived_shape', 'derived_shape', NULL, ?, ?, 'nfl_mcp.ingest.rebuild_derived_tables'), "
+                     "('pbp', 'plays', 2024, 3, ?, 'load_pbp')", [DERIVED_SHAPE_VERSION, built, fetched])
         conn.close()
 
     def test_doctor_happy_path_reports_success(self, runner, monkeypatch, tmp_path):
@@ -597,7 +598,8 @@ class TestDoctorCommand:
 
         result = runner.invoke(main, ["doctor"])
         assert result.exit_code == 0
-        assert "Derived shape version 3 (this build writes 3)" in result.output
+        assert (f"Derived shape version {DERIVED_SHAPE_VERSION} "
+                f"(this build writes {DERIVED_SHAPE_VERSION})") in result.output
         assert "after the last fetch" in result.output
         assert "Last real fetch: 2026-10-31 23:00:00" in result.output
         assert "Active slot: nflread_b.duckdb" in result.output

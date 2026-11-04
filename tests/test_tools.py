@@ -1202,6 +1202,34 @@ class TestNflStatus:
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("require_db")
+class TestPostseasonScope:
+    """A playoff row says it is one, and a season-type filter reads only that scope."""
+
+    def test_search_plays_rows_name_the_game_and_its_season_type(self):
+        rows = nfl_search_plays(season=2024, season_type="POST", max_rows=5)["rows"]
+        assert rows and all(r["season_type"] == "POST" and r["game_id"].startswith("2024_")
+                            for r in rows)
+
+    def test_snap_counts_take_a_postseason_filter(self):
+        rows = tools.nfl_snap_counts(team="KC", season=2024, season_type="POST")["snap_counts"]
+        assert rows and {r["game_type"] for r in rows} <= {"WC", "DIV", "CON", "SB"}
+
+    def test_fantasy_opportunity_returns_the_shares_its_description_promises(self):
+        rows = tools.nfl_fantasy_opportunity(team="KC", season=2024, week=1)["fantasy_opportunity"]
+        row = next(r for r in rows if r["rec_attempt"])
+        assert row["target_share_pct"] == round(100.0 * row["rec_attempt"] / row["rec_attempt_team"], 2)
+        assert {"carry_share_pct", "air_yards_share_pct"} <= set(row)
+
+    def test_drop_rate_and_role_trend_default_to_the_regular_season(self):
+        drops = tools.nfl_drop_rate(season=2024, season_type="ALL", limit=500)["drop_rate"]
+        assert {r["season_type"] for r in drops} == {"REG", "POST"}
+        assert {r["season_type"] for r in tools.nfl_drop_rate(season=2024)["drop_rate"]} == {"REG"}
+        trend = tools.nfl_role_trend(season=2024, season_type="POST", limit=500)["role_trend"]
+        assert trend and all(r["season_type"] == "POST" and r["week"] >= 19 for r in trend)
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("require_db")
 class TestNflCatalog:
     def test_returns_datasets_list(self):
         result = nfl_catalog()
@@ -1219,6 +1247,25 @@ class TestNflCatalog:
     def test_total_datasets_matches_list(self):
         result = nfl_catalog()
         assert result["total_datasets"] == len(result["datasets"])
+
+    def test_lists_only_tables_a_query_can_read(self):
+        """The shape stamp is a metadata row, not a table: a model that saw it listed queried it."""
+        listed = [d["table_name"] for d in nfl_catalog()["datasets"]]
+        listed += [d["table_name"] for d in nfl_status()["datasets"]["loaded"]]
+        assert "derived_shape" not in listed
+        assert nfl_status()["derived"]["shape_version"] == DERIVED_SHAPE_VERSION
+
+    def test_every_example_game_id_in_the_schema_text_is_a_real_game(self):
+        """The example is what a model copies, and nflverse writes away first, home second."""
+        import re
+
+        from nfl_mcp import schema_pbp
+        text = schema_pbp._SCHEMA_SUMMARY + "".join(schema_pbp._SCHEMA_CATEGORIES.values())
+        ids = sorted(set(re.findall(r"\b(\d{4}_\d{2}_[A-Z]{2,3}_[A-Z]{2,3})\b", text)))
+        assert ids
+        found = tools._execute(
+            f"SELECT game_id FROM schedules WHERE game_id IN ({', '.join('?' for _ in ids)})", ids)
+        assert sorted(r["game_id"] for r in found) == ids
 
 
 @pytest.mark.integration

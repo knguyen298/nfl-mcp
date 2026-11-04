@@ -453,7 +453,8 @@ def test_compare_team_binds_the_code_and_refuses_a_non_code(monkeypatch):
 
     tools.nfl_compare(entity1="oak", entity2="BAL", compare_type="team", season=2024)
     reads = _data_reads(calls)
-    assert len(calls) == 6                          # 2 staleness lookups, then 4 data reads
+    # 2 staleness lookups, 4 data reads, then the season span each empty side reads for its reason
+    assert len(calls) == 8
     assert len(reads) == 4
     assert "team IN (?, ?)" in reads[0][0]
     assert reads[0][1][:2] == ["OAK", "LV"]         # the typed code binds, with its alias
@@ -644,6 +645,32 @@ def test_nfl_query_falls_back_to_duckdb_candidates_when_schema_lookup_fails(monk
     assert result["code"] == "COLUMN_NOT_FOUND"
     assert "play_type" in result["did_you_mean"]
     assert "epa" not in result["did_you_mean"]
+
+
+def _scoped_schema(sql, params=None, row_limit=None):
+    """Fake _execute: plays columns everywhere, player_drop_rate's own when the lookup is scoped."""
+    if "information_schema" not in sql:
+        raise duckdb.BinderException('Referenced column "drop_pct" not found in FROM clause!')
+    if params == ["player_drop_rate"]:
+        return [{"column_name": c} for c in ("drop_rate_pct", "drops", "season")]
+    if params:
+        return []
+    return [{"column_name": c} for c in ("passing_drop_pct", "receiving_drop_pct", "drop_rate_pct")]
+
+
+def test_column_suggestions_come_from_the_tables_the_query_reads(monkeypatch):
+    monkeypatch.setattr(tools, "_execute", _scoped_schema)
+    assert tools.nfl_query("SELECT drop_pct FROM player_drop_rate")["did_you_mean"][0] == "drop_rate_pct"
+    # A table the schema does not know scopes to nothing, so every column is ranked instead.
+    assert "passing_drop_pct" in tools.nfl_query("SELECT drop_pct FROM elsewhere")["did_you_mean"]
+
+
+def test_column_suggestions_rank_every_column_when_the_tables_cannot_be_named(monkeypatch):
+    monkeypatch.setattr(tools, "_execute", _scoped_schema)
+    monkeypatch.setattr(tools.duckdb, "get_table_names",
+                        lambda sql: (_ for _ in ()).throw(duckdb.ParserException("no")))
+    assert "passing_drop_pct" in tools.nfl_query("SELECT drop_pct FROM player_drop_rate")["did_you_mean"]
+    assert tools._query_columns(None) == ["passing_drop_pct", "receiving_drop_pct", "drop_rate_pct"]
 
 
 def test_similarity_prefers_the_last_word_of_a_snake_case_name():
@@ -927,7 +954,7 @@ def test_compare_team_applies_season_range_filters(monkeypatch):
     )
     assert "error" not in result
     reads = _data_reads(calls)
-    assert len(calls) == 6
+    assert len(calls) == 8                          # each empty side also reads the season span
     assert len(reads) == 4
     assert "season_year >= ?" in reads[0][0]
     assert "season_year <= ?" in reads[0][0]
@@ -1195,12 +1222,14 @@ def test_ftn_charting_exact_season_filter(monkeypatch):
     captured = {}
     monkeypatch.setattr(
         tools, "_execute",
-        lambda sql, params=None: captured.update(sql=sql, params=params) or [{"total_plays": 0}],
+        lambda sql, params=None: (captured.update(sql=sql, params=params) or [{"total_plays": 0}])
+        if "AS lo" not in sql else [{"lo": 2022, "hi": 2026}],
     )
     result = tools.nfl_ftn_charting(season=2024)
     assert "p.season = ?" in captured["sql"]
     assert captured["params"] == [2024]
-    assert result == {"charting": {}, "total_plays": 0}
+    assert result["charting"] == {} and result["total_plays"] == 0
+    assert result["reason"].startswith("No ftn_charting rows match")
 
 
 def test_ftn_charting_handles_null_averages(monkeypatch):
@@ -1222,7 +1251,8 @@ def test_ftn_charting_handles_null_averages(monkeypatch):
 def test_ftn_charting_empty_rows(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [])
     result = tools.nfl_ftn_charting(team="KC")
-    assert result == {"charting": {}, "total_plays": 0}
+    assert result == {"charting": {}, "total_plays": 0, "reason":
+                      "No ftn_charting rows for every season. The table is empty. Run `nfl-mcp ingest` to load it."}
 
 
 def test_ftn_charting_echoes_the_player_on_an_empty_result(monkeypatch):
@@ -1292,7 +1322,7 @@ def test_role_trend_builds_filters(monkeypatch):
     assert "player_id = ?" in captured["sql"]
     assert "snap_pct >= ?" in captured["sql"]
     assert "snap_pct_delta DESC" in captured["sql"]
-    assert captured["params"] == ["00-0036322", "TE", "KC", 2024, 8, 50.0]
+    assert captured["params"] == ["00-0036322", "TE", "KC", 2024, 8, 50.0, "REG"]
 
 
 def test_role_trend_invalid_limit_falls_back(monkeypatch):
@@ -1368,7 +1398,7 @@ def test_drop_rate_builds_filters(monkeypatch):
     assert "player_id = ?" in captured["sql"]
     assert "catchable_targets >= ?" in captured["sql"]
     assert "drop_rate_pct DESC" in captured["sql"]
-    assert captured["params"] == ["00-0036322", "TEN", 2024, 30]
+    assert captured["params"] == ["00-0036322", "TEN", 2024, 30, "REG"]
 
 
 def test_drop_rate_guards_pre_2022():
@@ -1543,13 +1573,31 @@ def test_coverage_reason_on_an_empty_or_unreadable_table(monkeypatch):
     (lambda: tools.nfl_search_plays(team="KC", season=2010, week=0), "plays"),
     (lambda: tools.nfl_team_records(team="KC", season=2010), "team_records"),
     (lambda: tools.nfl_team_records(season=2010), "team_records"),
+    (lambda: tools.nfl_schedule(season=2010), "schedules"),
+    (lambda: tools.nfl_snap_counts(season=2010), "snap_counts"),
+    (lambda: tools.nfl_fantasy_opportunity(season=2010), "ff_opportunity"),
+    (lambda: tools.nfl_ftn_charting(season=2010), "ftn_charting"),
+    (lambda: tools.nfl_role_trend(season=2010), "player_role_trend"),
+    (lambda: tools.nfl_compare("KC", "BUF", season=2010)["KC"], "team_offense_stats"),
 ], ids=["roster", "injuries", "td_luck", "contract_value", "team_stats", "search_plays",
-        "team_records", "team_records_all_teams"])
+        "team_records", "team_records_all_teams", "schedule", "snap_counts",
+        "fantasy_opportunity", "ftn_charting", "role_trend", "compare_team"])
 def test_an_empty_answer_says_what_the_database_holds(monkeypatch, call, table):
     monkeypatch.setattr(tools, "_execute", lambda sql, params=None:
                         [{"lo": 2024, "hi": 2026}] if "AS lo" in sql else [])
     reason = call()["reason"]
     assert reason.startswith(f"No {table} rows for season 2010.") and "2024 to 2026" in reason
+
+
+@pytest.mark.parametrize("table,kwargs,floor", [
+    ("rosters", {"season": 1900}, 1920),
+    ("schedules", {"season_to": 1990}, 1999),
+    ("team_offense_stats", {"season": 1990}, 1999),
+], ids=["rosters", "schedules_range", "derived_from_plays"])
+def test_a_season_before_the_upstream_floor_names_the_floor(monkeypatch, table, kwargs, floor):
+    _span(monkeypatch, 2024, 2026)
+    outside, reason = tools._coverage_reason(table, **kwargs)
+    assert outside is True and f"starts in {floor}" in reason and "nfl-mcp ingest" not in reason
 
 
 def test_coverage_reason_names_the_filters_that_emptied_an_answer_inside_the_span(monkeypatch):
