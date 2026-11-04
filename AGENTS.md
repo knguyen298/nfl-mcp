@@ -42,6 +42,10 @@ tests/
 1. `tools.py` — implement the function, add to `__all__`
 2. `server.py` — add a `Tool(...)` entry to `TOOLS` and an entry to `_DISPATCH`
 
+A tool reports a failure as a dict with a top-level `error` string. It can add a `hint`.
+`call_tool` in `server.py` sets `isError` on every answer that has that key, and it gives an
+exception the same shape. An empty answer is not an error: give it a `reason` instead.
+
 **Adding a new dataset** requires changes in exactly one file:
 1. `registry.py` — add a `DatasetDef` entry to `REGISTRY`
 
@@ -103,7 +107,7 @@ nfl-mcp ingest --dataset all --start 2024 --end 2024   # fast, CI-friendly
 nfl-mcp ingest --dataset all                             # all seasons, slow
 
 # After changing tool code, reinstall into Claude Desktop's venv
-pip install --force-reinstall /Users/eshaanbhattad/Desktop/nfl-mcp/
+pip install --force-reinstall /path/to/your/nfl-mcp/checkout
 # Then restart Claude Desktop
 ```
 
@@ -131,7 +135,9 @@ class TestMyNewTool:
 - **Path**: `~/.nfl-mcp/nflread.duckdb` (override with `NFL_MCP_DB_PATH` env var)
 - **Access**: always read-only at query time via `get_db_connection()` in `database.py`
 - **Metadata**: `_ingest_metadata` table tracks what datasets/seasons have been loaded
-- **Tables**: 33 tables total — use `nfl_schema()` to list them or `nfl_schema(table=<name>)` for columns
+- **Tables**: 42 tables in the local database in November 2026, `_ingest_metadata` included. The
+  number changes with the registry, so use `nfl_schema()` to list them or `nfl_schema(table=<name>)`
+  for columns.
 
 ## Dataset Registry
 
@@ -152,6 +158,9 @@ The ingest loop checks `_ingest_metadata` before every dataset+season. Re-runnin
 ## Derived Table Shape
 
 The derived tables (`team_offense_stats`, `team_defense_stats`, `situational_stats`, `formation_effectiveness`, the five `player_*` tables, `injury_return_curve` and `team_records`) are rebuilt from rows already in the database. `nfl-mcp ingest` rebuilds them at the end of every run, whether or not any dataset was fetched, and `nfl-mcp rebuild` rebuilds them on its own with no network at all.
+
+No structured tool reads `formation_effectiveness`. A client reaches it only through `nfl_query`,
+and `schema_pbp.py` says so. If you add a tool for it, keep it to one tool.
 
 - `nfl_mcp/ingest.py::DERIVED_SHAPE_VERSION` describes the column shape this code writes. Raise it in the same commit that changes a derived table's columns; `rebuild_derived_tables` stamps the number into `_ingest_metadata`.
 - `--check` also answers `stale` when a fetch is newer than the shape stamp (a `--skip-views` run): the
@@ -222,8 +231,9 @@ Rules:
   regressed to a no-op because the updater lived only in `Dockerfile.dev`, and
   `.github/workflows/docker.yml` builds `./Dockerfile` (no `file:` input). `tests/test_dockerfile_dev.py`
   guards this — extend it rather than deleting assertions.
-- Never re-ingest at container start. A cold ingest takes 10+ minutes and blocks
-  readiness behind any startup probe or health check; copy the seed instead.
+- Never re-ingest at container start. A cold ingest takes minutes (the `v0.5.0` image build ran the
+  full ingest, ESPN records included, in 4 m 46 s) and blocks readiness behind any startup probe
+  or health check; copy the seed instead.
 - The seed bake passes `--pre1999` (ESPN season records, ~60 requests); the runtime ingest
   in `entrypoint.sh` and `update_db.sh` must not, or every refresh depends on a third-party
   API at runtime. `test_seed_includes_pre1999_records_but_runtime_does_not` guards this.
@@ -231,13 +241,17 @@ Rules:
   volume and no external storage. `/data` and `/var/log/nflmcp` are `chmod 777` so an
   arbitrary `--user` works. Anything that requires platform-specific storage (e.g. an
   Azure Files mount) is out of scope for the image design.
+- The server has no authentication. CORS allows every origin (`*`), and the container binds
+  `0.0.0.0`. This is deliberate, because nfl-mcp is a local tool server that reads a read-only
+  database. Do not publish port 8000 to an untrusted network. If you need remote access, put
+  an authenticating proxy in front of it. Do not add authentication to the image.
 - Use `ln -sfn`, not `ln -s`: the plain form fails with `File exists` on an existing
   regular file, and both scripts run `set -eu`, so the container crash-loops.
 - Scripts are POSIX `/bin/sh` (no `pipefail`); `sh -n` is asserted in the tests.
 
 ## Common Pitfalls
 
-- **Claude Desktop can't access `~/Desktop`** due to macOS sandboxing. The Claude Desktop venv must be outside Desktop — currently `~/nfl-mcp-venv`. Any code changes require `pip install --force-reinstall` into that venv.
+- **Claude Desktop cannot read files under `~/Desktop`**, because macOS sandboxes it. Put the virtualenv that Claude Desktop runs, and the checkout you install from, outside `~/Desktop` and the other protected folders (`~/Documents`, `~/Downloads`). After a code change, run `pip install --force-reinstall` into that virtualenv and restart Claude Desktop.
 - **DuckDB write lock**: the server opens read-only connections. Ingest opens a write connection. Don't run ingest while the server is running against the same DB file.
 - **Player names are abbreviated** (`'P.Mahomes'`, `'T.Hill'`) and are not unique: `nfl_resolve_player` in `tools.py` settles a name into one player. It is an internal function and not an MCP tool, so no client calls it directly; every tool with a `player` parameter runs it before it queries and returns the resolved id with the rows. Filter rows by `gsis_id` (`pfr_id` in `snap_counts`), never with `ILIKE '%name%'`. A name that covers several players returns `ambiguous` plus labelled candidates. Keep `ILIKE` only as the fallback in a raw `nfl_query` over a table that has no id column.
 - **Team codes are historical**: `plays` and `schedules` carry the code of the era (`OAK`, `SD`, `STL`). Normalize with `franchises.canonical_team()` instead of comparing raw codes across decades, or a Raiders-through-2024 query silently returns two franchises' worth of gaps.
@@ -246,8 +260,8 @@ Rules:
 - **`nfl_query` is last resort** — prefer structured tools. The tool descriptions use "PREFERRED for..." language intentionally to steer the model away from raw SQL.
 - **Models invent column names** (`play_epa` for `epa`). `_sql_error_detail` in `tools.py` turns DuckDB's binder/catalog text into `code` + `unknown_column`/`unknown_table` + `did_you_mean`, re-ranked against `information_schema` by last snake_case word, because DuckDB's own "Candidate bindings" are spelling-based and miss the real metric. Keep the vocabulary hints in `schema_pbp.py` up to date — that text is what the model actually reads.
 
-## Coverage Gaps (Known)
+## Coverage
 
-- `cli.py` (~29%): interactive wizard (`init`, `setup-client`) can't easily be unit tested
-- `ingest.py` (~25%): bulk ingest and network-dependent paths not covered without live nflreadpy calls
-- `tools.py` error paths: exception branches require DB failures to trigger
+CI holds the full suite at 100 percent line coverage (see Testing Strategy). There are no known
+gaps. A unit-only run (`pytest -m unit`) is lower, because some lines run only against a loaded
+database.

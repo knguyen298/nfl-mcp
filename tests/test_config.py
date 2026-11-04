@@ -4,6 +4,8 @@ import json
 import warnings
 from pathlib import Path
 
+import pytest
+
 import nfl_mcp.config as config
 
 
@@ -37,11 +39,16 @@ def test_load_config_merges_valid_json(tmp_path, monkeypatch):
     assert loaded["x"] == 1
 
 
-def test_load_config_recovers_from_malformed_json(tmp_path, monkeypatch):
+@pytest.mark.parametrize("text,problem", [
+    ("{ this is not valid json ", "Expecting property name"),
+    ("[]", "it holds a JSON list, not an object"),
+])
+def test_a_bad_config_is_reported_and_left_where_it_is(tmp_path, monkeypatch, text, problem):
+    """A read once renamed a malformed file to config.json.broken, and a list raised TypeError."""
     config_dir = tmp_path / "nfl-mcp"
     config_dir.mkdir()
     config_file = config_dir / "config.json"
-    config_file.write_text("{ this is not valid json ")
+    config_file.write_text(text)
 
     monkeypatch.setattr(config, "CONFIG_DIR", config_dir)
     monkeypatch.setattr(config, "CONFIG_FILE", config_file)
@@ -51,32 +58,9 @@ def test_load_config_recovers_from_malformed_json(tmp_path, monkeypatch):
         loaded = config.load_config()
 
     assert loaded == {**config._DEFAULT_CONFIG}
-    assert (config_dir / "config.json.broken").exists()
-    assert any("Malformed config" in str(w.message) for w in caught)
-
-
-def test_load_config_malformed_json_replace_failure_omits_backup_note(tmp_path, monkeypatch):
-    config_dir = tmp_path / "nfl-mcp"
-    config_dir.mkdir()
-    config_file = config_dir / "config.json"
-    config_file.write_text("{ this is not valid json ")
-
-    monkeypatch.setattr(config, "CONFIG_DIR", config_dir)
-    monkeypatch.setattr(config, "CONFIG_FILE", config_file)
-
-    def _raise_oserror(self, _target):
-        raise OSError("no permission")
-
-    monkeypatch.setattr(type(config_file), "replace", _raise_oserror, raising=True)
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        loaded = config.load_config()
-
-    assert loaded == {**config._DEFAULT_CONFIG}
-    assert not (config_dir / "config.json.broken").exists()
-    assert any("Malformed config" in str(w.message) for w in caught)
-    assert all("Backed up to" not in str(w.message) for w in caught)
+    assert sorted(p.name for p in config_dir.iterdir()) == ["config.json"]
+    assert config_file.read_text() == text
+    assert any(problem in str(w.message) and "nfl-mcp init" in str(w.message) for w in caught)
 
 
 def test_save_config_writes_file_and_returns_path(tmp_path, monkeypatch):
@@ -112,3 +96,17 @@ def test_config_exists_reflects_file_presence(tmp_path, monkeypatch):
     assert config.config_exists() is False
     config_file.write_text("{}")
     assert config.config_exists() is True
+
+
+def test_a_relative_config_path_is_read_from_the_config_directory(tmp_path, monkeypatch):
+    """Claude Desktop usually starts the server from /, where data/x.duckdb means nothing."""
+    monkeypatch.delenv("NFL_MCP_DB_PATH", raising=False)
+    monkeypatch.setattr(config, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(config, "load_config", lambda: {"duckdb_path": "data/x.duckdb"})
+    assert config.get_duckdb_path() == tmp_path / "data" / "x.duckdb"
+
+
+def test_a_relative_env_path_is_read_from_the_current_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NFL_MCP_DB_PATH", "x.duckdb")
+    assert config.get_duckdb_path() == tmp_path / "x.duckdb"

@@ -5,6 +5,8 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # docker.yml runs this whole workflow before it publishes an image.
+  workflow_call:
 
 jobs:
   test:
@@ -34,6 +36,19 @@ jobs:
         # Kept on the CI command (not pyproject addopts) so local unit-only
         # runs (`pytest -m unit`) are not held to the full-suite floor.
         run: pytest -q --cov-fail-under=100
+
+      - name: Type and lint counts must not rise
+        # Ceilings, not zero: the code carried these findings when the step was added. A PR
+        # that fixes some lowers the number here in the same commit. To raise a ceiling,
+        # change the number in its own commit and say in the PR which finding is new and why
+        # it stays. Never silence a finding with a comment to stay under it.
+        run: |
+          mypy_errors=$(mypy nfl_mcp | grep -c ': error:' || true)
+          ruff_findings=$(ruff check nfl_mcp tests --output-format json \
+            | python -c 'import json, sys; print(len(json.load(sys.stdin)))')
+          echo "mypy: $mypy_errors errors (ceiling 15), ruff: $ruff_findings findings (ceiling 98)"
+          test "$mypy_errors" -le 15
+          test "$ruff_findings" -le 98
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v7

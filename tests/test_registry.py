@@ -111,11 +111,11 @@ class TestSeasonCoverageWindows:
 
     def test_default_start_is_reachable_but_conservative(self):
         # FIRST_SEASON is the default backfill start (1966, the merger agreement year). It
-        # must sit inside the range --start accepts, and must not be deeper than the
-        # sources allow.
+        # must sit inside the range --start accepts. Its literal value is not pinned here:
+        # what a change to it costs is a dataset's history, and the test below names every
+        # dataset the default clips.
         from nfl_mcp.seasons import EARLIEST_SEASON, FIRST_SEASON
         assert EARLIEST_SEASON <= FIRST_SEASON
-        assert FIRST_SEASON == 1966
 
     def test_default_start_only_clips_the_oldest_dataset(self):
         # Only rosters predate the 1966 default, so the default costs exactly one

@@ -45,6 +45,18 @@ class TestServe:
         assert "localhost:8000" in result.output
         assert "all interfaces" in result.output
 
+    @pytest.mark.parametrize("var,value", [("NFL_MCP_DUCKDB_THREADS", "two"),
+                                           ("NFL_MCP_DUCKDB_MEMORY_LIMIT", "lots")])
+    def test_serve_refuses_a_duckdb_variable_it_cannot_use(self, runner, monkeypatch, var, value):
+        """Once these made every tool fail while the server reported itself healthy."""
+        started = []
+        monkeypatch.setattr("nfl_mcp.cli.uvicorn.run", lambda *a, **k: started.append(True))
+        monkeypatch.setenv(var, value)
+        result = runner.invoke(main, ["serve"])
+        assert result.exit_code == 1
+        assert f"{var}='{value}'" in result.output
+        assert not started
+
 
 # ── ingest --list ──────────────────────────────────────────────────────────────
 

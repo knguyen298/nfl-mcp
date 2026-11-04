@@ -6,7 +6,11 @@ import threading
 import duckdb
 import pytest
 
-from nfl_mcp.database import _connection_config, get_db_connection
+from nfl_mcp.database import (
+    _connection_config,
+    connection_config_problem,
+    get_db_connection,
+)
 
 _ENV_VARS = (
     "NFL_MCP_DUCKDB_MEMORY_LIMIT",
@@ -118,3 +122,29 @@ class TestGetDbConnection:
 
         assert total == 400000
         assert spilled, "DuckDB never wrote a spill file, so the query proved nothing"
+
+
+class TestConfigurationProblems:
+    @pytest.mark.parametrize("var,value,named", [
+        ("NFL_MCP_DUCKDB_THREADS", "two", "NFL_MCP_DUCKDB_THREADS='two'"),
+        ("NFL_MCP_DUCKDB_THREADS", "0", "NFL_MCP_DUCKDB_THREADS='0'"),
+        ("NFL_MCP_DUCKDB_MEMORY_LIMIT", "lots", "NFL_MCP_DUCKDB_MEMORY_LIMIT='lots'"),
+    ])
+    def test_a_bad_value_is_named(self, monkeypatch, var, value, named):
+        for other in _ENV_VARS:
+            monkeypatch.delenv(other, raising=False)
+        monkeypatch.setenv(var, value)
+        assert connection_config_problem().startswith(named)
+
+    def test_good_values_pass(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("NFL_MCP_DUCKDB_THREADS", "2")
+        monkeypatch.setenv("NFL_MCP_DUCKDB_MEMORY_LIMIT", "512MB")
+        monkeypatch.setenv("NFL_MCP_DUCKDB_TEMP_DIR", str(tmp_path))
+        assert connection_config_problem() is None
+
+    def test_a_missing_database_says_to_ingest_and_creates_nothing(self, monkeypatch, tmp_path):
+        target = tmp_path / "absent" / "nflread.duckdb"
+        monkeypatch.setenv("NFL_MCP_DB_PATH", str(target))
+        with pytest.raises(duckdb.IOException, match="nfl-mcp ingest"), get_db_connection():
+            pass
+        assert list(tmp_path.iterdir()) == []

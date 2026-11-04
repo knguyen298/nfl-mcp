@@ -30,7 +30,8 @@ Aggregate tables (faster for team-level queries):
   team_offense_stats  (team, season_year, season_type, total_plays, total_yards, avg_epa, ...)
   team_defense_stats  (team, season_year, season_type, yards_allowed, sacks, turnovers_forced, ...)
   situational_stats   (team, season_year, season_type, situation, plays, avg_epa, conversion_pct)
-  formation_effectiveness (team, season_year, season_type, formation, play_type, avg_epa, ...)
+  formation_effectiveness (team, season_year, season_type, formation, play_type, avg_epa, ...) —
+                      no structured tool reads it; query it with nfl_query
   player_stats        (player_id, season, season_type, week, attempts, carries, targets, ...) —
                       official counting stats per player per game, what nfl_player_stats sums
   team_records        (season, team, source_team, games, wins, losses, ties, source) — final
@@ -530,6 +531,7 @@ AGGREGATE TABLES  (pre-aggregated, much faster for team/season queries)
     -- formation values: 'SHOTGUN','UNDER CENTER','NO HUDDLE','SHOTGUN NO HUDDLE'
     -- scrimmage plays only (no two-point tries, no nullified downs), one row per season_type, and a
     --   group of fewer than 5 plays has no row. touchdowns counts the offence's own scores only.
+    -- no structured tool reads this table: nfl_query is the only way to it.
 
   player_stats  (player_id, player_name, season, season_type, week, game_id, team, opponent_team)
     -- nflreadpy's week-level stat table, one row per player per game: the official counting

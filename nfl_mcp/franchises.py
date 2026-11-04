@@ -59,7 +59,7 @@ FRANCHISES: dict[str, Franchise] = {f.key: f for f in (
     Franchise("BUF", "Buffalo Bills", 2, first_season=1960),
     Franchise("CAR", "Carolina Panthers", 29, first_season=1995),
     Franchise("CHI", "Chicago Bears", 3, first_season=1920,
-              eras=((1920, "Decatur Staleys"), (1922, "Chicago Staleys"), (1923, "Chicago Bears"))),
+              eras=((1920, "Decatur Staleys"), (1921, "Chicago Staleys"), (1922, "Chicago Bears"))),
     Franchise("CIN", "Cincinnati Bengals", 4, first_season=1968),
     # The Browns' name, history and records stayed in Cleveland while the players moved to
     # Baltimore, so the franchise is continuous — it simply did not play 1996–1998.
@@ -83,7 +83,8 @@ FRANCHISES: dict[str, Franchise] = {f.key: f for f in (
               eras=((1960, "Los Angeles Chargers"), (1961, "San Diego Chargers"),
                     (2017, "Los Angeles Chargers"))),
     Franchise("LV", "Las Vegas Raiders", 13, aliases=("OAK",), first_season=1960,
-              eras=((1960, "Oakland Raiders"), (2020, "Las Vegas Raiders"))),
+              eras=((1960, "Oakland Raiders"), (1982, "Los Angeles Raiders"),
+                    (1995, "Oakland Raiders"), (2020, "Las Vegas Raiders"))),
     Franchise("MIA", "Miami Dolphins", 15, first_season=1966),
     Franchise("MIN", "Minnesota Vikings", 16, first_season=1961),
     Franchise("NE", "New England Patriots", 17, first_season=1960,
@@ -102,7 +103,8 @@ FRANCHISES: dict[str, Franchise] = {f.key: f for f in (
               eras=((1960, "Houston Oilers"), (1997, "Tennessee Oilers"),
                     (1999, "Tennessee Titans"))),
     Franchise("WAS", "Washington Commanders", 28, aliases=("WSH", "TFN"), first_season=1932,
-              eras=((1932, "Washington Redskins"), (2020, "Washington Football Team"),
+              eras=((1932, "Boston Braves"), (1933, "Boston Redskins"),
+                    (1937, "Washington Redskins"), (2020, "Washington Football Team"),
                     (2022, "Washington Commanders"))),
 )}
 

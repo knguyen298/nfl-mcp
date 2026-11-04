@@ -21,21 +21,20 @@ dependencies = [
     "anyio>=4.5",         # server.py runs each tool call in a worker thread
     "duckdb>=2.0",         # 1.x splits PIVOT into CREATE + SELECT, and words file errors differently
     "pyarrow>=14.0",
-    "nflreadpy>=0.1",
+    "nflreadpy>=0.1.5,<0.2",  # 0.1.5 built the shipped seed; a new major release is untested here
     "polars>=0.20",
     "click>=8.0",
     "tqdm>=4.0",
     "starlette>=0.27",
     "uvicorn>=0.20",
-    "sse-starlette>=1.6",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-cov", "ruff", "mypy", "python-dotenv", "openai"]
+dev = ["pytest", "pytest-cov", "ruff", "mypy"]
 
 [project.urls]
-Homepage = "https://github.com/ebhattad/nfl-mcp"
-Issues   = "https://github.com/ebhattad/nfl-mcp/issues"
+Homepage = "https://github.com/knguyen298/nfl-mcp"
+Issues   = "https://github.com/knguyen298/nfl-mcp/issues"
 
 [project.scripts]
 nfl-mcp = "nfl_mcp.cli:main"
@@ -54,9 +53,8 @@ packages = ["nfl_mcp"]
 markers = [
     "unit: unit tests that do not require a loaded local DuckDB dataset",
     "integration: tests that require a loaded local DuckDB dataset",
-    "eval: tool routing evals that require an LLM API key (not run in CI)",
 ]
-addopts = "--cov=nfl_mcp --cov-report=term-missing --cov-report=xml --ignore=evals"
+addopts = "--cov=nfl_mcp --cov-report=term-missing --cov-report=xml"
 
 [tool.coverage.run]
 omit = ["nfl_mcp/schema_pbp.py"]  # pure data, no logic to cover

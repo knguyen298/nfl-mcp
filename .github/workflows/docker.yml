@@ -19,7 +19,15 @@ permissions:
   packages: write
 
 jobs:
+  # The weekly schedule moves :latest, which is what a plain `docker pull` gets, so every
+  # publish waits for the full test suite instead of tagging :latest on releases only.
+  test:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Check out source

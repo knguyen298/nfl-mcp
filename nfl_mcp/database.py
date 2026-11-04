@@ -28,7 +28,8 @@ def _connection_config() -> dict[str, Any]:
       NFL_MCP_DUCKDB_MEMORY_LIMIT  e.g. '512MB'
       NFL_MCP_DUCKDB_THREADS       e.g. '1'
       NFL_MCP_DUCKDB_TEMP_DIR      writable spill dir, e.g. '/tmp/.duckdb_spill'
-    Unset vars leave DuckDB's defaults (local/dev use).
+    Unset vars leave DuckDB's defaults (local/dev use). A value DuckDB cannot use raises
+    ValueError naming the variable; `nfl-mcp serve` asks connection_config_problem() at start.
     """
     config = dict(_LOCKED_CONFIG)
     mem = os.getenv("NFL_MCP_DUCKDB_MEMORY_LIMIT")
@@ -36,11 +37,34 @@ def _connection_config() -> dict[str, Any]:
         config["memory_limit"] = mem
     threads = os.getenv("NFL_MCP_DUCKDB_THREADS")
     if threads:
+        if not threads.strip().isdigit() or int(threads) < 1:
+            raise ValueError(f"NFL_MCP_DUCKDB_THREADS={threads!r} is not a whole number above "
+                             "zero. Set it to e.g. '1', or unset it.")
         config["threads"] = int(threads)
     spill = os.getenv("NFL_MCP_DUCKDB_TEMP_DIR")
     if spill:
         config["temp_directory"] = spill
     return config
+
+
+def connection_config_problem() -> str | None:
+    """Say what is wrong with the NFL_MCP_DUCKDB_* variables, or None when DuckDB accepts them.
+
+    The values are tried on an in-memory database, so a bad one stops `serve` at start
+    instead of failing every tool call while the server reports itself healthy.
+    """
+    try:
+        config = _connection_config()
+    except ValueError as e:
+        return str(e)
+    for key, var in (("memory_limit", "NFL_MCP_DUCKDB_MEMORY_LIMIT"),
+                     ("temp_directory", "NFL_MCP_DUCKDB_TEMP_DIR")):
+        if key in config:
+            try:
+                duckdb.connect(":memory:", config={key: config[key]}).close()
+            except duckdb.Error as e:
+                return f"{var}={config[key]!r} is not a value DuckDB accepts: {e}"
+    return None
 
 
 @contextmanager
@@ -53,7 +77,11 @@ def get_db_connection():
     the CLI keep opening their own writable connections.
     """
     db_path = get_duckdb_path()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if not db_path.exists():
+        # A read creates nothing: no file and no parent directory.
+        raise duckdb.IOException(
+            f"No database at {db_path}. Run 'nfl-mcp ingest' to build it, or set "
+            "NFL_MCP_DB_PATH to the file you built.")
     conn = duckdb.connect(str(db_path), read_only=True, config=_connection_config())
     try:
         yield conn

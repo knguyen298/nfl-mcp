@@ -49,6 +49,37 @@ class TestCanonicalTeam:
         assert set(ESPN_IDS.values()) == set(FRANCHISES)
 
 
+# Every move and rename the map knows, as the last season under the old name and the first
+# under the new one. 1985 LV once read "Oakland Raiders": the club was in Los Angeles.
+_ERA_CHANGES = [
+    ("ARI", 1959, "Chicago Cardinals", "St. Louis Cardinals"),
+    ("ARI", 1987, "St. Louis Cardinals", "Phoenix Cardinals"),
+    ("ARI", 1993, "Phoenix Cardinals", "Arizona Cardinals"),
+    ("CHI", 1920, "Decatur Staleys", "Chicago Staleys"),
+    ("CHI", 1921, "Chicago Staleys", "Chicago Bears"),
+    ("DET", 1933, "Portsmouth Spartans", "Detroit Lions"),
+    ("IND", 1983, "Baltimore Colts", "Indianapolis Colts"),
+    ("KC", 1962, "Dallas Texans", "Kansas City Chiefs"),
+    ("LA", 1945, "Cleveland Rams", "Los Angeles Rams"),
+    ("LA", 1994, "Los Angeles Rams", "St. Louis Rams"),
+    ("LA", 2015, "St. Louis Rams", "Los Angeles Rams"),
+    ("LAC", 1960, "Los Angeles Chargers", "San Diego Chargers"),
+    ("LAC", 2016, "San Diego Chargers", "Los Angeles Chargers"),
+    ("LV", 1981, "Oakland Raiders", "Los Angeles Raiders"),
+    ("LV", 1994, "Los Angeles Raiders", "Oakland Raiders"),
+    ("LV", 2019, "Oakland Raiders", "Las Vegas Raiders"),
+    ("NE", 1970, "Boston Patriots", "New England Patriots"),
+    ("NYJ", 1962, "New York Titans", "New York Jets"),
+    ("PIT", 1939, "Pittsburgh Pirates", "Pittsburgh Steelers"),
+    ("TEN", 1996, "Houston Oilers", "Tennessee Oilers"),
+    ("TEN", 1998, "Tennessee Oilers", "Tennessee Titans"),
+    ("WAS", 1932, "Boston Braves", "Boston Redskins"),
+    ("WAS", 1936, "Boston Redskins", "Washington Redskins"),
+    ("WAS", 2019, "Washington Redskins", "Washington Football Team"),
+    ("WAS", 2021, "Washington Football Team", "Washington Commanders"),
+]
+
+
 class TestEraName:
     @pytest.mark.parametrize("season,team,expected", [
         (1970, "IND", "Baltimore Colts"),
@@ -63,6 +94,14 @@ class TestEraName:
     ])
     def test_names_by_season(self, season, team, expected):
         assert era_name(season, team) == expected
+
+    @pytest.mark.parametrize("team,last,before,after", _ERA_CHANGES)
+    def test_every_change_of_name_lands_on_its_season(self, team, last, before, after):
+        assert (era_name(last, team), era_name(last + 1, team)) == (before, after)
+
+    def test_the_change_list_covers_every_era_in_the_map(self):
+        in_map = {(key, start) for key, f in FRANCHISES.items() for start, _ in sorted(f.eras)[1:]}
+        assert {(team, last + 1) for team, last, _, _ in _ERA_CHANGES} == in_map
 
     def test_unknown_team(self):
         assert era_name(1990, "ZZZ") is None

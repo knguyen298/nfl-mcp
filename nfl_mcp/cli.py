@@ -17,6 +17,7 @@ from pathlib import Path
 import click
 import uvicorn
 
+from .database import connection_config_problem
 from .server import create_app
 from .seasons import FIRST_SEASON, EARLIEST_SEASON, current_season
 
@@ -44,6 +45,9 @@ def main():
               help="Port to listen on.")
 def serve(host, port):
     """Start the MCP server over Streamable HTTP."""
+    problem = connection_config_problem()
+    if problem:
+        raise click.ClickException(problem)
     display_host = "localhost" if host == "0.0.0.0" else host
     click.echo(f"🏈 NFL MCP server listening on http://{display_host}:{port}/mcp")
     if host == "0.0.0.0":

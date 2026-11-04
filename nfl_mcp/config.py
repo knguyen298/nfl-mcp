@@ -27,25 +27,26 @@ def ensure_config_dir() -> Path:
 
 
 def load_config() -> dict[str, Any]:
-    """Load config from disk, falling back to defaults."""
-    if CONFIG_FILE.exists():
-        try:
-            with open(CONFIG_FILE) as f:
-                stored = json.load(f)
+    """Load config from disk, falling back to defaults.
+
+    A read never changes the file. A file that is not a JSON object is reported with a
+    warning and the defaults are used, so the user can still repair what they wrote.
+    """
+    if not CONFIG_FILE.exists():
+        return {**_DEFAULT_CONFIG}
+    try:
+        with open(CONFIG_FILE) as f:
+            stored = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        problem = str(e)
+    else:
+        if isinstance(stored, dict):
             return {**_DEFAULT_CONFIG, **stored}
-        except json.JSONDecodeError:
-            ensure_config_dir()
-            backup = CONFIG_FILE.with_suffix(".json.broken")
-            try:
-                CONFIG_FILE.replace(backup)
-                backup_note = f" Backed up to {backup}."
-            except OSError:
-                backup_note = ""
-            warnings.warn(
-                f"Malformed config at {CONFIG_FILE}.{backup_note} "
-                "Falling back to defaults; run 'nfl-mcp init' to regenerate config."
-            )
-            return {**_DEFAULT_CONFIG}
+        problem = f"it holds a JSON {type(stored).__name__}, not an object"
+    warnings.warn(
+        f"Cannot use the config at {CONFIG_FILE}: {problem}. Using the defaults. "
+        "Fix the file, or run 'nfl-mcp init' to write a new one."
+    )
     return {**_DEFAULT_CONFIG}
 
 
@@ -58,12 +59,18 @@ def save_config(config: dict[str, Any]) -> Path:
 
 
 def get_duckdb_path() -> Path:
-    """Return resolved path to the DuckDB database file."""
+    """Return the absolute path to the DuckDB database file.
+
+    A relative path in the config file is read from the config directory, because Claude
+    Desktop usually starts the server from `/`. A relative NFL_MCP_DB_PATH is read from the
+    current directory, where the shell that set it runs. Symlinks are kept: the container
+    swaps the database by moving the /data/nflread.duckdb link.
+    """
     # Env var override for CI / containers
     override = os.getenv("NFL_MCP_DB_PATH")
     if override:
-        return Path(override).expanduser()
-    return Path(load_config()["duckdb_path"]).expanduser()
+        return Path(override).expanduser().absolute()
+    return CONFIG_DIR / Path(load_config()["duckdb_path"]).expanduser()
 
 
 def config_exists() -> bool:

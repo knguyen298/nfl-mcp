@@ -452,8 +452,8 @@ class TestServerStaysResponsive:
             started = time.perf_counter()
             status = await server_module.call_tool("nfl_status", None)
             waited = time.perf_counter() - started
-            payload = json.loads((await query)[0].text)
-            return waited, payload, json.loads(status[0].text)
+            payload = json.loads((await query).content[0].text)
+            return waited, payload, json.loads(status.content[0].text)
 
         waited, query_payload, status_payload = asyncio.run(scenario())
         assert "error" not in query_payload

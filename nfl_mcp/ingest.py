@@ -1689,9 +1689,10 @@ def run_ingest_datasets(
         # them here means a run that ingests those two is reflected in the same run. This call also
         # stamps DERIVED_SHAPE_VERSION, so a database that a plain ingest has just refreshed answers
         # `nfl-mcp rebuild --check` as current instead of asking for a rebuild it no longer needs.
-        # apply_pragmas=False because this connection got its caps at line 1463 and the ingest has
-        # probably spilled by now: DuckDB refuses a second SET temp_directory once the first one has
-        # been used, and a container capped at 512MB crashed on exactly that after a full --fresh run.
+        # apply_pragmas=False because _apply_duckdb_pragmas capped this connection when
+        # run_ingest_datasets opened it, and the ingest has probably spilled by now: DuckDB refuses
+        # a second SET temp_directory once the first one has been used, and a container capped at
+        # 512MB crashed on exactly that after a full --fresh run.
         rebuild_derived_tables(conn, path, apply_pragmas=False)
 
     conn.close()
@@ -1707,20 +1708,3 @@ def run_ingest_datasets(
     print("=" * 60)
     return len(_failed_fetches)
 
-
-def run_ingest(
-    start: int = FIRST_SEASON,
-    end: int | None = None,
-    fresh: bool = False,
-    skip_views: bool = False,
-    db_path: str | None = None,
-) -> None:
-    """Backward-compatible entry point — ingests PBP only."""
-    run_ingest_datasets(
-        dataset_ids=["pbp"],
-        start=start,
-        end=end,
-        fresh=fresh,
-        skip_views=skip_views,
-        db_path=db_path,
-    )

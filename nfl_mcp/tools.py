@@ -331,6 +331,46 @@ def _unknown_team_error(team: str, param: str = "team") -> dict[str, Any]:
     }
 
 
+def _reversed_range(low_name: str, low: int | None, high_name: str, high: int | None) -> dict | None:
+    """Refuse a season range that ends before it starts, which otherwise answers an empty success."""
+    if low is not None and high is not None and int(low) > int(high):
+        return {"error": f"{low_name}={low} is after {high_name}={high}. Swap the two values."}
+    return None
+
+
+def _coverage_reason(table: str, season: int | None = None, season_from: int | None = None,
+                     season_to: int | None = None, column: str = "season") -> tuple[bool, str]:
+    """Say why a read of `table` came back empty: what was asked, what the table holds, what to change.
+
+    The first value is True when the seasons asked for lie outside what the table holds, the
+    case where a list of other names or an empty list is a wrong answer rather than a thin one.
+    """
+    if season is not None:
+        asked = f"season {season}"
+    elif season_from is not None or season_to is not None:
+        asked = f"seasons {season_from if season_from is not None else '...'} to " \
+                f"{season_to if season_to is not None else '...'}"
+    else:
+        asked = "every season"
+    try:
+        span = _execute(f"SELECT MIN({column}) AS lo, MAX({column}) AS hi FROM {table}")
+    except (duckdb.Error, TimeoutError):
+        span = []
+    low, high = (span[0]["lo"], span[0]["hi"]) if span else (None, None)
+    if low is None or high is None:
+        return True, f"No {table} rows for {asked}. The table is empty. Run `nfl-mcp ingest` to load it."
+    if season is not None:
+        outside = not low <= int(season) <= high
+    else:
+        outside = ((season_from is not None and int(season_from) > high)
+                   or (season_to is not None and int(season_to) < low))
+    held = f"This database holds {table} for seasons {low} to {high}."
+    if outside:
+        return True, (f"No {table} rows for {asked}. {held} Ask for a season in that range, or "
+                      "load the seasons you need with `nfl-mcp ingest --start <first> --end <last>`.")
+    return False, f"No {table} rows match these filters for {asked}. {held} Loosen the other filters."
+
+
 def _team_filter(conditions: list[str], params: list[Any], column: str, team: str | None) -> None:
     """Append a row filter on a team code the caller typed, on every code that means it.
 
@@ -449,6 +489,7 @@ def _player_filter(
     value_count: int = 1,
     missing_reason: str = "",
     must_have_player: bool = False,
+    settle_with: tuple[str, ...] = ("player_id", "team", "position"),
 ) -> dict[str, Any]:
     """Resolve the player a caller named and put his id into that tool's WHERE clause.
 
@@ -469,6 +510,9 @@ def _player_filter(
     safe direction. And it only runs over a complete list: when the resolver reported more
     matches than candidates returned (`J.Smith` reports 41 and lists 20), the candidates
     are a cut of the field and narrowing them would be a silent pick.
+
+    `settle_with` names the calling tool's own parameters that can pick one candidate, so an
+    ambiguous answer tells the caller what to send next. nfl_resolve_player is not an MCP tool.
     """
     if team and team.strip() and canonical_team(team) is None:
         return _unknown_team_error(team)
@@ -488,6 +532,10 @@ def _player_filter(
         if keep:
             resolved = ({"resolved": keep[0]} if len(keep) == 1 else
                         {**resolved, "candidates": keep, "count": len(keep)})
+    if "ambiguous" in resolved:
+        return {**resolved, "settle_with": list(settle_with),
+                "hint": "Two or more players match. Re-run with one of these set from one "
+                        f"candidate: {', '.join(settle_with)}."}
     if "resolved" not in resolved:
         return resolved
     identity = resolved["resolved"]
@@ -763,20 +811,24 @@ def nfl_search_plays(
     _team_filter(conditions, params, "defteam", opponent)
     res = _player_filter("(passer_player_id = ? OR rusher_player_id = ? OR receiver_player_id = ?)",
                          conditions, params, player=player, player_id=player_id, team=team,
-                         season=season, season_from=season_from, season_to=season_to, value_count=3)
+                         season=season, season_from=season_from, season_to=season_to, value_count=3,
+                         settle_with=("player_id", "team"))
     if "identity" not in res:
         return res
     identity = res["identity"]
-    if season:
+    refused = _reversed_range("season_from", season_from, "season_to", season_to)
+    if refused:
+        return refused
+    if season is not None:
         conditions.append("season = ?")
         params.append(int(season))
-    if season_from:
+    if season_from is not None:
         conditions.append("season >= ?")
         params.append(int(season_from))
-    if season_to:
+    if season_to is not None:
         conditions.append("season <= ?")
         params.append(int(season_to))
-    if week:
+    if week is not None:
         conditions.append("week = ?")
         params.append(int(week))
     refused = _season_type_filter(conditions, params, "season_type", season_type)
@@ -942,7 +994,7 @@ def nfl_team_stats(
     conditions: list[str] = []
     params: list[Any] = []
     _team_filter(conditions, params, "team", team)
-    if season:
+    if season is not None:
         conditions.append("season_year = ?")
         params.append(int(season))
     err = _season_type_filter(conditions, params, "season_type", season_type)
@@ -968,6 +1020,8 @@ def nfl_team_stats(
             sql = f"SELECT * FROM situational_stats WHERE {where} ORDER BY season_year, season_type, situation"
             results["situational"] = _execute(sql, params)
 
+        if not any(results.get(key) for key in ("offense", "defense", "situational")):
+            results["reason"] = _coverage_reason("team_offense_stats", season, column="season_year")[1]
         return results
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -1126,17 +1180,29 @@ def nfl_player_stats(
     season_to: int | None = None,
     season_type: str | None = None,
     stat_type: str = "passing",
+    position: str | None = None,
+    team: str | None = None,
 ) -> Dict[str, Any]:
     """Official season counting stats for one player, summed from the week-level player_stats
     table by the resolved gsis_id. Returns one row per season and season_type, dropping a season
     whose counting stats are all zero, names the column behind every metric in `metric_sources`,
     and lists metrics this database cannot provide in `unavailable`. Only `avg_cpoe` and the play
-    count behind it come from plays."""
+    count behind it come from plays. `position` and `team` only pick the player a name means: the
+    rows still cover every club he played for."""
     if stat_type not in _PLAYER_STATS_METRICS:
         return {"error": f"Unknown stat_type: {stat_type}. Use 'passing', 'rushing', or 'receiving'."}
 
+    refused = _reversed_range("season_from", season_from, "season_to", season_to)
+    if refused:
+        return refused
     res = _player_filter(player=player_name, player_id=player_id, season=season,
-                         season_from=season_from, season_to=season_to, must_have_player=True)
+                         season_from=season_from, season_to=season_to, must_have_player=True,
+                         team=team, position=position)
+    if res.get("not_found") and (season, season_from, season_to) != (None, None, None):
+        outside, reason = _coverage_reason("player_stats", season, season_from, season_to)
+        if outside:
+            # The names on offer would be other players of those seasons, not the one asked for.
+            return {"not_found": True, "query": res.get("query"), "reason": reason}
     if "identity" not in res:
         return res
     identity = res["identity"]
@@ -1157,13 +1223,13 @@ def nfl_player_stats(
 
         window = ""
         params: list[Any] = [identity["gsis_id"]]
-        if season:
+        if season is not None:
             window += " AND season = ?"
             params.append(int(season))
-        if season_from:
+        if season_from is not None:
             window += " AND season >= ?"
             params.append(int(season_from))
-        if season_to:
+        if season_to is not None:
             window += " AND season <= ?"
             params.append(int(season_to))
         season_type_conditions: list[str] = []
@@ -1218,6 +1284,10 @@ def nfl_compare(
     season_from: int | None = None,
     season_to: int | None = None,
     season_type: str | None = None,
+    position1: str | None = None,
+    position2: str | None = None,
+    team1: str | None = None,
+    team2: str | None = None,
 ) -> Dict[str, Any]:
     """Side-by-side comparison of two teams or players.
 
@@ -1234,6 +1304,9 @@ def nfl_compare(
     side.
     """
     e1, e2 = entity1, entity2
+    refused = _reversed_range("season_from", season_from, "season_to", season_to)
+    if refused:
+        return refused
 
     try:
         if compare_type == "team":
@@ -1252,13 +1325,13 @@ def nfl_compare(
                 return stale
             season_filter = ""
             season_params: list[Any] = []
-            if season:
+            if season is not None:
                 season_filter += " AND season_year = ?"
                 season_params.append(int(season))
-            if season_from:
+            if season_from is not None:
                 season_filter += " AND season_year >= ?"
                 season_params.append(int(season_from))
-            if season_to:
+            if season_to is not None:
                 season_filter += " AND season_year <= ?"
                 season_params.append(int(season_to))
 
@@ -1284,12 +1357,15 @@ def nfl_compare(
 
         elif compare_type == "player":
             sides: list[dict[str, Any]] = []
-            for name, pid, requested in [
-                (e1, player_id1, entity1), (e2, player_id2, entity2)
+            for side, name, pid, requested, position, team in [
+                ("1", e1, player_id1, entity1, position1, team1),
+                ("2", e2, player_id2, entity2, position2, team2),
             ]:
                 res = _player_filter(player=name, player_id=pid, season=season,
                                      season_from=season_from, season_to=season_to,
-                                     must_have_player=True)
+                                     must_have_player=True, team=team, position=position,
+                                     settle_with=tuple(f"{p}{side}" for p in
+                                                       ("player_id", "team", "position")))
                 if "identity" not in res:
                     sides.append({"requested": requested, **res})
                     continue
@@ -1445,7 +1521,7 @@ def nfl_roster(
     conditions: list[str] = []
     params: list[Any] = []
     _team_filter(conditions, params, "team", team)
-    if season:
+    if season is not None:
         conditions.append("season = ?")
         params.append(int(season))
     if position:
@@ -1462,7 +1538,10 @@ def nfl_roster(
     """
     try:
         rows, flag = _execute_limited(sql, params if params else None, _MAX_ROWS)
-        return {"players": rows, "count": len(rows), **flag}
+        result = {"players": rows, "count": len(rows), **flag}
+        if not rows:
+            result["reason"] = _coverage_reason("rosters", season)[1]
+        return result
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1483,14 +1562,15 @@ def nfl_injuries(
     conditions: list[str] = []
     params: list[Any] = []
     _team_filter(conditions, params, "team", team)
-    if season:
+    if season is not None:
         conditions.append("season = ?")
         params.append(int(season))
-    if week:
+    if week is not None:
         conditions.append("week = ?")
         params.append(int(week))
     res = _player_filter("gsis_id = ?", conditions, params,
-                         player=player, player_id=player_id, team=team, season=season)
+                         player=player, player_id=player_id, team=team, season=season,
+                         settle_with=("player_id", "team"))
     if "identity" not in res:
         return res
     identity = res["identity"]
@@ -1509,9 +1589,10 @@ def nfl_injuries(
     """
     try:
         rows, flag = _execute_limited(sql, params if params else None, _MAX_ROWS)
-        return _echo_player(
-            {"injuries": _label_players(rows), "count": len(rows), **flag}, identity
-        )
+        result = {"injuries": _label_players(rows), "count": len(rows), **flag}
+        if not rows:
+            result["reason"] = _coverage_reason("injuries", season)[1]
+        return _echo_player(result, identity)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1535,10 +1616,10 @@ def nfl_schedule(
         marks = ", ".join("?" for _ in codes)
         conditions.append(f"(home_team IN ({marks}) OR away_team IN ({marks}))")
         params.extend(codes * 2)
-    if season:
+    if season is not None:
         conditions.append("season = ?")
         params.append(int(season))
-    if week:
+    if week is not None:
         conditions.append("week = ?")
         params.append(int(week))
     refused = _season_type_filter(conditions, params, "game_type", season_type, rounds=True)
@@ -1566,6 +1647,18 @@ def nfl_schedule(
 
 # ── Team records (1970–present) ───────────────────────────────────────────────
 
+# Regular-season games each club has still to play in the newest season the schedule holds. A
+# count against expected_games() would call BUF and CIN 2022 unfinished: their game was called off.
+_REMAINING_GAMES_SQL = """
+    SELECT season, team, COUNT(*) AS remaining FROM (
+        SELECT season, game_type, result, home_team AS team FROM schedules
+        UNION ALL SELECT season, game_type, result, away_team FROM schedules
+    )
+    WHERE season = (SELECT MAX(season) FROM schedules) AND game_type = 'REG' AND result IS NULL
+    GROUP BY season, team
+"""
+
+
 def nfl_team_records(
     team: str | None = None,
     season: int | None = None,
@@ -1584,6 +1677,9 @@ def nfl_team_records(
     """
     if not team and season is None and from_season is None and to_season is None:
         return {"error": "Provide team, season, or a from_season/to_season range."}
+    refused = _reversed_range("from_season", from_season, "to_season", to_season)
+    if refused:
+        return refused
 
     key = canonical_team(team) if team else None
     if team and key is None:
@@ -1621,12 +1717,19 @@ def nfl_team_records(
         if stale is not None:
             return stale
         rows, flag = _execute_limited(sql, params if params else None, _MAX_ROWS)
+        remaining = {(r["season"], canonical_team(r["team"])): r["remaining"]
+                     for r in (_execute(_REMAINING_GAMES_SQL) if rows else [])}
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
 
     for row in rows:
         row["club"] = era_name(row["season"], row["team"])
+        left = remaining.get((row["season"], row["team"]))
+        if left:
+            row["status"] = "in_progress"
+            row["reason"] = (f"Season {row['season']} is in progress: {row['team']} has played "
+                             f"{row['games']} of {row['games'] + left} games. The record is not final.")
 
     result: Dict[str, Any] = {"records": rows, "count": len(rows), **flag}
     if key and not rows:
@@ -1664,10 +1767,10 @@ def nfl_snap_counts(
         return res
     identity = res["identity"]
     _team_filter(conditions, params, "team", team)
-    if season:
+    if season is not None:
         conditions.append("season = ?")
         params.append(int(season))
-    if week:
+    if week is not None:
         conditions.append("week = ?")
         params.append(int(week))
     if position:
@@ -1717,10 +1820,10 @@ def nfl_fantasy_opportunity(
         return res
     identity = res["identity"]
     _team_filter(conditions, params, "posteam", team)
-    if season:
+    if season is not None:
         conditions.append("season = ?")
         params.append(int(season))
-    if week:
+    if week is not None:
         conditions.append("week = ?")
         params.append(int(week))
     if position:
@@ -1866,20 +1969,24 @@ def nfl_ftn_charting(
     _team_filter(conditions, params, "p.defteam", opponent)
     res = _player_filter("(p.passer_player_id = ? OR p.rusher_player_id = ? OR p.receiver_player_id = ?)",
                          conditions, params, player=player, player_id=player_id, team=team,
-                         season=season, season_from=season_from, season_to=season_to, value_count=3)
+                         season=season, season_from=season_from, season_to=season_to, value_count=3,
+                         settle_with=("player_id", "team"))
     if "identity" not in res:
         return res
     identity = res["identity"]
-    if season:
+    refused = _reversed_range("season_from", season_from, "season_to", season_to)
+    if refused:
+        return refused
+    if season is not None:
         conditions.append("p.season = ?")
         params.append(int(season))
-    if season_from:
+    if season_from is not None:
         conditions.append("p.season >= ?")
         params.append(int(season_from))
-    if season_to:
+    if season_to is not None:
         conditions.append("p.season <= ?")
         params.append(int(season_to))
-    if week:
+    if week is not None:
         conditions.append("p.week = ?")
         params.append(int(week))
     refused = _season_type_filter(conditions, params, "p.season_type", season_type)
@@ -1972,7 +2079,7 @@ def nfl_td_luck(
         conditions.append("position ILIKE ?")
         params.append(position.upper())
     _team_filter(conditions, params, "team", team)
-    if season:
+    if season is not None:
         conditions.append("season = ?")
         params.append(int(season))
     refused = _season_type_filter(conditions, params, "season_type", season_type,
@@ -1995,7 +2102,10 @@ def nfl_td_luck(
         if stale is not None:
             return stale
         rows, flag = _execute_limited(sql, params if params else None, limit)
-        return _echo_player({"td_luck": _label_players(rows), "count": len(rows), **flag}, identity)
+        result = {"td_luck": _label_players(rows), "count": len(rows), **flag}
+        if not rows:
+            result["reason"] = _coverage_reason("player_td_luck", season)[1]
+        return _echo_player(result, identity)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -2034,10 +2144,10 @@ def nfl_role_trend(
         conditions.append("position ILIKE ?")
         params.append(position.upper())
     _team_filter(conditions, params, "team", team)
-    if season:
+    if season is not None:
         conditions.append("season = ?")
         params.append(int(season))
-    if week:
+    if week is not None:
         conditions.append("week = ?")
         params.append(int(week))
     if min_snap_pct is not None:
@@ -2121,7 +2231,7 @@ def nfl_separation_opportunity(
         conditions.append("position ILIKE ?")
         params.append(position.upper())
     _team_filter(conditions, params, "team", team)
-    if season:
+    if season is not None:
         conditions.append("season = ?")
         params.append(int(season))
     refused = _season_type_filter(conditions, params, "season_type", season_type,
@@ -2181,12 +2291,13 @@ def nfl_drop_rate(
     conditions: list[str] = []
     params: list[Any] = []
     res = _player_filter("player_id = ?", conditions, params,
-                         player=player, player_id=player_id, team=team, season=season)
+                         player=player, player_id=player_id, team=team, season=season,
+                         settle_with=("player_id", "team"))
     if "identity" not in res:
         return res
     identity = res["identity"]
     _team_filter(conditions, params, "team", team)
-    if season:
+    if season is not None:
         conditions.append("season = ?")
         params.append(int(season))
     if min_targets is not None:
@@ -2255,7 +2366,7 @@ def nfl_contract_value(
         conditions.append("position ILIKE ?")
         params.append(position.upper())
     _team_filter(conditions, params, "team", team)
-    if season:
+    if season is not None:
         conditions.append("season = ?")
         params.append(int(season))
     refused = _season_type_filter(conditions, params, "season_type", season_type,
@@ -2282,7 +2393,10 @@ def nfl_contract_value(
         if stale is not None:
             return stale
         rows, flag = _execute_limited(sql, params if params else None, limit)
-        return _echo_player({"contract_value": _label_players(rows), "count": len(rows), **flag}, identity)
+        result = {"contract_value": _label_players(rows), "count": len(rows), **flag}
+        if not rows:
+            result["reason"] = _coverage_reason("player_contract_value", season)[1]
+        return _echo_player(result, identity)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}

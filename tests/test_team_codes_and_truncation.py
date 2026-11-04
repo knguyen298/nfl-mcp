@@ -737,10 +737,11 @@ def _fake_execute(rows):
     information_schema for a derived table with no season_type column. Both answer "nothing is
     old-shaped here", so the tool goes on to the data query the test is about. A fake that handed
     data rows back for those two instead would make the guard report a stale database and the tool
-    would answer with an error instead of a truncated list.
+    would answer with an error instead of a truncated list. nfl_team_records also asks the
+    schedule which games are still to play, and none are.
     """
     def fake(sql, params=None):
-        if "_ingest_metadata" in sql or "information_schema" in sql:
+        if "_ingest_metadata" in sql or "information_schema" in sql or "AS remaining" in sql:
             return []
         return rows
     return fake

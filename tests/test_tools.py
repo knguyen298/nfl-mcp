@@ -1836,8 +1836,9 @@ class TestNflTeamRecords:
         ]
         def fake_execute(sql, params=None):
             """Answer the derived-shape guard's two lookups with 'nothing is old-shaped' and hand
-            the two records to the data query, which is the one under test."""
-            if "_ingest_metadata" in sql or "information_schema" in sql:
+            the two records to the data query, which is the one under test. No game is left to
+            play in the schedule."""
+            if "_ingest_metadata" in sql or "information_schema" in sql or "AS remaining" in sql:
                 return []
             return rows
 
@@ -1958,3 +1959,16 @@ class TestAuditFindingsAreFixed:
         # share; at 25% the largest recovery any player-week carries is 318.2.
         worst = nfl_query("SELECT MAX(avg_snap_pct_recovery) AS m FROM injury_return_curve")
         assert worst["rows"][0]["m"] <= 400
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("require_db")
+class TestPlayerStatsSettlesAName:
+    def test_josh_allen_needs_a_position_and_gets_one(self):
+        assert nfl_player_stats("Josh Allen", season=2024)["ambiguous"] is True
+        settled = nfl_player_stats("Josh Allen", season=2024, position="QB")
+        assert settled["player"]["label"] == "Josh Allen (QB, BUF)"
+
+    def test_an_unambiguous_name_ignores_a_matching_team(self):
+        plain = nfl_player_stats("Patrick Mahomes", season=2024)
+        assert nfl_player_stats("Patrick Mahomes", season=2024, team="KC") == plain

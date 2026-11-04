@@ -11,6 +11,9 @@ on:
     branches: [main]
     paths:
       - Dockerfile
+      - Dockerfile.dev
+      - entrypoint.sh
+      - update_db.sh
       - .dockerignore
       - pyproject.toml
       - nfl_mcp/**
@@ -45,20 +48,42 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Smoke test — container boots and serves
+      - name: Smoke test — container answers a real tool call
+        # initialize must answer 2xx, then nfl_status must come back with isError false. Any
+        # other status, or a tool error, fails the job: the old check passed on any HTTP code.
         run: |
           docker run -d --name nfl-mcp-ci -p 8000:8000 nfl-mcp:ci
+          url=http://localhost:8000/mcp
+          hdr='-H Content-Type:application/json -H Accept:application/json,text/event-stream'
+          init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}'
+          code=000
           for i in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/mcp || true)
-            if [ -n "$code" ] && [ "$code" != "000" ]; then
-              echo "Server responded with HTTP $code"
-              exit 0
-            fi
+            code=$(curl -s -D headers.txt -o init.txt -w "%{http_code}" $hdr -d "$init" "$url" || true)
+            case "$code" in 2??) break ;; esac
             sleep 2
           done
-          echo "Server did not respond on /mcp within timeout"
-          docker logs nfl-mcp-ci || true
-          exit 1
+          echo "initialize answered HTTP $code"
+          case "$code" in 2??) ;; *) docker logs nfl-mcp-ci || true; exit 1 ;; esac
+          sid=$(grep -i '^mcp-session-id:' headers.txt | cut -d' ' -f2 | tr -d '\r')
+          curl -sf $hdr -H "Mcp-Session-Id: $sid" \
+            -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$url" > /dev/null
+          curl -sf $hdr -H "Mcp-Session-Id: $sid" \
+            -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nfl_status","arguments":{}}}' \
+            "$url" > call.txt
+          if grep -q '"isError":false' call.txt && grep -q 'total_plays' call.txt; then
+            echo "nfl_status answered without an error"
+          else
+            cat call.txt; docker logs nfl-mcp-ci || true; exit 1
+          fi
+
+      - name: Build the dev image (no seed, no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.dev
+          push: false
+          tags: nfl-mcp:ci-dev
+          cache-from: type=gha
 
       - name: Tear down container
         if: always()

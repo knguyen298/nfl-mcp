@@ -1,7 +1,10 @@
 """
 NFL MCP Server
-Tools: nfl_schema, nfl_status, nfl_query, nfl_search_plays, nfl_team_stats, nfl_player_stats, nfl_compare,
-       nfl_catalog, nfl_roster, nfl_injuries, nfl_schedule, nfl_snap_counts, nfl_team_records
+Tools: nfl_schema, nfl_status, nfl_query, nfl_search_plays, nfl_team_stats, nfl_player_stats,
+       nfl_compare, nfl_catalog, nfl_roster, nfl_injuries, nfl_schedule, nfl_snap_counts,
+       nfl_fantasy_opportunity, nfl_fantasy_rankings, nfl_ftn_charting, nfl_td_luck,
+       nfl_role_trend, nfl_separation_opportunity, nfl_drop_rate, nfl_contract_value,
+       nfl_injury_return, nfl_team_records
 """
 
 import contextlib
@@ -14,7 +17,7 @@ import anyio
 import anyio.to_thread
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp.types import TextContent, Tool
+from mcp.types import CallToolResult, TextContent, Tool
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -41,6 +44,7 @@ _TOOL_LIMITER = anyio.CapacityLimiter(_MAX_CONCURRENT_TOOLS)
 
 
 def _tool_error_payload(tool_name: str, exc: Exception) -> dict[str, Any]:
+    """An exception in the same shape a tool gives its own errors: a top-level `error` string."""
     if isinstance(exc, ValueError) and str(exc).startswith("Unknown tool:"):
         code = "UNKNOWN_TOOL"
     elif isinstance(exc, TimeoutError):
@@ -49,15 +53,7 @@ def _tool_error_payload(tool_name: str, exc: Exception) -> dict[str, Any]:
         code = "INVALID_ARGUMENTS"
     else:
         code = "TOOL_EXECUTION_ERROR"
-    return {
-        "ok": False,
-        "error": {
-            "code": code,
-            "type": type(exc).__name__,
-            "message": str(exc),
-            "tool": tool_name,
-        },
-    }
+    return {"error": str(exc), "code": code, "type": type(exc).__name__, "tool": tool_name}
 
 
 TOOLS = [
@@ -295,6 +291,14 @@ TOOLS = [
                     "description": "Type of stats to return (default: passing)",
                     "default": "passing",
                 },
+                "position": {
+                    "type": "string",
+                    "description": "Position code (e.g. QB, DE) that picks one player when the name matches several. It does not filter the rows.",
+                },
+                "team": {
+                    "type": "string",
+                    "description": "Team abbreviation (e.g. BUF) that picks one player when the name matches several. The rows still cover every club the player played for.",
+                },
             },
         },
     ),
@@ -357,6 +361,16 @@ TOOLS = [
                     "type": "string",
                     "enum": ["REG", "POST"],
                     "description": "Filter by season type: REG (regular season) or POST (playoffs). Both modes apply it and keep the two season types in separate rows. Both tables store only these two values, so a round name (WC, DIV, CON, SB) is an error - use nfl_schedule to pick one round.",
+                },
+                **{
+                    f"{field}{n}": {
+                        "type": "string",
+                        "description": f"{what} that picks one player for entity{n} when the name "
+                                       "matches several (player mode only).",
+                    }
+                    for n in (1, 2)
+                    for field, what in (("position", "Position code (e.g. QB, DE)"),
+                                        ("team", "Team abbreviation (e.g. BUF)"))
                 },
             },
             "required": ["entity1", "entity2"],
@@ -894,7 +908,9 @@ _DISPATCH = {
 
 
 @_mcp_server.call_tool()
-async def call_tool(name: str, arguments: Any) -> list[TextContent]:
+async def call_tool(name: str, arguments: Any) -> CallToolResult:
+    """Run one tool and flag its answer with isError when it carries a top-level `error`, so a
+    client can tell a refusal from data without reading the text."""
     try:
         fn: Any = _DISPATCH.get(name)
         if fn is None:
@@ -904,11 +920,13 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             lambda: fn(**(arguments or {})),
             limiter=_TOOL_LIMITER,
         )
-        return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
-
     except Exception as e:
         logger.error(f"Error in {name}: {e}", exc_info=True)
-        return [TextContent(type="text", text=json.dumps(_tool_error_payload(name, e), indent=2))]
+        result = _tool_error_payload(name, e)
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(result, indent=2, default=str))],
+        isError=isinstance(result, dict) and "error" in result,
+    )
 
 
 def create_app() -> Starlette:

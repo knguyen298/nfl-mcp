@@ -34,7 +34,6 @@ from nfl_mcp.ingest import (
     _str,
     _table_exists,
     _write_df_to_table,
-    run_ingest,
     run_ingest_datasets,
     ALL_SEASONS,
     all_seasons,
@@ -1549,20 +1548,6 @@ class TestRunIngestOrchestration:
         # An external dataset must not go through the nflreadpy loader path.
         assert calls == [("espn", (1996,), False)]
         assert conn.closed is True
-
-    def test_run_ingest_wrapper_calls_dataset_entrypoint(self, monkeypatch):
-        captured = {}
-        monkeypatch.setattr(
-            "nfl_mcp.ingest.run_ingest_datasets",
-            lambda **kwargs: captured.update(kwargs),
-        )
-        run_ingest(start=2020, end=2021, fresh=True, skip_views=True, db_path="/tmp/custom.duckdb")
-        assert captured["dataset_ids"] == ["pbp"]
-        assert captured["start"] == 2020
-        assert captured["end"] == 2021
-        assert captured["fresh"] is True
-        assert captured["skip_views"] is True
-        assert captured["db_path"] == "/tmp/custom.duckdb"
 
 
 # ── run_ingest_datasets validation ────────────────────────────────────────────
