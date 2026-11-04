@@ -567,7 +567,9 @@ _DOWN_FLAGS = ("COALESCE(third_down_converted,0)=1 OR COALESCE(third_down_failed
 # divides a summed total by a summed total; no weekly rate is averaged. Each table gains a
 # season_type column, because the postseason used to be summed into the regular season.
 #
-# Derived table column -> the team_stats_raw expression behind it.
+# Team box sum -> the team_stats_raw expression behind it. Two of these are not columns of a
+# derived table on their own: passing_first_downs and rushing_first_downs are summed here so the
+# offense builder can add the penalty first downs no box carries to them (see first_downs there).
 _TEAM_BOX_SUMS = {
     "attempts": "attempts", "completions": "completions", "passing_yards": "passing_yards",
     "sacks_suffered": "sacks_suffered", "sack_yards": "sack_yards_lost", "carries": "carries",
@@ -576,7 +578,8 @@ _TEAM_BOX_SUMS = {
     "fumbles_lost": "fumbles_lost_total", "penalties": "penalties",
     "penalty_yards": "penalty_yards", "def_sacks": "def_sacks",
     "def_interceptions": "def_interceptions",
-    "first_downs": "passing_first_downs + rushing_first_downs + receiving_first_downs",
+    "passing_first_downs": "passing_first_downs",
+    "rushing_first_downs": "rushing_first_downs",
 }
 
 # A database with plays only - no team box, no schedule - still gets every per-play figure: this
@@ -714,6 +717,17 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
             WHERE reached_20 = 1
             GROUP BY 1, 2, 3
         ),
+        -- A first down by penalty: the one part of the total the box does not carry. nflverse files
+        -- it on the play that drew the flag, credited to posteam, and team_stats_raw has no column
+        -- for it. Summing all three of the box's first-down columns is no substitute: passing and
+        -- receiving first_downs are the same events counted twice (quarterback and receiver), which
+        -- is what made the old column read 544 for Kansas City 2024 regular season.
+        penalty_fd AS (
+            SELECT posteam AS team, season AS season_year, season_type,
+                   SUM(CASE WHEN COALESCE(first_down_penalty,0)=1 THEN 1 ELSE 0 END)
+                       AS penalty_first_downs
+            FROM plays WHERE posteam IS NOT NULL GROUP BY 1, 2, 3
+        ),
         {box},
         {points}
         SELECT
@@ -746,13 +760,27 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
             rz.red_zone_trips, rz.red_zone_touchdowns,
             ROUND(100.0*rz.red_zone_touchdowns/NULLIF(rz.red_zone_trips,0), 1)
                 AS red_zone_td_pct,
-            b.first_downs, b.penalties, b.penalty_yards,
+            -- First downs the way the league prints them: the two box columns that count different
+            -- events, plus the penalty first downs from plays. passing_first_downs and
+            -- receiving_first_downs are one event counted for two players, so receiving is left out
+            -- and penalty is put in. Against ESPN's team stats pages: Kansas City 2024 regular
+            -- season 219 passing + 106 rushing + 25 by penalty = 350 (their page says 350 total,
+            -- 106 rushing, 219 passing, 25 by penalty); Baltimore 199 + 164 + 30 = 393. The key is
+            -- team, season and season_type, never game_id: an older export has game_id null in
+            -- every box row, which is what the deployed container holds. posteam and the box team
+            -- both carry the code of the era, so the raw values match without
+            -- franchises.canonical_team(). With no box the whole term is null, like every other box
+            -- column in this row; with no plays rows the penalty term is 0.
+            b.passing_first_downs + b.rushing_first_downs
+                + COALESCE(pf.penalty_first_downs, 0) AS first_downs,
+            b.penalties, b.penalty_yards,
             s.explosive_plays, s.avg_epa, s.pass_epa, s.rush_epa,
             p.points_for, p.points_against
         FROM scrim s
         LEFT JOIN box b      USING (team, season_year, season_type)
         LEFT JOIN downs d    USING (team, season_year, season_type)
         LEFT JOIN red_zone rz USING (team, season_year, season_type)
+        LEFT JOIN penalty_fd pf USING (team, season_year, season_type)
         LEFT JOIN points p    USING (team, season_year, season_type)
     """)
     print("    team_offense_stats ✓")
@@ -1284,7 +1312,9 @@ def _create_team_records(conn: duckdb.DuckDBPyConnection):
 # that a database stamped one version back reads as stale. The column probe in
 # derived_shape_is_stale stays independent of this stamp: a database written
 # before the stamp exists has no row to compare.
-DERIVED_SHAPE_VERSION = 1
+# 2: team_offense_stats.first_downs lost the doubled receiving term and gained the penalty term,
+# so the derived values changed. A container stamped 1 must rebuild, not serve the doubled column.
+DERIVED_SHAPE_VERSION = 2
 
 # Tables that gained season_type together; probing all four catches every
 # database written before that change.

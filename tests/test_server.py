@@ -202,6 +202,21 @@ def test_the_team_tool_text_names_where_the_numbers_come_from():
     assert "yards-per-play" in team.split("scrimmage plays")[0]
     assert "a per-play figure comes from plays" not in team
     assert "season_type" in described["nfl_compare"]
+    # first_downs is the column whose source text used to be wrong: it was listed among the plain
+    # team_stats_raw sums, and team_stats_raw has no first_downs column at all. The text has to name
+    # the penalty first downs that come from plays' first_down_penalty flag, and must not send the
+    # model looking for a box column that is not there (searching for one is how a raw nfl_query
+    # ends up with the doubled total: passing_first_downs and receiving_first_downs are the same
+    # events, so summing all three box columns gives Kansas City 2024 regular season 544, not 350).
+    from nfl_mcp.tools import _TEAM_STAT_SOURCES
+    box_text = _TEAM_STAT_SOURCES["team_stats_raw"]
+    plays_text = _TEAM_STAT_SOURCES["plays"]
+    # Not listed among the plain box sums, and the text says in words that the column is not there.
+    assert "sack_yards, first_downs" not in box_text
+    assert "no first_downs column" in box_text
+    assert "first_down_penalty" in plays_text and "first_downs" in plays_text
+    # The text also has to say why the box's third first-down column is left out.
+    assert "receiving_first_downs" in box_text
     assert "week = 0" in described["nfl_separation_opportunity"]
     assert "never averaged together" in described["nfl_separation_opportunity"]
 

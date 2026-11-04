@@ -1734,7 +1734,12 @@ class TestTeamTables:
         # One passing touchdown and no rushing one. Row 7's pick-six is not in either.
         assert (kc["touchdowns"], kc["passing_tds"], kc["rushing_tds"]) == (1, 1, 0)
         assert (kc["turnovers"], kc["passing_interceptions"], kc["fumbles_lost"]) == (1, 1, 0)
-        assert (kc["first_downs"], kc["penalties"], kc["penalty_yards"]) == (3, 3, 20)
+        assert (kc["first_downs"], kc["penalties"], kc["penalty_yards"]) == (4, 3, 20)
+        # first_downs has two parts: the box's passing_first_downs (2) + rushing_first_downs (1),
+        # plus the one plays row credited to Kansas City with first_down_penalty = 1 (row 5, the
+        # punt replayed after defensive pass interference). The box's receiving_first_downs is also
+        # 2 - the same two completions credited to the receivers - and is deliberately not added:
+        # with it the row would read 6, and with the penalty row left out it would read 3.
         # The box says the defense got 1 sack; no play in this data is a sack, and 1 still wins.
         kc_def = rows(conn, "SELECT * FROM team_defense_stats WHERE team='KC' AND season_year=2024 "
                             "AND season_type='REG'")[0]
@@ -1820,6 +1825,23 @@ class TestTeamTables:
         assert got["Red Zone"]["conversion_attempts"] == 0
         assert got["Red Zone"]["conversion_pct"] is None
 
+    def test_the_penalty_term_comes_from_plays_and_is_zero_without_it(self, conn):
+        """The box has no penalty first-down column, so that part is counted off plays and joined on
+        team, season and season_type. Delete Kansas City's penalty row and its box part stays: a key
+        the penalty count does not cover adds 0, it does not fail and it does not null the row."""
+        assert (self._offense(conn, "KC", "REG")["first_downs"],
+                self._offense(conn, "BAL", "POST")["first_downs"]) == (4, 2)
+        conn.execute("DELETE FROM plays WHERE COALESCE(first_down_penalty,0)=1 AND posteam='KC'")
+        _create_aggregate_tables(conn)
+        # KC drops to its 2 passing + 1 rushing; Baltimore's postseason penalty row is still there.
+        assert (self._offense(conn, "KC", "REG")["first_downs"],
+                self._offense(conn, "BAL", "POST")["first_downs"]) == (3, 2)
+        # No plays rows at all still builds: every derived row is keyed on a scrimmage group, so the
+        # tables come back empty rather than raising on the penalty count.
+        conn.execute("DELETE FROM plays")
+        _create_aggregate_tables(conn)
+        assert rows(conn, "SELECT * FROM team_offense_stats") == []
+
     def test_the_postseason_is_its_own_row(self, conn):
         # BAL has one regular-season play (6 yards) and one postseason play (12 yards). Merged, the
         # old table said 2 plays and 9.0 yards per play.
@@ -1865,6 +1887,7 @@ class TestTeamTables:
                  "rush_touchdown": 0, "interception": 0, "fumble_lost": 0, "sack": 0,
                  "third_down_converted": 0, "third_down_failed": 0, "fourth_down_converted": 0,
                  "fourth_down_failed": 0, "two_point_attempt": 0, "game_id": "g1", "drive": "d3",
+                 "first_down_penalty": 0,
                  "qtr": 1, "time": "10:00", "shotgun": 0, "no_huddle": 0}
         _write_df_to_table(conn, "plays", pl.DataFrame(
             {k: [*v, extra[k]] for k, v in TEAM_PLAYS.items()}), replace=True)
@@ -1881,6 +1904,9 @@ class TestTeamTables:
         # box totals; what plays carries is not.
         assert (kc["total_plays"], kc["total_yards"], kc["touchdowns"], kc["points_for"]) == (
             None, None, None, None)
+        # first_downs is null with no box too, not the penalty count alone: the two box columns it
+        # needs are gone, and a partial total next to null box columns would be a second answer.
+        assert kc["first_downs"] is None
         assert (kc["yards_per_play"], kc["yards_per_rush"], kc["yards_per_pass"]) == (
             None, None, None)
         assert kc["avg_epa"] == pytest.approx(-0.06, abs=1e-9)

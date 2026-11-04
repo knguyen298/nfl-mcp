@@ -399,15 +399,38 @@ class TestTeamTablesAreTheOfficialNumbers:
 
     @staticmethod
     def box(team, season_type):
-        """Ground truth: the week-level team box summed the way the derived table sums it."""
+        """Ground truth: the week-level team box summed the way the derived table sums it.
+
+        first_downs is the one expected value not read off the box alone. team_stats_raw has no
+        penalty first-down column, so the second term counts this team's plays rows with
+        first_down_penalty = 1, and receiving_first_downs is left out of the first because it
+        credits the same completions to the receiver that passing_first_downs already credits to the
+        quarterback. The join is team, season and season_type, never game_id."""
         select = ", ".join(f"COALESCE(SUM({c}), 0) AS {c}" for c in
                            TestTeamTablesAreTheOfficialNumbers.BOX_COLUMNS)
         return nfl_query(
             f"SELECT {select}, "
-            f"COALESCE(SUM(passing_first_downs + rushing_first_downs + receiving_first_downs), 0) "
-            f"AS first_downs "
+            f"(SELECT COALESCE(SUM(passing_first_downs + rushing_first_downs), 0) FROM team_stats_raw "
+            f" WHERE team='{team}' AND season=2024 AND season_type='{season_type}') "
+            f"+ (SELECT COALESCE(SUM(CASE WHEN COALESCE(first_down_penalty,0)=1 THEN 1 ELSE 0 END), 0) "
+            f"FROM plays WHERE posteam='{team}' AND season=2024 "
+            f"  AND season_type='{season_type}') AS first_downs "
             f"FROM team_stats_raw WHERE team='{team}' AND season=2024 AND season_type='{season_type}'"
         )["rows"][0]
+
+    def test_first_downs_add_up_to_what_espn_prints(self):
+        """The two published checks this column was wrong against. ESPN's team stats pages for the
+        2024 season (/nfl/team/stats/_/type/team/name/kc/season/2024, and the same path with bal)
+        print Kansas City 350 first downs - 219 passing, 106 rushing, 25 by penalty - and Baltimore
+        393 - 199 passing, 164 rushing, 30 by penalty. The old column read 544 and 562: it added the
+        box's receiving_first_downs, which is passing_first_downs credited a second time to the
+        receivers, and it never counted a penalty."""
+        offense = lambda team, st: nfl_team_stats(team=team, season=2024, season_type=st,
+                                                  side="offense")["offense"][0]
+        assert (offense("KC", "REG")["first_downs"],
+                offense("BAL", "REG")["first_downs"]) == (350, 393)
+        # Kansas City's three postseason games: 32 passing + 16 rushing + 6 by penalty.
+        assert offense("KC", "POST")["first_downs"] == 54
 
     @pytest.mark.parametrize("team,plays,yards,tds,tovs", [
         ("KC", 1091, 5570, 41, 14),

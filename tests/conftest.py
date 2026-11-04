@@ -6,7 +6,7 @@ import duckdb
 import pytest
 
 from nfl_mcp.config import get_duckdb_path
-from nfl_mcp.ingest import _create_aggregate_tables, _create_fantasy_tables
+from nfl_mcp.ingest import rebuild_derived_tables
 
 
 def pytest_collection_modifyitems(items):
@@ -27,6 +27,12 @@ def rebuilt_db_copy(tmp_path_factory):
     the copy with the code under test, and run the integration tests against that. On a database
     ingested after this change the rebuild recomputes the same rows the ingest produced. Returns
     None when no database is loaded.
+
+    It calls rebuild_derived_tables rather than the two builders, because the rebuild is what also
+    stamps the derived shape with this build's DERIVED_SHAPE_VERSION. A copy that only had its tables
+    rebuilt keeps the stamp of the database it came from, and the nine tools that refuse to answer
+    from a stale shape then refuse to answer here - which is what happened when the stamp went to 2
+    for the corrected first_downs.
     """
     source = get_duckdb_path()
     if not source.exists():
@@ -35,8 +41,7 @@ def rebuilt_db_copy(tmp_path_factory):
     shutil.copyfile(source, copy)
     conn = duckdb.connect(str(copy))
     try:
-        _create_aggregate_tables(conn)
-        _create_fantasy_tables(conn)
+        rebuild_derived_tables(conn, str(copy))
     finally:
         conn.close()
     return copy

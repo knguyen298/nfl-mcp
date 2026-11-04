@@ -446,9 +446,15 @@ AGGREGATE TABLES  (pre-aggregated, much faster for team/season queries)
     -- team_stats_raw: total_plays (attempts + sacks_suffered + carries), total_yards, rush_plays,
     --   pass_plays (a sack is not an attempt), completions, rush_yards, pass_yards (net of
     --   sack_yards), touchdowns (passing_tds + rushing_tds — a pick-six is not one), turnovers
-    --   (passing_interceptions + fumbles_lost_total), sacks_suffered, sack_yards, first_downs,
-    --   penalties, penalty_yards.  schedules: points_for, points_against.
-    --   plays: explosive_plays, avg_epa, pass_epa, rush_epa, red_zone_*, third_down_*.
+    --   (passing_interceptions + fumbles_lost_total), sacks_suffered, sack_yards, penalties,
+    --   penalty_yards.  schedules: points_for, points_against.
+    --   plays: explosive_plays, avg_epa, pass_epa, rush_epa, red_zone_*, third_down_*, and the
+    --     penalty half of first_downs: it is team_stats_raw passing_first_downs +
+    --     rushing_first_downs plus the plays rows where first_down_penalty = 1, grouped by posteam.
+    --     The box has no penalty first-down column, and its receiving_first_downs repeats its
+    --     passing_first_downs (one event, credited to quarterback and receiver), so adding all
+    --     three doubled the total (Kansas City 2024 regular season read 544 against 350: 219
+    --     passing + 106 rushing + 25 by penalty).
     -- yards_per_play = total_yards / total_plays, yards_per_rush = rush_yards / rush_plays,
     --   yards_per_pass = pass_yards / (pass_plays + sacks_suffered) — all three divide the box
     --   totals in this row, so the row holds one answer per question. An average of the scrimmage

@@ -817,12 +817,17 @@ _TEAM_STAT_SOURCES = {
         "counting stats, summed from one row per team per game: total_plays, total_yards, rush_plays, "
         "pass_plays, completions, rush_yards, pass_yards, touchdowns, passing_tds, rushing_tds, "
         "special_teams_tds, turnovers, passing_interceptions, fumbles_lost, sacks_suffered, "
-        "sack_yards, first_downs, penalties, penalty_yards, sacks, interceptions; the three "
+        "sack_yards, penalties, penalty_yards, sacks, interceptions; the three "
         "yards-per-play rates, which divide those same totals: yards_per_play (total_yards / "
         "total_plays), yards_per_rush (rush_yards / rush_plays), yards_per_pass (pass_yards / "
         "(pass_plays + sacks_suffered)); the defence's plays_against, yards_allowed and "
         "turnovers_forced, from the opponent's box row grouped on opponent_team; and "
-        "yards_per_play_allowed, which is yards_allowed / plays_against from that same row"
+        "yards_per_play_allowed, which is yards_allowed / plays_against from that same row. "
+        "first_downs is the one counting column not read straight off this box: it has no "
+        "first_downs column and no penalty first-down column, so the total is its "
+        "passing_first_downs + rushing_first_downs plus the penalty first downs from plays "
+        "(its receiving_first_downs is the same events as passing_first_downs, credited to the "
+        "receiver as well as the quarterback, so adding it counts every passing first down twice)"
     ),
     "schedules": "points_for, points_against, points_allowed (game_type REG is REG; WC, DIV, CON, SB are POST)",
     "plays": (
@@ -831,7 +836,9 @@ _TEAM_STAT_SOURCES = {
         "pass_epa, rush_epa, avg_epa_allowed, and plays, avg_yards, "
         "touchdowns, avg_epa in situational_stats. Over the conversion flags instead, so kneels and "
         "spikes count too: third_down_*, and the conversions and conversion_attempts columns of "
-        "situational_stats. Over drives: red_zone_trips, red_zone_touchdowns, red_zone_td_pct"
+        "situational_stats. Over drives: red_zone_trips, red_zone_touchdowns, red_zone_td_pct. "
+        "Over the first_down_penalty flag, grouped by posteam, season and season_type: the penalty "
+        "first downs that complete team_offense_stats.first_downs, which no box column carries"
     ),
 }
 

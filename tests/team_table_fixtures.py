@@ -27,6 +27,13 @@ trips would make it 20.0.
 KC scrimmage rows are 1, 2, 3, 4 and 7: 19 yards over 5 plays (3.8), EPA -0.3 over 5 (-0.06).
 Rows 5, 6 are out (pass = 0 and rush = 0) and row 8 is out (two_point_attempt = 1), so a punt, a
 field goal and a two-point try are nowhere in the per-play figures.
+
+Two rows carry first_down_penalty = 1: row 5 (KC REG, defensive pass interference on the punt, the
+down is replayed) and row 10 (BAL POST, defensive holding on a first down). They pick a punt and a
+play whose box row already counts a passing first down, because the box charges a penalty first down
+to neither of its two first-down columns: it belongs to no passer, rusher or receiver. So
+first_downs is the box's two columns plus these rows - KC REG 2 + 1 + 1 = 4, BAL REG 1 + 0 + 0 = 1,
+BAL POST 1 + 0 + 1 = 2.
 """
 
 import polars as pl
@@ -57,6 +64,9 @@ TEAM_PLAYS = {
     "third_down_failed": [0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
     "fourth_down_converted": [0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
     "fourth_down_failed": [0] * 10,
+    # Row 5 and row 10 drew a defensive penalty that is an automatic first down. The box credits
+    # neither the passer nor the rusher with them, so plays is the only place they exist.
+    "first_down_penalty": [0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
     "two_point_attempt": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
     "game_id": ["g1"] * 8 + ["g1", "g2"],
     "drive": ["d2", "d1", "d1", "d1", "d1", "d1", "d1", "d1", "d1", "d1"],
@@ -88,7 +98,9 @@ TEAM_BOX = {
     "fumbles_lost_total": [0, 0, 0],
     "passing_first_downs": [2, 1, 1],
     "rushing_first_downs": [1, 0, 0],
-    "receiving_first_downs": [0, 0, 0],
+    # Set equal to passing_first_downs, the way the real box has them (544 of 544 Kansas City
+    # 2024 rows), so a build that added this column again would overshoot instead of agreeing.
+    "receiving_first_downs": [2, 1, 1],
     "penalties": [3, 1, 0],
     "penalty_yards": [20, 5, 0],
     "def_sacks": [1, 0, 0],
