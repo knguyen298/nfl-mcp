@@ -93,7 +93,7 @@ TOOLS = [
     Tool(
         name="nfl_status",
         description=(
-            "Returns database health: play counts, loaded seasons, and a summary of all ingested datasets with row counts and last refresh time. Call this first to understand what data is available."
+            "Returns database health: play counts, loaded seasons, and a summary of all ingested datasets with row counts, the last real fetch (last_refreshed), whether the derived tables were built after that fetch, and the active A/B slot. Call this first to understand what data is available."
         ),
         inputSchema={"type": "object", "properties": {}},
     ),

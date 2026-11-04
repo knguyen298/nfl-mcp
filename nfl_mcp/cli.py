@@ -127,13 +127,16 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999):
         dataset_ids.append("espn_records")
 
     from .ingest import run_ingest_datasets
-    run_ingest_datasets(
+    failed = run_ingest_datasets(
         dataset_ids=dataset_ids,
         start=start,
         end=end,
         fresh=fresh,
         skip_views=skip_views,
     )
+    # Non-zero so update_db.sh keeps the live slot instead of swapping to one that missed data.
+    if failed:
+        raise SystemExit(1)
 
 
 # ── rebuild ────────────────────────────────────────────────────────────────────────
@@ -395,14 +398,11 @@ def doctor():
     click.echo("=" * 50)
     all_ok = True
 
-    # 1. Config
+    # 1. Config. Optional: NFL_MCP_DB_PATH alone finds the database, and a container sets nothing else.
     if config_exists():
         click.secho("  ✓ Config file found", fg="green")
     else:
-        click.secho("  ✗ No config file — run 'nfl-mcp init' first", fg="red")
-        all_ok = False
-        click.echo()
-        return
+        click.secho("  – No config file; using NFL_MCP_DB_PATH or the default path", fg="bright_black")
 
     # 2. Database
     db_path = get_duckdb_path()
@@ -410,13 +410,27 @@ def doctor():
         click.secho(f"  ✓ DuckDB file exists ({db_path})", fg="green")
         try:
             import duckdb
+
+            from .ingest import active_slot, read_derived_status
             conn = duckdb.connect(str(db_path), read_only=True)
             count = conn.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
             seasons = conn.execute(
                 "SELECT MIN(season), MAX(season) FROM plays"
             ).fetchone()
+            status = read_derived_status(conn)
             conn.close()
             click.secho(f"  ✓ {count:,} plays loaded (seasons {seasons[0]}–{seasons[1]})", fg="green")
+            shape_ok = status["shape_version"] == status["code_shape_version"]
+            click.secho(f"  {'✓' if shape_ok else '✗'} Derived shape version {status['shape_version']} "
+                        f"(this build writes {status['code_shape_version']})", fg="green" if shape_ok else "red")
+            if status["matches_raw_rows"]:
+                click.secho(f"  ✓ Derived tables built {status['built_at']}, after the last fetch", fg="green")
+            else:
+                click.secho(f"  ✗ Derived tables built {status['built_at']}, before the last fetch — "
+                            "run 'nfl-mcp rebuild'", fg="red")
+            click.echo(f"  – Last real fetch: {status['last_fetch']}")
+            click.echo(f"  – Active slot: {active_slot(db_path) or 'none (a plain database file)'}")
+            all_ok = shape_ok and status["matches_raw_rows"]
         except Exception as e:
             click.secho(f"  ✗ Database error: {e}", fg="red")
             all_ok = False
@@ -460,3 +474,5 @@ def doctor():
     else:
         click.secho("  Some checks failed — see above for fixes.", bold=True, fg="red")
     click.echo()
+    if not all_ok:
+        raise SystemExit(1)

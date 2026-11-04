@@ -9,6 +9,8 @@ Called by: nfl-mcp init / nfl-mcp ingest
 
 import datetime
 import os
+from contextlib import contextmanager
+
 import duckdb
 import polars as pl
 from pathlib import Path
@@ -50,6 +52,19 @@ def _apply_duckdb_pragmas(conn: duckdb.DuckDBPyConnection, db_path: str) -> None
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+# Fetches that failed in this run, for the ingest's exit status: update_db.sh must not swap to a
+# slot that missed data. nflreadpy's own season validator refusing a season is not a failure -
+# participation never publishes the season in progress, and every source refuses a new season
+# from March until kickoff - so counting it would fail every refresh for months.
+_failed_fetches: list[str] = []
+
+
+def _fetch_failed(label: str, exc: Exception) -> None:
+    print(f"    Failed to load: {exc}")
+    if not str(exc).startswith("Season must be between"):
+        _failed_fetches.append(label)
+
+
 def _clip_to_window(season_list, dataset_def):
     """Drop seasons outside a dataset's own published coverage window (no network)."""
     return [
@@ -89,6 +104,22 @@ def _duckdb_type_for_polars(dtype: pl.DataType) -> str:
     if dtype == pl.Datetime:
         return "TIMESTAMP"
     return "VARCHAR"
+
+
+@contextmanager
+def _one_transaction(conn: duckdb.DuckDBPyConnection):
+    """Commit the delete, the insert and the metadata row of one season together, or none of them.
+
+    Each used to commit on its own: a failed insert left the season empty while _ingest_metadata
+    still called it loaded, so later runs skipped it.
+    """
+    conn.begin()
+    try:
+        yield
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 # ── Metadata table ─────────────────────────────────────────────────────────────
@@ -237,8 +268,14 @@ def _build_enhanced_description(row: dict) -> str:
     return " — ".join(parts)
 
 
-def _reconcile_schema(conn: duckdb.DuckDBPyConnection, table: str, df: pl.DataFrame) -> None:
-    """Add any new incoming columns to an existing table before insert-by-name."""
+def _reconcile_schema(conn: duckdb.DuckDBPyConnection, table: str, df: pl.DataFrame,
+                      season_sql: str | None = None) -> None:
+    """Add any new incoming columns to an existing table before insert-by-name.
+
+    With season_sql, also name the seasons already in the table: the new columns are null for every
+    one of them until it is fetched again. A one-season re-ingest after team_stats_raw gained
+    passing_first_downs read Kansas City 2024 at 131 first downs instead of 350.
+    """
     existing_rows = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
     existing_cols = {row[1] for row in existing_rows}
 
@@ -252,15 +289,20 @@ def _reconcile_schema(conn: duckdb.DuckDBPyConnection, table: str, df: pl.DataFr
 
     if added:
         print(f"    Schema drift: added {', '.join(added)}")
+        if season_sql:
+            nulled = [r[0] for r in conn.execute(
+                f'SELECT DISTINCT {season_sql} FROM "{table}" ORDER BY 1').fetchall()]
+            if nulled:
+                print(f"    WARNING: null for every row of seasons {nulled}; "
+                      "re-fetch them with --fresh --start/--end")
 
 
 # ── PBP ingestion (season-by-season with enhanced_description) ─────────────────
 
-def _create_plays_table(conn: duckdb.DuckDBPyConnection, sample_df: pl.DataFrame, fresh: bool = False):
-    if fresh:
-        conn.execute("DROP TABLE IF EXISTS plays")
-        print("  Dropped existing plays table")
-
+def _create_plays_table(conn: duckdb.DuckDBPyConnection, sample_df: pl.DataFrame):
+    # No DROP for --fresh: a fresh run may cover one season, and dropping the table lost every
+    # other season while _ingest_metadata still called them loaded. _ingest_pbp_season replaces
+    # each season it fetches, so --fresh only has to stop the run from skipping loaded seasons.
     renamed = _safe_rename(sample_df.head(0))
     try:
         conn.execute("SELECT 1 FROM plays LIMIT 0")
@@ -281,7 +323,7 @@ def _ingest_pbp_season(conn: duckdb.DuckDBPyConnection, season: int) -> int:
     try:
         df = nflreadpy.load_pbp([season])
     except Exception as e:
-        print(f"    Failed to load: {e}")
+        _fetch_failed(f"pbp {season}", e)
         return 0
 
     print(f"    {len(df):,} plays, {len(df.columns)} columns")
@@ -303,10 +345,10 @@ def _ingest_pbp_season(conn: duckdb.DuckDBPyConnection, season: int) -> int:
     ]
     df = df.with_columns(pl.Series("enhanced_description", descriptions))
 
-    _reconcile_schema(conn, "plays", df)
     # Replace, not append: the fetch above succeeded, so it is safe to drop the stale
     # copy of this season (a partial in-progress season, or a --fresh re-run).
     conn.execute("DELETE FROM plays WHERE season = ?", [season])
+    _reconcile_schema(conn, "plays", df, "season")
     conn.register("_ingest_df", df.to_arrow())
     conn.execute("INSERT INTO plays BY NAME SELECT * FROM _ingest_df")
     conn.unregister("_ingest_df")
@@ -321,21 +363,21 @@ def _write_df_to_table(
     table: str,
     df: pl.DataFrame,
     replace: bool = False,
+    season_sql: str | None = None,
 ) -> None:
     """Create or append df into a DuckDB table."""
     if replace:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
 
-    try:
-        conn.execute(f"SELECT 1 FROM {table} LIMIT 0")
-        _reconcile_schema(conn, table, df)
-        conn.register("_load_df", df.to_arrow())
+    # A lookup, not a failed SELECT: a failed statement aborts the caller's open transaction.
+    exists = _table_exists(conn, table)
+    conn.register("_load_df", df.to_arrow())
+    if exists:
+        _reconcile_schema(conn, table, df, season_sql)
         conn.execute(f"INSERT INTO {table} BY NAME SELECT * FROM _load_df")
-        conn.unregister("_load_df")
-    except duckdb.CatalogException:
-        conn.register("_load_df", df.to_arrow())
+    else:
         conn.execute(f"CREATE TABLE {table} AS SELECT * FROM _load_df")
-        conn.unregister("_load_df")
+    conn.unregister("_load_df")
 
 
 def _ingest_generic_dataset(
@@ -363,7 +405,7 @@ def _ingest_generic_dataset(
         try:
             df = loader(**dataset_def.extra_params)
         except Exception as e:
-            print(f"    Failed to load: {e}")
+            _fetch_failed(dataset_def.dataset_id, e)
             return 0
 
         if df is None or len(df) == 0:
@@ -372,8 +414,9 @@ def _ingest_generic_dataset(
 
         df = _safe_rename(df)
         print(f"    {len(df):,} rows, {len(df.columns)} columns")
-        _write_df_to_table(conn, table, df, replace=True)
-        _record_loaded(conn, dataset_def.dataset_id, table, dataset_def.loader_fn, len(df))
+        with _one_transaction(conn):
+            _write_df_to_table(conn, table, df, replace=True)
+            _record_loaded(conn, dataset_def.dataset_id, table, dataset_def.loader_fn, len(df))
         total_rows = len(df)
 
     else:
@@ -391,7 +434,7 @@ def _ingest_generic_dataset(
             try:
                 df = loader([season], **dataset_def.extra_params)
             except Exception as e:
-                print(f"    Failed to load: {e}")
+                _fetch_failed(f"{dataset_def.dataset_id} {season}", e)
                 continue
 
             if df is None or len(df) == 0:
@@ -402,14 +445,12 @@ def _ingest_generic_dataset(
             print(f"    {len(df):,} rows, {len(df.columns)} columns")
 
             # Replace, not append: the fetch succeeded, so drop any stale rows for this
-            # season (no-op on first load; table may not exist yet).
-            try:
-                conn.execute(f"DELETE FROM {table} WHERE season = {season}")
-            except Exception:
-                pass
-
-            _write_df_to_table(conn, table, df)
-            _record_loaded(conn, dataset_def.dataset_id, table, dataset_def.loader_fn, len(df), season)
+            # season. season_sql covers a table with no season column (participation).
+            with _one_transaction(conn):
+                if _table_exists(conn, table):
+                    conn.execute(f"DELETE FROM {table} WHERE {dataset_def.season_sql} = ?", [season])
+                _write_df_to_table(conn, table, df, season_sql=dataset_def.season_sql)
+                _record_loaded(conn, dataset_def.dataset_id, table, dataset_def.loader_fn, len(df), season)
             total_rows += len(df)
             print(f"    {len(df):,} rows inserted")
 
@@ -485,16 +526,17 @@ def _ingest_espn_records(
             print(f"    espn_records {season}: no records published")
             continue
 
-        conn.execute("DELETE FROM espn_team_records WHERE season = ?", [season])
-        conn.executemany(
-            "INSERT INTO espn_team_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                (r.season, r.team, r.espn_team_id, r.espn_abbrev, r.games,
-                 r.wins, r.losses, r.ties, r.record_summary, r.source_game_id, r.fetched_at)
-                for r in records
-            ],
-        )
-        _record_loaded(conn, defn.dataset_id, defn.table_name, "espn_records", len(records), season)
+        with _one_transaction(conn):
+            conn.execute("DELETE FROM espn_team_records WHERE season = ?", [season])
+            conn.executemany(
+                "INSERT INTO espn_team_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (r.season, r.team, r.espn_team_id, r.espn_abbrev, r.games,
+                     r.wins, r.losses, r.ties, r.record_summary, r.source_game_id, r.fetched_at)
+                    for r in records
+                ],
+            )
+            _record_loaded(conn, defn.dataset_id, defn.table_name, "espn_records", len(records), season)
         total += len(records)
         failures = 0
 
@@ -907,11 +949,12 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
 
 def _table_exists(conn: duckdb.DuckDBPyConnection, name: str) -> bool:
     """Return True if a base table named `name` exists in the main schema."""
+    # fetchall, not fetchone: DuckDB refuses a later register() while a result is unfinished.
     row = conn.execute(
         "SELECT COUNT(*) FROM information_schema.tables "
         "WHERE table_schema = 'main' AND table_name = ?",
         [name],
-    ).fetchone()
+    ).fetchall()[0]
     return (row[0] or 0) > 0
 
 
@@ -1368,6 +1411,41 @@ _SHAPE_PROBE_SQL = (
 _PROBE_PARAMS = [*list(_PROBE_TABLES), *list(_PROBE_TABLES)]
 
 
+# When the derived tables were last built (the shape stamp's row) and when raw rows last changed (the
+# newest fetch). A rebuild writes the stamp and a 'derived' row per table it builds; neither is a fetch,
+# so last_fetch is what nfl_status reports as last_refreshed.
+_FRESHNESS_SQL = (
+    "SELECT MAX(loaded_at) FILTER (WHERE dataset_id = 'derived_shape') AS built_at, "
+    "MAX(loaded_at) FILTER (WHERE dataset_id <> 'derived_shape' AND COALESCE(loader_fn, '') <> 'derived')"
+    " AS last_fetch FROM _ingest_metadata"
+)
+
+
+def derived_status(*, stamp: int | None, built_at, last_fetch) -> dict:
+    """The derived tables' shape and whether they were built from the rows the database holds now.
+
+    The shape stamp only says the columns are right. A --skip-views ingest, or one killed before its
+    rebuild, fetches rows after the last build, and the derived tables then lag the raw rows.
+    """
+    return {
+        "shape_version": stamp,
+        "code_shape_version": DERIVED_SHAPE_VERSION,
+        "built_at": built_at,
+        "last_fetch": last_fetch,
+        "matches_raw_rows": last_fetch is None or (built_at is not None and built_at >= last_fetch),
+    }
+
+
+def read_derived_status(conn: duckdb.DuckDBPyConnection) -> dict:
+    built_at, last_fetch = conn.execute(_FRESHNESS_SQL).fetchall()[0]
+    return derived_status(stamp=shape_stamp(conn), built_at=built_at, last_fetch=last_fetch)
+
+
+def active_slot(db_path: Path) -> str | None:
+    """The A/B slot a container's symlink points at, or None for a plain database file."""
+    return os.readlink(db_path) if db_path.is_symlink() else None
+
+
 def shape_needs_rebuild(*, stamp: int | None, missing: list[str]) -> bool:
     """Decide staleness from the stamp and the probe, either of which may be all you have.
 
@@ -1400,9 +1478,13 @@ def derived_shape_is_stale(conn: duckdb.DuckDBPyConnection) -> bool:
     volume now", and a volume with no stamp was never rebuilt by code that could stamp it.
     A tool answers the weaker question - "are the rows I am about to read the wrong shape" -
     with shape_needs_rebuild directly; see nfl_mcp.tools._stale_derived_shape.
+
+    Derived tables built before the newest fetch are stale here too, though their shape is right.
     """
     stamp = shape_stamp(conn)
     if stamp is None:
+        return True
+    if not read_derived_status(conn)["matches_raw_rows"]:
         return True
     return shape_needs_rebuild(stamp=stamp, missing=probe_missing_season_type(conn))
 
@@ -1492,9 +1574,9 @@ def run_ingest_datasets(
     fresh: bool = False,
     skip_views: bool = False,
     db_path: str | None = None,
-) -> None:
+) -> int:
     """
-    Ingest one or more datasets into DuckDB.
+    Ingest one or more datasets into DuckDB. Returns how many fetches failed.
 
     dataset_ids: list of keys from REGISTRY (e.g. ["pbp", "schedules"])
     start/end:   season range; if both are None, loads all available seasons.
@@ -1530,6 +1612,7 @@ def run_ingest_datasets(
     _apply_duckdb_pragmas(conn, path)
 
     _ensure_metadata_table(conn)
+    _failed_fetches.clear()
 
     pbp_ingested = 0
     has_pbp = "pbp" in dataset_ids
@@ -1556,7 +1639,7 @@ def run_ingest_datasets(
             raise RuntimeError("Could not load play-by-play for any requested season")
         print(f"  {len(sample_df.columns)} columns · {len(sample_df):,} rows")
 
-        _create_plays_table(conn, sample_df, fresh=fresh)
+        _create_plays_table(conn, sample_df)
 
         loaded_pbp = {
             row[0] for row in conn.execute(
@@ -1578,10 +1661,11 @@ def run_ingest_datasets(
         else:
             print(f"  Will ingest: {to_ingest}")
             for season in to_ingest:
-                rows = _ingest_pbp_season(conn, season)
+                with _one_transaction(conn):
+                    rows = _ingest_pbp_season(conn, season)
+                    if rows:
+                        _record_loaded(conn, "pbp", "plays", "load_pbp", rows, season)
                 pbp_ingested += rows
-                if rows:
-                    _record_loaded(conn, "pbp", "plays", "load_pbp", rows, season)
 
         _create_indexes(conn)
 
@@ -1618,7 +1702,10 @@ def run_ingest_datasets(
     season_label = "all available" if bulk_mode else f"{seasons[0]}–{seasons[-1]}"
     print(f"  Seasons: {season_label}")
     print(f"  DB: {path}")
+    if _failed_fetches:
+        print(f"  {len(_failed_fetches)} fetches failed: {', '.join(_failed_fetches)}")
     print("=" * 60)
+    return len(_failed_fetches)
 
 
 def run_ingest(

@@ -7,7 +7,10 @@ entrypoint.sh, and a text assertion catches exactly that class of drift.
 
 import os
 import subprocess
+import sys
 from pathlib import Path
+
+import duckdb
 
 
 def _read(name: str) -> str:
@@ -141,8 +144,10 @@ class TestEntrypoint:
         # Images that baked the DB straight into /data must not be re-ingested over.
         assert 'mv "$SYMLINK" "$SLOT_A"' in _read("entrypoint.sh")
 
-    def test_links_the_active_slot_idempotently(self):
+    def test_links_slot_a_only_when_the_link_is_unusable(self):
         entrypoint = _read("entrypoint.sh")
+        # A valid link is left alone, so a restart keeps the slot update_db.sh swapped to.
+        assert 'if [ ! -L "$SYMLINK" ] || [ ! -e "$SYMLINK" ]; then' in entrypoint
         assert 'ln -sfn "$(basename "$SLOT_A")" "$SYMLINK"' in entrypoint
         # Plain `ln -s` fails with "File exists" when /data/nflread.duckdb is already a
         # regular file, which under set -eu crash-loops the container.
@@ -288,7 +293,8 @@ _NFL_MCP_STUB = (
     '#!/bin/sh\n'
     'echo "[stub nfl-mcp $*]"\n'
     'if [ -n "${NFL_MCP_DB_PATH:-}" ]; then printf INGESTED > "$NFL_MCP_DB_PATH"; fi\n'
-    'if [ "$1" = "rebuild" ]; then exit 0; fi\n'
+    'if [ "$1" = "ingest" ]; then exit "${STUB_INGEST_EXIT:-0}"; fi\n'
+    'if [ "$1" = "rebuild" ]; then exit "${STUB_REBUILD_EXIT:-0}"; fi\n'
 )
 
 
@@ -308,7 +314,9 @@ def _sim(tmp_path, *, with_seed=True, existing_baked=False):
 
     (bin_dir / "nfl-mcp").write_text(_NFL_MCP_STUB)
     (bin_dir / "supercronic").write_text('#!/bin/sh\necho "[stub supercronic]"\n')
-    for tool in ("nfl-mcp", "supercronic"):
+    # update_db.sh's row check; tests below run the real snippet against real DuckDB files.
+    (bin_dir / "python").write_text('#!/bin/sh\nexit "${STUB_ROWS_EXIT:-0}"\n')
+    for tool in ("nfl-mcp", "supercronic", "python"):
         (bin_dir / tool).chmod(0o755)
 
     entrypoint = (root / "entrypoint.sh").read_text()
@@ -383,6 +391,59 @@ class TestContainerLifecycle:
         _run(updater, bin_dir)
         assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
         assert (data / "nflread_b.duckdb").exists()
+
+    def test_restart_after_a_swap_keeps_serving_slot_b(self, tmp_path):
+        entrypoint, updater, data, bin_dir = _sim(tmp_path)
+        _run(entrypoint, bin_dir)
+        _run(updater, bin_dir)
+
+        _run(entrypoint, bin_dir)
+        assert os.readlink(data / "nflread.duckdb") == "nflread_b.duckdb"
+
+    def test_restart_with_a_dangling_link_falls_back_to_slot_a(self, tmp_path):
+        entrypoint, updater, data, bin_dir = _sim(tmp_path)
+        _run(entrypoint, bin_dir)
+        _run(updater, bin_dir)
+        (data / "nflread_b.duckdb").unlink()
+
+        _run(entrypoint, bin_dir)
+        assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
+
+    def _refused_update(self, tmp_path, stub_var):
+        entrypoint, updater, data, bin_dir = _sim(tmp_path)
+        _run(entrypoint, bin_dir)
+        env = {**_child_env(bin_dir), stub_var: "1"}
+        result = subprocess.run(["sh", str(updater)], capture_output=True, text=True, env=env, check=False)
+
+        assert result.returncode != 0
+        assert "Keeping nflread_a.duckdb live." in result.stdout
+        assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
+        return result.stdout
+
+    def test_updater_keeps_the_live_slot_when_the_ingest_fails(self, tmp_path):
+        assert "ingest failed or missed a fetch" in self._refused_update(tmp_path, "STUB_INGEST_EXIT")
+
+    def test_updater_keeps_the_live_slot_when_the_target_has_no_rows(self, tmp_path):
+        assert "has no rows in plays or team_offense_stats" in self._refused_update(tmp_path, "STUB_ROWS_EXIT")
+
+    def test_updater_keeps_the_live_slot_when_the_target_is_stale(self, tmp_path):
+        assert "derived tables in" in self._refused_update(tmp_path, "STUB_REBUILD_EXIT")
+
+    def test_the_row_check_reads_real_databases(self, tmp_path):
+        line = next(l for l in _read("update_db.sh").splitlines() if l.startswith("ROWS_CHECK="))
+        snippet = line[len('ROWS_CHECK="'):-1]
+        full, empty, missing = (str(tmp_path / f"{n}.duckdb") for n in ("full", "empty", "missing"))
+        for path, rows in ((full, 1), (empty, 0)):
+            conn = duckdb.connect(path)
+            for table in ("plays", "team_offense_stats"):
+                conn.execute(f"CREATE TABLE {table} AS SELECT 1 AS x FROM range({rows})")
+            conn.close()
+        duckdb.connect(missing).close()
+
+        codes = [subprocess.run([sys.executable, "-c", snippet, p], capture_output=True, check=False).returncode
+                 for p in (full, empty, missing)]
+        assert codes[0] == 0
+        assert codes[1] != 0 and codes[2] != 0
 
     def test_updater_refuses_to_run_without_the_symlink(self, tmp_path):
         _, updater, data, bin_dir = _sim(tmp_path)

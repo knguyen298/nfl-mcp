@@ -154,6 +154,9 @@ The ingest loop checks `_ingest_metadata` before every dataset+season. Re-runnin
 The derived tables (`team_offense_stats`, `team_defense_stats`, `situational_stats`, `formation_effectiveness`, the five `player_*` tables, `injury_return_curve` and `team_records`) are rebuilt from rows already in the database. `nfl-mcp ingest` rebuilds them at the end of every run, whether or not any dataset was fetched, and `nfl-mcp rebuild` rebuilds them on its own with no network at all.
 
 - `nfl_mcp/ingest.py::DERIVED_SHAPE_VERSION` describes the column shape this code writes. Raise it in the same commit that changes a derived table's columns; `rebuild_derived_tables` stamps the number into `_ingest_metadata`.
+- `--check` also answers `stale` when a fetch is newer than the shape stamp (a `--skip-views` run): the
+  columns are right but the numbers lag the rows. Tools do not refuse on that; `nfl_status` and
+  `nfl-mcp doctor` report it.
 - `nfl_mcp/cli.py::rebuild` with `--check` prints `current` or `stale` and exits 0 or 1 without a write lock, so a startup probe or a health check can ask it. `entrypoint.sh` asks it before `exec nfl-mcp serve`, because a container that pulls a new image over an existing `/data` volume keeps the slot it already had.
 - A rebuild is local arithmetic, not an ingest: 1.3 s measured on a 582 MB database holding 521,905 plays. A cold ingest is still forbidden at container start — see the container section.
 - `rebuild_derived_tables` wraps every drop, `CREATE TABLE AS` and the shape stamp in one transaction (`conn.begin()`), because each builder drops its table before it recreates it. An interrupted run therefore leaves the tables it started with and no stamp, and a guarded tool never sees a half-rebuilt set that the column probe vouches for. It starts the transaction itself, so a caller must hand it a connection with no transaction open: DuckDB refuses a nested BEGIN.
@@ -205,8 +208,11 @@ Two independent paths keep the published image current. Change one without break
    incomplete ingest fails the build. GitHub Actions rebuilds weekly, on release, and on
    demand — this is what makes a fresh `docker pull` current.
 2. **Runtime (A/B swap).** `entrypoint.sh` copies the seed to `/data/nflread_a.duckdb`,
-   symlinks `/data/nflread.duckdb` to the active slot, starts `supercronic`, then `exec`
-   `nfl-mcp serve`. `update_db.sh` ingests into the idle slot and swaps the symlink. No
+   links `/data/nflread.duckdb` to slot A only when the link is missing or dangling (a restart
+   keeps slot B after a swap), starts `supercronic`, then `exec` `nfl-mcp serve`.
+   `update_db.sh` ingests into the idle slot and swaps the symlink only when the ingest exits 0
+   (any failed fetch is non-zero), `plays` and `team_offense_stats` have rows, and
+   `nfl-mcp rebuild --check` says `current` for that slot. No
    restart is needed because `get_db_connection()` opens a fresh read-only connection per
    tool call.
 

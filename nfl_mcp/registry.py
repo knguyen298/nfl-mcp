@@ -30,6 +30,9 @@ class DatasetDef:
     # dataset; "espn" is the external records fetch, which is not an nflreadpy loader and
     # is opt-in because it is rate-limited and belongs to another publisher.
     source: str = "nflreadpy"
+    # SQL for a row's season, which the re-fetch of one season deletes by. A table with no
+    # season column names another expression here, or the delete fails instead of appending.
+    season_sql: str = "season"
 
 
 # ── Registry ───────────────────────────────────────────────────────────────────
@@ -195,6 +198,8 @@ _DEFS: list[DatasetDef] = [
         seasonal=True, default=True,
         description="Player participation per play — very large dataset",
         min_season=2016,
+        # No season column; nflverse game ids start with the season ("2024_01_BAL_KC").
+        season_sql="CAST(LEFT(nflverse_game_id, 4) AS INTEGER)",
         # No upper bound: upstream publishes every season from 2016 onward.
     ),
     DatasetDef(

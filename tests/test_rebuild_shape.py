@@ -102,6 +102,21 @@ class TestDerivedShapeIsStale:
         finally:
             conn.close()
 
+    def test_a_fetch_after_the_last_build_is_stale(self):
+        # A --fresh --skip-views run: the columns are right, the numbers are from before the fetch.
+        conn = duckdb.connect(":memory:")
+        try:
+            _ensure_metadata_table(conn)
+            _stamp(conn, DERIVED_SHAPE_VERSION)
+            _record_loaded(conn, "player_td_luck", "player_td_luck", "derived", 5)
+            assert derived_shape_is_stale(conn) is False   # a rebuild's own rows are not a fetch
+            _record_loaded(conn, "pbp", "plays", "load_pbp", 50, season=2026)
+            assert derived_shape_is_stale(conn) is True
+            _stamp(conn, DERIVED_SHAPE_VERSION)
+            assert derived_shape_is_stale(conn) is False
+        finally:
+            conn.close()
+
     def test_stamp_row_saves_the_version_in_row_count(self):
         conn = duckdb.connect(":memory:")
         try:
@@ -460,3 +475,23 @@ class TestRebuildPragmas:
                 conn.execute(f"SET temp_directory='{spill_b}'")
         finally:
             conn.close()
+
+
+class TestDerivedStatus:
+    """What nfl_status and nfl-mcp doctor report about the derived tables and the slot."""
+
+    def test_status_compares_the_build_with_the_last_fetch(self):
+        import datetime
+        built = datetime.datetime(2026, 11, 1)
+        later = built + datetime.timedelta(hours=1)
+        assert ingest.derived_status(stamp=3, built_at=built, last_fetch=built)["matches_raw_rows"] is True
+        assert ingest.derived_status(stamp=3, built_at=built, last_fetch=later)["matches_raw_rows"] is False
+        assert ingest.derived_status(stamp=None, built_at=None, last_fetch=later)["matches_raw_rows"] is False
+        assert ingest.derived_status(stamp=None, built_at=None, last_fetch=None)["matches_raw_rows"] is True
+
+    def test_active_slot_reads_the_symlink(self, tmp_path):
+        (tmp_path / "nflread_b.duckdb").write_text("")
+        link = tmp_path / "nflread.duckdb"
+        link.symlink_to("nflread_b.duckdb")
+        assert ingest.active_slot(link) == "nflread_b.duckdb"
+        assert ingest.active_slot(tmp_path / "nflread_b.duckdb") is None

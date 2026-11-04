@@ -39,7 +39,21 @@ cp "$DB_DIR/$CURRENT" "$TARGET"
 # Incremental: completed seasons are skipped; the current season and static
 # snapshot tables (rankings, players, contracts) are re-fetched every run.
 echo "[$(date -u)] Running incremental ingest..."
-NFL_MCP_DB_PATH="$TARGET" nfl-mcp ingest
+if ! NFL_MCP_DB_PATH="$TARGET" nfl-mcp ingest; then
+    echo "[$(date -u)] ERROR: ingest failed or missed a fetch. Keeping $CURRENT live."
+    exit 1
+fi
+
+# Check the slot before it goes live. Exit 1 when either table is missing or empty.
+ROWS_CHECK="import duckdb,sys; c=duckdb.connect(sys.argv[1],read_only=True); sys.exit(0 if all(c.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0] for t in ('plays','team_offense_stats')) else 1)"
+if ! python -c "$ROWS_CHECK" "$TARGET"; then
+    echo "[$(date -u)] ERROR: $TARGET has no rows in plays or team_offense_stats. Keeping $CURRENT live."
+    exit 1
+fi
+if ! NFL_MCP_DB_PATH="$TARGET" nfl-mcp rebuild --check; then
+    echo "[$(date -u)] ERROR: derived tables in $TARGET are not current. Keeping $CURRENT live."
+    exit 1
+fi
 
 # Atomic rename of the link. The server opens a fresh read-only DuckDB connection per
 # tool call (see nfl_mcp/database.py), so the next query reads the new slot — no restart,

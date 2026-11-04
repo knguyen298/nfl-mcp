@@ -59,7 +59,7 @@ Notes on the updater:
 
 - **Watch `/var/log/nflmcp/nfl_update.log`.** It is the only place a failed refresh reports itself; the server keeps serving the last good copy regardless.
 - **The updater inherits the runtime memory caps** (`512MB`, 1 thread), so raise the container memory to 2 GB if that log shows the ingest being killed.
-- **Check what a running container actually holds** with the `nfl_status` tool: `last_refreshed` reports the newest `_ingest_metadata` timestamp.
+- **Check what a running container actually holds** with the `nfl_status` tool: `last_refreshed` reports the last real fetch, and a rebuild does not move it. `derived.matches_raw_rows` says whether the derived tables were built after that fetch, and `active_slot` names the slot the symlink points at. `nfl-mcp doctor` reports the same facts from `NFL_MCP_DB_PATH` alone and exits 1 when a check fails.
 - **Run one container per database.** Every instance keeps its own `/data` slots, so scaling out replicates both the ingest work and the storage.
 - **A new image fixes an old `/data` volume at start.** Pulling an image over a volume written by an older image keeps the existing slot, so its derived tables can predate the image. `entrypoint.sh` asks `nfl-mcp rebuild --check` before it starts the server and rebuilds locally when the answer is stale — about 1.3 s measured on a 582 MB database, no network. To land an update immediately rather than at the next scheduled window, run `docker exec <container> /update_db.sh`: it ingests into the idle slot and then swaps the symlink, and the server keeps answering from the current slot the whole time.
 

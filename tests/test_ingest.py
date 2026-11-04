@@ -278,6 +278,18 @@ class TestReconcileSchema:
 
 # ── _str / description helpers ────────────────────────────────────────────────
 
+class TestNulledSeasonsWarning:
+    def test_a_new_column_names_the_seasons_it_is_null_for(self, conn, capsys):
+        conn.execute("CREATE TABLE t AS SELECT * FROM (VALUES (2024, 1), (2025, 2)) v(season, x)")
+        _reconcile_schema(conn, "t", pl.DataFrame({"season": [2026], "x": [3], "first_downs": [9]}), "season")
+        assert "null for every row of seasons [2024, 2025]" in capsys.readouterr().out
+
+    def test_an_empty_table_has_no_seasons_to_name(self, conn, capsys):
+        conn.execute("CREATE TABLE t (season BIGINT)")
+        _reconcile_schema(conn, "t", pl.DataFrame({"season": [2026], "first_downs": [9]}), "season")
+        assert "null for every row" not in capsys.readouterr().out
+
+
 class TestStringAndDescriptionHelpers:
     @pytest.mark.parametrize("value,expected", [
         (None, ""),
@@ -376,24 +388,38 @@ class TestStringAndDescriptionHelpers:
 class TestPbpIngestionHelpers:
     def test_create_plays_table_creates_schema_and_enhanced_column(self, conn):
         sample = pl.DataFrame({"a.b": [1], "team name": ["KC"]})
-        _create_plays_table(conn, sample, fresh=False)
+        _create_plays_table(conn, sample)
         cols = {r[1] for r in conn.execute("PRAGMA table_info('plays')").fetchall()}
         assert "a_b" in cols
         assert "team_name" in cols
         assert "enhanced_description" in cols
 
-    def test_create_plays_table_fresh_recreates_existing_table(self, conn):
-        conn.execute("CREATE TABLE plays (season BIGINT)")
-        conn.execute("INSERT INTO plays VALUES (2023)")
-        sample = pl.DataFrame({"season": [2024], "posteam": ["KC"], "defteam": ["BAL"]})
-        _create_plays_table(conn, sample, fresh=True)
-        count = conn.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
-        assert count == 0
+    def test_fresh_run_over_one_season_keeps_the_other_seasons(self, tmp_path, monkeypatch):
+        # --fresh --start 2026 --end 2026 used to drop plays for every season and leave
+        # _ingest_metadata calling 2024 and 2025 loaded, so no later run fetched them again.
+        db = str(tmp_path / "fresh.duckdb")
+        seed = duckdb.connect(db)
+        seed.execute("CREATE TABLE plays (season BIGINT, posteam VARCHAR, defteam VARCHAR, "
+                     "enhanced_description VARCHAR)")
+        seed.execute("INSERT INTO plays SELECT 2024, 'KC', 'BAL', '' FROM range(3)")
+        seed.execute("INSERT INTO plays SELECT 2025, 'KC', 'BAL', '' FROM range(4)")
+        seed.execute("INSERT INTO plays SELECT 2026, 'KC', 'BAL', '' FROM range(5)")
+        seed.close()
+        fetched = pl.DataFrame({"season": [2026, 2026], "posteam": ["KC", "KC"], "defteam": ["BAL", "BAL"]})
+        _install_fake_nflreadpy(monkeypatch, load_pbp=lambda seasons: fetched)
+        monkeypatch.setattr("nfl_mcp.ingest.current_season", lambda: 2026)
+
+        run_ingest_datasets(["pbp"], start=2026, end=2026, fresh=True, skip_views=True, db_path=db)
+
+        check = duckdb.connect(db, read_only=True)
+        counts = check.execute("SELECT season, COUNT(*) FROM plays GROUP BY 1 ORDER BY 1").fetchall()
+        check.close()
+        assert counts == [(2024, 3), (2025, 4), (2026, 2)]
 
     def test_create_plays_table_when_already_exists_and_not_fresh(self, conn):
         conn.execute("CREATE TABLE plays (season BIGINT)")
         sample = pl.DataFrame({"season": [2024]})
-        _create_plays_table(conn, sample, fresh=False)
+        _create_plays_table(conn, sample)
         cols = {r[1] for r in conn.execute("PRAGMA table_info('plays')").fetchall()}
         assert "season" in cols
 
@@ -422,7 +448,7 @@ class TestPbpIngestionHelpers:
             "game_id": ["g1", "g1"],
         })
 
-        _create_plays_table(conn, df, fresh=False)
+        _create_plays_table(conn, df)
         _install_fake_nflreadpy(monkeypatch, load_pbp=lambda seasons: df)
 
         inserted = _ingest_pbp_season(conn, 2024)
@@ -584,6 +610,58 @@ class TestGenericDatasetIngestion:
         assert total == 1
 
 
+    def test_refetching_participation_replaces_the_season(self, conn, monkeypatch):
+        # participation has no season column; the delete used to fail silently and every re-fetch
+        # appended the season again.
+        from nfl_mcp.registry import REGISTRY
+        df = pl.DataFrame({"nflverse_game_id": ["2024_01_BAL_KC", "2024_01_BAL_KC", "2025_01_X_Y"],
+                           "play_id": [1, 2, 1]})
+        _install_fake_nflreadpy(monkeypatch, load_participation=lambda seasons, **kw: df.filter(
+            pl.col("nflverse_game_id").str.starts_with(str(seasons[0]))))
+        for _ in range(3):
+            _ingest_generic_dataset(conn, REGISTRY["participation"], seasons=[2024, 2025], fresh=True)
+        assert conn.execute("SELECT COUNT(*) FROM participation").fetchone()[0] == 3
+
+    def test_a_table_with_no_season_column_fails_instead_of_appending(self, conn, monkeypatch):
+        defn = DatasetDef(dataset_id="no_season", loader_fn="load_no_season", table_name="no_season",
+                          seasonal=True, default=False)
+        conn.execute("CREATE TABLE no_season (game_id VARCHAR)")
+        _install_fake_nflreadpy(monkeypatch, load_no_season=lambda seasons, **kw: pl.DataFrame({"game_id": ["g"]}))
+        with pytest.raises(duckdb.BinderException):
+            _ingest_generic_dataset(conn, defn, seasons=[2024], fresh=True)
+        assert conn.execute("SELECT COUNT(*) FROM no_season").fetchone()[0] == 0
+
+    def test_a_failed_insert_keeps_the_season_and_its_metadata(self, conn, monkeypatch):
+        # The delete, the insert and the metadata row used to commit one by one, so a failed insert
+        # left the season empty and still marked loaded.
+        defn = DatasetDef(dataset_id="fake_seasonal", loader_fn="load_fake_seasonal",
+                          table_name="fake_seasonal", seasonal=True, default=False)
+        conn.execute("CREATE TABLE fake_seasonal (season BIGINT, value BIGINT)")
+        conn.execute("INSERT INTO fake_seasonal VALUES (2024, 1), (2024, 2)")
+        _record_loaded(conn, "fake_seasonal", "fake_seasonal", "load_fake_seasonal", 2, season=2024)
+        _install_fake_nflreadpy(monkeypatch, load_fake_seasonal=lambda seasons, **kw: pl.DataFrame(
+            {"season": [2024], "value": [3]}))
+
+        def broken_insert(*args, **kwargs):
+            raise duckdb.IOException("disk full")
+        monkeypatch.setattr("nfl_mcp.ingest._write_df_to_table", broken_insert)
+        with pytest.raises(duckdb.IOException):
+            _ingest_generic_dataset(conn, defn, seasons=[2024], fresh=True)
+
+        assert conn.execute("SELECT value FROM fake_seasonal ORDER BY 1").fetchall() == [(1,), (2,)]
+        assert conn.execute("SELECT row_count FROM _ingest_metadata").fetchall() == [(2,)]
+
+    def test_failed_fetches_are_counted_but_a_season_refusal_is_not(self, tmp_path, monkeypatch):
+        def load(seasons, **kwargs):
+            if seasons == [2025]:
+                raise ConnectionError("Failed to download x: 503")
+            raise ValueError("Season must be between 2016 and 2025")
+        _install_fake_nflreadpy(monkeypatch, load_participation=load)
+        monkeypatch.setattr("nfl_mcp.ingest.current_season", lambda: 2026)
+        failed = run_ingest_datasets(["participation"], start=2025, end=2026, skip_views=True,
+                                     db_path=str(tmp_path / "f.duckdb"))
+        assert failed == 1
+
     def test_seasonal_current_season_is_refetched_even_when_loaded(self, conn, monkeypatch):
         defn = DatasetDef(
             dataset_id="fake_seasonal",
@@ -663,7 +741,7 @@ class TestPbpCurrentSeasonRefresh:
         )
         monkeypatch.setattr("nfl_mcp.ingest.duckdb.connect", lambda path: conn)
         monkeypatch.setattr("nfl_mcp.ingest._ensure_metadata_table", lambda c: None)
-        monkeypatch.setattr("nfl_mcp.ingest._create_plays_table", lambda c, df, fresh=False: None)
+        monkeypatch.setattr("nfl_mcp.ingest._create_plays_table", lambda c, df: None)
         monkeypatch.setattr("nfl_mcp.ingest._ingest_pbp_season", lambda c, season: pbp_calls.append(season) or 1)
         monkeypatch.setattr("nfl_mcp.ingest._record_loaded", lambda *a, **k: None)
         monkeypatch.setattr("nfl_mcp.ingest._create_indexes", lambda c: None)
@@ -684,7 +762,7 @@ class TestPbpCurrentSeasonRefresh:
         _install_fake_nflreadpy(monkeypatch, load_pbp=load_pbp)
         monkeypatch.setattr("nfl_mcp.ingest.duckdb.connect", lambda path: conn)
         monkeypatch.setattr("nfl_mcp.ingest._ensure_metadata_table", lambda c: None)
-        monkeypatch.setattr("nfl_mcp.ingest._create_plays_table", lambda c, df, fresh=False: None)
+        monkeypatch.setattr("nfl_mcp.ingest._create_plays_table", lambda c, df: None)
         monkeypatch.setattr("nfl_mcp.ingest._ingest_pbp_season", lambda c, season: 0)
         monkeypatch.setattr("nfl_mcp.ingest._create_indexes", lambda c: None)
 
@@ -762,7 +840,7 @@ class TestClipToWindow:
         )
         monkeypatch.setattr("nfl_mcp.ingest.duckdb.connect", lambda path: conn)
         monkeypatch.setattr("nfl_mcp.ingest._ensure_metadata_table", lambda c: None)
-        monkeypatch.setattr("nfl_mcp.ingest._create_plays_table", lambda c, df, fresh=False: None)
+        monkeypatch.setattr("nfl_mcp.ingest._create_plays_table", lambda c, df: None)
         monkeypatch.setattr("nfl_mcp.ingest._ingest_pbp_season", lambda c, season: pbp_calls.append(season) or 1)
         monkeypatch.setattr("nfl_mcp.ingest._record_loaded", lambda *a, **k: None)
         monkeypatch.setattr("nfl_mcp.ingest._create_indexes", lambda c: None)
@@ -1334,6 +1412,12 @@ class TestRunIngestOrchestration:
             self.queries.append(sql)
             return TestRunIngestOrchestration._DummyResult(self.loaded_rows)
 
+        # Each pbp season runs in its own transaction.
+        def begin(self):
+            pass
+
+        commit = rollback = begin
+
         def close(self):
             self.closed = True
 
@@ -1347,7 +1431,7 @@ class TestRunIngestOrchestration:
         )
         monkeypatch.setattr("nfl_mcp.ingest.duckdb.connect", lambda path: conn)
         monkeypatch.setattr("nfl_mcp.ingest._ensure_metadata_table", lambda c: None)
-        monkeypatch.setattr("nfl_mcp.ingest._create_plays_table", lambda c, df, fresh=False: None)
+        monkeypatch.setattr("nfl_mcp.ingest._create_plays_table", lambda c, df: None)
         monkeypatch.setattr("nfl_mcp.ingest._ingest_pbp_season", lambda c, season: calls["pbp"].append(season) or 11)
         monkeypatch.setattr(
             "nfl_mcp.ingest._record_loaded",
@@ -1393,7 +1477,7 @@ class TestRunIngestOrchestration:
         )
         monkeypatch.setattr("nfl_mcp.ingest.duckdb.connect", lambda path: conn)
         monkeypatch.setattr("nfl_mcp.ingest._ensure_metadata_table", lambda c: None)
-        monkeypatch.setattr("nfl_mcp.ingest._create_plays_table", lambda c, df, fresh=False: None)
+        monkeypatch.setattr("nfl_mcp.ingest._create_plays_table", lambda c, df: None)
         monkeypatch.setattr("nfl_mcp.ingest._ingest_pbp_season", lambda c, season: pbp_calls.append(season) or 1)
         monkeypatch.setattr("nfl_mcp.ingest._create_indexes", lambda c: None)
         monkeypatch.setattr("nfl_mcp.ingest.rebuild_derived_tables",

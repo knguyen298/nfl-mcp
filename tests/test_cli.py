@@ -149,6 +149,12 @@ class TestDatasetResolution:
         runner.invoke(main, ["ingest", "--dataset", "pbp", "--dataset", "injuries"])
         assert set(captured["ids"]) == {"pbp", "injuries"}
 
+    @pytest.mark.parametrize("failed, code", [(0, 0), (2, 1)])
+    def test_exit_status_follows_failed_fetches(self, runner, monkeypatch, failed, code):
+        # update_db.sh swaps slots only on exit 0, so a missed fetch must be non-zero.
+        monkeypatch.setattr("nfl_mcp.ingest.run_ingest_datasets", lambda *a, **kw: failed)
+        assert runner.invoke(main, ["ingest", "--dataset", "schedules"]).exit_code == code
+
     def test_deduplication(self, runner, monkeypatch):
         """Specifying the same dataset twice should not duplicate it."""
         captured = {}
@@ -534,15 +540,36 @@ class TestCliHelpers:
 # ── doctor command ──────────────────────────────────────────────────────────────
 
 class TestDoctorCommand:
-    def test_doctor_exits_early_when_config_missing(self, runner, monkeypatch):
+    def test_doctor_runs_from_the_database_path_alone(self, runner, monkeypatch, tmp_path):
+        # A container sets NFL_MCP_DB_PATH and writes no config file; doctor used to stop there.
         monkeypatch.setattr("nfl_mcp.config.config_exists", lambda: False)
+        monkeypatch.setattr("nfl_mcp.config.get_duckdb_path", lambda: tmp_path / "missing.duckdb")
         result = runner.invoke(main, ["doctor"])
-        assert result.exit_code == 0
-        assert "No config file" in result.output
+        assert result.exit_code == 1
+        assert "No config file; using NFL_MCP_DB_PATH" in result.output
+        assert "DuckDB file not found" in result.output
+
+    @staticmethod
+    def _stamped_db(path, *, fetched_after_build):
+        import datetime
+
+        import duckdb
+        built = datetime.datetime(2026, 11, 1)
+        fetched = built + datetime.timedelta(hours=1 if fetched_after_build else -1)
+        conn = duckdb.connect(str(path))
+        conn.execute("CREATE TABLE plays AS SELECT 2024 AS season FROM range(3)")
+        conn.execute("CREATE TABLE _ingest_metadata (dataset_id VARCHAR, table_name VARCHAR, season INTEGER, "
+                     "row_count BIGINT, loaded_at TIMESTAMP, loader_fn VARCHAR)")
+        conn.execute("INSERT INTO _ingest_metadata VALUES "
+                     "('derived_shape', 'derived_shape', NULL, 3, ?, 'nfl_mcp.ingest.rebuild_derived_tables'), "
+                     "('pbp', 'plays', 2024, 3, ?, 'load_pbp')", [built, fetched])
+        conn.close()
 
     def test_doctor_happy_path_reports_success(self, runner, monkeypatch, tmp_path):
+        slot = tmp_path / "nflread_b.duckdb"
+        self._stamped_db(slot, fetched_after_build=False)
         db_path = tmp_path / "nflread.duckdb"
-        db_path.write_text("placeholder")
+        db_path.symlink_to(slot.name)
 
         claude_path = tmp_path / "claude_desktop_config.json"
         claude_path.write_text(json.dumps({"mcpServers": {"nfl": {"command": "nfl-mcp"}}}))
@@ -551,31 +578,31 @@ class TestDoctorCommand:
         vscode_dir.mkdir(parents=True, exist_ok=True)
         (vscode_dir / "mcp.json").write_text(json.dumps({"servers": {"nfl": {"command": "nfl-mcp"}}}))
 
-        class _FakeCursor:
-            def __init__(self, row):
-                self._row = row
-
-            def fetchone(self):
-                return self._row
-
-        class _FakeConn:
-            def execute(self, sql):
-                if "COUNT(*) FROM plays" in sql:
-                    return _FakeCursor((123456,))
-                return _FakeCursor((2013, 2025))
-
-            def close(self):
-                return None
-
         monkeypatch.setattr("nfl_mcp.config.config_exists", lambda: True)
         monkeypatch.setattr("nfl_mcp.config.get_duckdb_path", lambda: db_path)
         monkeypatch.setattr("nfl_mcp.cli._claude_desktop_config_path", lambda: claude_path)
         monkeypatch.setattr("nfl_mcp.cli.Path.cwd", lambda: tmp_path)
-        monkeypatch.setattr("duckdb.connect", lambda *args, **kwargs: _FakeConn())
 
         result = runner.invoke(main, ["doctor"])
         assert result.exit_code == 0
+        assert "Derived shape version 3 (this build writes 3)" in result.output
+        assert "after the last fetch" in result.output
+        assert "Last real fetch: 2026-10-31 23:00:00" in result.output
+        assert "Active slot: nflread_b.duckdb" in result.output
         assert "All checks passed!" in result.output
+
+    def test_doctor_fails_when_derived_tables_lag_the_rows(self, runner, monkeypatch, tmp_path):
+        db_path = tmp_path / "nflread.duckdb"
+        self._stamped_db(db_path, fetched_after_build=True)
+        monkeypatch.setattr("nfl_mcp.config.config_exists", lambda: True)
+        monkeypatch.setattr("nfl_mcp.config.get_duckdb_path", lambda: db_path)
+        monkeypatch.setattr("nfl_mcp.cli._claude_desktop_config_path", lambda: None)
+        monkeypatch.setattr("nfl_mcp.cli.Path.cwd", lambda: tmp_path)
+
+        result = runner.invoke(main, ["doctor"])
+        assert result.exit_code == 1
+        assert "before the last fetch — run 'nfl-mcp rebuild'" in result.output
+        assert "Active slot: none (a plain database file)" in result.output
 
     def test_doctor_reports_db_error_and_failed_summary(self, runner, monkeypatch, tmp_path):
         db_path = tmp_path / "nflread.duckdb"
@@ -591,7 +618,7 @@ class TestDoctorCommand:
         )
 
         result = runner.invoke(main, ["doctor"])
-        assert result.exit_code == 0
+        assert result.exit_code == 1
         assert "Database error: cannot open db" in result.output
         assert "Claude Desktop not detected" in result.output
         assert "VS Code MCP config not found" in result.output
@@ -613,7 +640,7 @@ class TestDoctorCommand:
         monkeypatch.setattr("nfl_mcp.cli.Path.cwd", lambda: tmp_path)
 
         result = runner.invoke(main, ["doctor"])
-        assert result.exit_code == 0
+        assert result.exit_code == 1
         assert "DuckDB file not found" in result.output
         assert "Claude Desktop config exists but 'nfl' server not found" in result.output
         assert ".vscode/mcp.json exists but 'nfl' server not found" in result.output
@@ -635,6 +662,6 @@ class TestDoctorCommand:
         monkeypatch.setattr("nfl_mcp.cli.Path.cwd", lambda: tmp_path)
 
         result = runner.invoke(main, ["doctor"])
-        assert result.exit_code == 0
+        assert result.exit_code == 1
         assert "Claude Desktop config exists but is invalid JSON" in result.output
         assert ".vscode/mcp.json exists but is invalid JSON" in result.output

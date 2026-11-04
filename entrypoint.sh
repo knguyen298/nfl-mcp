@@ -32,7 +32,11 @@ if [ ! -f "$SLOT_A" ]; then
 fi
 
 # Relative link: the symlink lives in $DB_DIR, so the target name resolves there.
-ln -sfn "$(basename "$SLOT_A")" "$SYMLINK"
+# Only when the link is missing, dangling or not a link: after update_db.sh swapped to
+# slot B, relinking A on every start served the older slot until the next refresh.
+if [ ! -L "$SYMLINK" ] || [ ! -e "$SYMLINK" ]; then
+    ln -sfn "$(basename "$SLOT_A")" "$SYMLINK"
+fi
 echo "[init] Active DB: $(readlink "$SYMLINK")"
 
 # A new image over an existing /data volume keeps the old slot, whose derived

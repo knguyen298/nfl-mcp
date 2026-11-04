@@ -505,7 +505,8 @@ def test_nfl_status_happy_path(monkeypatch):
         [{"season": 2024, "season_type": "REG", "plays": 123}],
         [{"first_season": 2024, "last_season": 2024, "num_seasons": 1}],
         [{"dataset_id": "pbp", "table_name": "plays", "total_rows": 123}],
-        [{"last_refreshed": "2026-03-01"}],
+        [{"built_at": "2026-03-02", "last_fetch": "2026-03-01"}],
+        [{"row_count": 3}],
     ])
     monkeypatch.setattr(tools, "_execute", lambda sql, params=None: next(responses))
 
@@ -514,6 +515,8 @@ def test_nfl_status_happy_path(monkeypatch):
     assert result["plays"]["season_range"]["first_season"] == 2024
     assert result["datasets"]["total_loaded"] == 1
     assert result["datasets"]["last_refreshed"] == "2026-03-01"
+    assert result["derived"]["matches_raw_rows"] is True
+    assert result["active_slot"] is None
 
 
 def test_nfl_status_returns_error_on_timeout(monkeypatch):

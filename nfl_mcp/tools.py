@@ -568,9 +568,18 @@ def nfl_status() -> Dict[str, Any]:
             "GROUP BY dataset_id, table_name "
             "ORDER BY dataset_id"
         )
-        last_refreshed = _execute(
-            "SELECT MAX(loaded_at) as last_refreshed FROM _ingest_metadata"
+        # Imported here like _stale_derived_shape does, so serving tools does not pay for polars.
+        from .config import get_duckdb_path
+        from .ingest import (
+            _FRESHNESS_SQL,
+            _SHAPE_STAMP_SQL,
+            active_slot,
+            derived_status,
         )
+
+        freshness = _execute(_FRESHNESS_SQL)[0]
+        stamp = _execute(_SHAPE_STAMP_SQL)
+        derived = derived_status(stamp=stamp[0]["row_count"] if stamp else None, **freshness)
         return {
             "plays": {
                 "total_plays": total[0]["total_plays"] if total else 0,
@@ -579,9 +588,13 @@ def nfl_status() -> Dict[str, Any]:
             },
             "datasets": {
                 "total_loaded": len(datasets),
-                "last_refreshed": last_refreshed[0]["last_refreshed"] if last_refreshed else None,
+                # The last real fetch. A rebuild writes metadata rows too, and counting them made
+                # this move with no new data.
+                "last_refreshed": freshness["last_fetch"],
                 "loaded": datasets,
             },
+            "derived": derived,
+            "active_slot": active_slot(get_duckdb_path()),
         }
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
