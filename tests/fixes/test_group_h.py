@@ -674,3 +674,55 @@ def test_integration_snap_counts_kc_2024_sb():
     res = tools.nfl_snap_counts(team="KC", season=2024, **{"season_type": "SB"})
     assert _n(res, "snap_counts") == expected
     assert {r["game_type"] for r in res["snap_counts"]} == {"SB"}
+
+
+# ── Player resolver gets every franchise code ─────────────────────────────────
+
+@pytest.fixture
+def two_sams(tmp_path, monkeypatch):
+    """Two players named Sam Smith: one on the 2019 OAK roster, one on the 2024 KC roster."""
+    path = tmp_path / "sams.duckdb"
+    c = duckdb.connect(str(path))
+    c.execute("""CREATE TABLE players (gsis_id VARCHAR, display_name VARCHAR, common_first_name VARCHAR,
+        first_name VARCHAR, last_name VARCHAR, short_name VARCHAR, football_name VARCHAR,
+        suffix VARCHAR, pfr_id VARCHAR, position VARCHAR, latest_team VARCHAR,
+        rookie_season INTEGER, last_season INTEGER, status VARCHAR)""")
+    c.executemany("INSERT INTO players VALUES (?, 'Sam Smith', 'Sam', 'Sam', 'Smith', 'S.Smith', "
+                  "'Sam', NULL, NULL, 'WR', ?, 2018, ?, 'ACT')",
+                  [("00-0000031", "LV", 2019), ("00-0000032", "KC", 2024)])
+    c.execute("CREATE TABLE rosters (gsis_id VARCHAR, season INTEGER, team VARCHAR)")
+    c.executemany("INSERT INTO rosters VALUES (?, ?, ?)",
+                  [("00-0000031", 2019, "OAK"), ("00-0000032", 2024, "KC")])
+    c.close()
+    monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))
+
+
+@pytest.mark.parametrize("team", ["OAK", "oak", "LV", " lv "])
+def test_player_lookup_team_alias_matches_old_roster_code(two_sams, team):
+    # The roster row says OAK; LV and OAK are the same franchise, so both find player 31 only.
+    res = tools.nfl_player_lookup("Sam Smith", team=team)
+    assert [c["gsis_id"] for c in res["candidates"]] == ["00-0000031"]
+
+
+def test_player_lookup_unknown_team_is_error(two_sams):
+    res = tools.nfl_player_lookup("Sam Smith", team="XX")
+    assert res["code"] == "UNKNOWN_TEAM"
+
+
+@pytest.mark.integration
+def test_integration_td_luck_jax_and_jac_resolve_same_player():
+    _real_db()
+    by_code = {code: tools.nfl_td_luck(player="Etienne", team=code, season=2024)
+               for code in ("JAX", "JAC")}
+    assert all("ambiguous" not in r for r in by_code.values()), by_code
+    assert by_code["JAX"]["player_id"] == by_code["JAC"]["player_id"]
+    assert by_code["JAX"]["player_name"] == "Travis Etienne"
+
+
+@pytest.mark.integration
+def test_integration_lookup_la_and_lar_resolve_same_player():
+    _real_db()
+    by_code = {code: tools.nfl_player_lookup("Donald", team=code, season=2024)
+               for code in ("LA", "LAR")}
+    assert by_code["LA"]["count"] == 1
+    assert by_code["LA"]["candidates"] == by_code["LAR"]["candidates"]

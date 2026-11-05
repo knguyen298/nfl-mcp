@@ -70,8 +70,11 @@ def _checked(fn):
     return wrapper
 
 
-def _int_arg(name: str, value: Any) -> int | None:
-    """None stays None. An int, an integral float or a numeric string gives an int; 0 is a value."""
+def _int_arg(name: str, value: Any, minimum: int | None = None, maximum: int | None = None) -> int | None:
+    """None stays None. An int, an integral float or a numeric string gives an int; 0 is a value.
+
+    minimum and maximum are optional inclusive bounds; a value outside them is INVALID_ARGUMENT.
+    """
     if value is None:
         return None
     if isinstance(value, bool):
@@ -80,10 +83,16 @@ def _int_arg(name: str, value: Any) -> int | None:
         if isinstance(value, float):
             if not value.is_integer():
                 raise ValueError
-            return int(value)
-        return int(str(value).strip())
+            number = int(value)
+        else:
+            number = int(str(value).strip())
     except (TypeError, ValueError, OverflowError):
         raise _BadArgument(f"{name} must be an integer, got {value!r}") from None
+    if (minimum is not None and number < minimum) or (maximum is not None and number > maximum):
+        low = "" if minimum is None else f" at least {minimum}"
+        high = "" if maximum is None else f" at most {maximum}"
+        raise _BadArgument(f"{name} must be{low}{' and' if low and high else ''}{high}, got {number}")
+    return number
 
 
 def _num_arg(name: str, value: Any) -> float | None:
@@ -190,6 +199,7 @@ def _range_reason(
     Call it only when a query returned no rows. Returns None when the filter is inside the
     loaded range or the range cannot be read.
     """
+    # table and season_col go straight into the SQL: callers must pass constants, never user input.
     if season is None and season_from is None and season_to is None and week is None:
         return None
     try:
@@ -285,7 +295,7 @@ def _find_players(
     *,
     gsis_id: str | None = None,
     gsis_ids: list[str] | None = None,
-    team: str | None = None,
+    team: Sequence[str] | None = None,
     season: int | None = None,
     season_from: int | None = None,
     season_to: int | None = None,
@@ -296,7 +306,8 @@ def _find_players(
 
     gsis_id looks one player up by id. A name matches the full name, the last name, the short name ("K.Allen"), or the first
     name plus last name, after folding accents, punctuation and a generational suffix.
-    Team and season mean "has a rosters row" (in that season when both are given).
+    Team (a sequence of franchise codes, see _team_codes) and season mean "has a rosters row"
+    (in that season when both are given).
     """
     where: list[str] = []
     params: list[Any] = []
@@ -325,8 +336,9 @@ def _find_players(
     roster: list[str] = []
     roster_params: list[Any] = []
     if team:
-        roster.append("r.team = ?")
-        roster_params.append(team.upper())
+        clause, codes = _in_clause("r.team", team)
+        roster.append(clause)
+        roster_params.extend(codes)
     if season is not None:
         roster.append("r.season = ?")
         roster_params.append(int(season))
@@ -387,7 +399,7 @@ def _resolve_player(
     player_name: str | None,
     player_id: str | None,
     *,
-    team: str | None = None,
+    team: Sequence[str] | None = None,
     season: int | None = None,
     season_from: int | None = None,
     season_to: int | None = None,
@@ -424,6 +436,7 @@ def _resolve_player(
     return None, None
 
 
+@_checked
 def nfl_player_lookup(
     name: str,
     team: str | None = None,
@@ -435,7 +448,7 @@ def nfl_player_lookup(
         return {"error": "name is required", "code": "MISSING_NAME"}
     try:
         candidates, truncated = _find_players(
-            str(name), team=team, season=season, position=position, limit=50)
+            str(name), team=_team_codes(team), season=season, position=position, limit=50)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.exception("Tool error")
         return {"error": str(e)}
@@ -469,7 +482,7 @@ def _player_filter(
     table: str,
     name_col: str,
     *,
-    team: str | None = None,
+    team: Sequence[str] | None = None,
     season: int | None = None,
 ) -> tuple[str | None, list[Any], dict | None, dict[str, Any] | None]:
     """Player condition for a derived table that has a player_id column.
@@ -1746,7 +1759,7 @@ def nfl_fantasy_opportunity(
     """
     season, week = _int_arg("season", season), _int_arg("week", week)
     team_clause = _team_filter("posteam", team)
-    team = team.strip() if team else None
+    team = _team_codes(team)  # codes for the player resolver
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
         player, player_id, "ff_opportunity", "full_name", team=team, season=season)
@@ -1896,7 +1909,7 @@ def nfl_ftn_charting(
         if clause:
             conditions.append(clause[0])
             params.extend(clause[1])
-    team = team.strip() if team else None
+    team = _team_codes(team)  # codes for the player resolver
     resolved = None
     if player or player_id:
         try:
@@ -2003,7 +2016,7 @@ def nfl_td_luck(
 
     season = _int_arg("season", season)
     team_clause = _team_filter("team", team)
-    team = team.strip() if team else None
+    team = _team_codes(team)  # codes for the player resolver
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
         player, player_id, "player_td_luck", "full_name", team=team, season=season)
@@ -2067,7 +2080,7 @@ def nfl_role_trend(
     season, week = _int_arg("season", season), _int_arg("week", week)
     min_snap_pct = _num_arg("min_snap_pct", min_snap_pct)
     team_clause = _team_filter("team", team)
-    team = team.strip() if team else None
+    team = _team_codes(team)  # codes for the player resolver
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
         player, player_id, "player_role_trend", "full_name", team=team, season=season)
@@ -2141,7 +2154,7 @@ def nfl_separation_opportunity(
 
     regression_candidate = _bool_arg("regression_candidate", regression_candidate, default=None)
     team_clause = _team_filter("team", team)
-    team = team.strip() if team else None
+    team = _team_codes(team)  # codes for the player resolver
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
         player, player_id, "player_separation_opportunity", "full_name", team=team, season=season)
@@ -2211,7 +2224,7 @@ def nfl_drop_rate(
 
     min_targets = _int_arg("min_targets", min_targets)
     team_clause = _team_filter("team", team)
-    team = team.strip() if team else None
+    team = _team_codes(team)  # codes for the player resolver
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
         player, player_id, "player_drop_rate", "player", team=team, season=season)
@@ -2274,7 +2287,7 @@ def nfl_contract_value(
     season = _int_arg("season", season)
     min_apy, max_apy = _num_arg("min_apy", min_apy), _num_arg("max_apy", max_apy)
     team_clause = _team_filter("team", team)
-    team = team.strip() if team else None
+    team = _team_codes(team)  # codes for the player resolver
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
         player, player_id, "player_contract_value", "full_name", team=team, season=season)
