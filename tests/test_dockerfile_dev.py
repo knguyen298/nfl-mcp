@@ -338,7 +338,8 @@ class TestContainerLifecycle:
 class TestRootStartDropsPrivileges:
     """entrypoint.sh started as root chowns a foreign-owned /data, then re-runs as nflmcp.
 
-    Nothing runs as root: `id`, `stat`, `chown` and `setpriv` are stubs that log their calls.
+    Nothing runs as root: `id`, `find`, `chown` and `setpriv` are stubs. The `find` stub reports
+    the directory itself as foreign-owned unless the owner is nflmcp.
     """
 
     @staticmethod
@@ -346,7 +347,7 @@ class TestRootStartDropsPrivileges:
         log = tmp_path / "calls.log"
         stubs = {
             "id": '[ "$1" = -u ] && echo 0\n',
-            "stat": f'echo {owner}\n',
+            "find": f'[ {owner} = nflmcp ] || echo "$1"\n',
             "chown": 'echo "chown $*" >> "$CALL_LOG"\n',
             "setpriv": 'echo "setpriv $*" >> "$CALL_LOG"\n',
         }
