@@ -169,8 +169,8 @@ def test_nfl_status_returns_error_on_timeout(monkeypatch):
 def test_nfl_query_reports_truncation(monkeypatch):
     monkeypatch.setattr(
         tools,
-        "_execute",
-        lambda sql, params=None: [{"x": 1}, {"x": 2}, {"x": 3}],
+        "_fetch_capped",
+        lambda sql, limit: ([{"name": "x", "type": "INTEGER"}], [{"x": 1}, {"x": 2}, {"x": 3}]),
     )
     result = tools.nfl_query("SELECT 1 AS x", max_rows=2)
     assert result["row_count"] == 2
@@ -178,7 +178,7 @@ def test_nfl_query_reports_truncation(monkeypatch):
 
 
 def test_nfl_query_returns_error_when_execute_fails(monkeypatch):
-    monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad sql")))
+    monkeypatch.setattr(tools, "_fetch_capped", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad sql")))
     result = tools.nfl_query("SELECT 1")
     assert result["error"] == "bad sql"
     assert "code" not in result
@@ -214,11 +214,21 @@ def _failing_query(exc, schema_rows):
     return fake_execute
 
 
+def _raise_from_fetch(monkeypatch, exc):
+    """Make nfl_query's own statement fail with `exc` (schema lookups still use _execute)."""
+
+    def fake_fetch(sql, limit):
+        raise exc
+
+    monkeypatch.setattr(tools, "_fetch_capped", fake_fetch)
+
+
 def test_nfl_query_suggests_real_columns_for_an_invented_column(monkeypatch):
     monkeypatch.setattr(
         tools, "_execute", _failing_query(duckdb.BinderException(COLUMN_ERROR),
                                           [{"column_name": c} for c in PLAY_COLUMNS]),
     )
+    _raise_from_fetch(monkeypatch, duckdb.BinderException(COLUMN_ERROR))
     result = tools.nfl_query("SELECT defteam, ROUND(AVG(play_epa),4) FROM plays GROUP BY 1")
 
     assert result["code"] == "COLUMN_NOT_FOUND"
@@ -233,6 +243,7 @@ def test_nfl_query_suggests_real_tables_for_an_invented_table(monkeypatch):
         tools, "_execute", _failing_query(duckdb.CatalogException(TABLE_ERROR),
                                           [{"table_name": t} for t in ("plays", "schedules")]),
     )
+    _raise_from_fetch(monkeypatch, duckdb.CatalogException(TABLE_ERROR))
     result = tools.nfl_query("SELECT * FROM playz")
 
     assert result["code"] == "TABLE_NOT_FOUND"
@@ -248,6 +259,7 @@ def test_nfl_query_falls_back_to_duckdb_candidates_when_schema_lookup_fails(monk
         raise duckdb.BinderException(COLUMN_ERROR)
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
+    _raise_from_fetch(monkeypatch, duckdb.BinderException(COLUMN_ERROR))
     result = tools.nfl_query("SELECT AVG(play_epa) FROM plays")
 
     assert result["code"] == "COLUMN_NOT_FOUND"

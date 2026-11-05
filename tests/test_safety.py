@@ -1,45 +1,7 @@
 """Tests for SQL safety guardrails in nfl_mcp.tools."""
 
 import pytest
-from nfl_mcp.tools import nfl_query, _FORBIDDEN
-
-
-# ── Forbidden keyword detection ────────────────────────────────────────────────
-
-class TestForbiddenRegex:
-    """Ensure dangerous SQL keywords are blocked."""
-
-    @pytest.mark.parametrize("keyword", [
-        "INSERT", "UPDATE", "DELETE", "DROP", "TRUNCATE", "ALTER",
-        "CREATE", "REPLACE", "UPSERT", "EXECUTE", "EXEC", "CALL",
-        "COPY", "GRANT", "REVOKE", "VACUUM", "ANALYZE", "CLUSTER",
-        "REINDEX", "COMMENT", "SECURITY", "OWNER", "TABLESPACE",
-        "SCHEMA", "SET", "DO", "LISTEN", "NOTIFY", "PREPARE",
-        "DEALLOCATE", "LOAD", "DISCARD", "RESET",
-    ])
-    def test_blocks_dangerous_keywords(self, keyword):
-        assert _FORBIDDEN.search(keyword), f"Should block: {keyword}"
-        assert _FORBIDDEN.search(keyword.lower()), f"Should block lowercase: {keyword.lower()}"
-
-    @pytest.mark.parametrize("keyword", [
-        "pg_read_file", "pg_read_binary_file", "pg_write_file",
-        "pg_sleep", "lo_import", "lo_export", "dblink",
-        "current_setting", "pg_terminate_backend", "pg_cancel_backend",
-    ])
-    def test_blocks_dangerous_functions(self, keyword):
-        assert _FORBIDDEN.search(keyword), f"Should block function: {keyword}"
-
-    def test_allows_select(self):
-        assert _FORBIDDEN.search("SELECT") is None
-
-    def test_allows_common_sql_words(self):
-        for word in ["FROM", "WHERE", "GROUP", "ORDER", "HAVING", "JOIN",
-                     "LEFT", "RIGHT", "INNER", "OUTER", "CASE", "WHEN",
-                     "THEN", "ELSE", "END", "AS", "ON", "AND", "OR", "NOT",
-                     "IN", "BETWEEN", "LIKE", "ILIKE", "IS", "NULL",
-                     "COUNT", "SUM", "AVG", "MIN", "MAX", "ROUND",
-                     "COALESCE", "NULLIF", "DISTINCT", "LIMIT", "OFFSET"]:
-            assert _FORBIDDEN.search(word) is None, f"Should allow: {word}"
+from nfl_mcp.tools import nfl_query
 
 
 # ── nfl_query guardrails ──────────────────────────────────────────────────────
@@ -50,7 +12,7 @@ class TestNflQueryGuardrails:
     def test_rejects_non_select(self):
         result = nfl_query("INSERT INTO plays VALUES (1)")
         assert "error" in result
-        assert "SELECT" in result["error"]
+        assert result["statement_type"] == "INSERT"
 
     def test_rejects_delete(self):
         result = nfl_query("DELETE FROM plays")
@@ -63,24 +25,19 @@ class TestNflQueryGuardrails:
     def test_rejects_multiple_statements(self):
         result = nfl_query("SELECT 1; SELECT 2")
         assert "error" in result
-        assert "Multiple" in result["error"]
+        assert "one statement" in result["error"]
 
     def test_rejects_update_in_subquery(self):
         result = nfl_query("SELECT * FROM (UPDATE plays SET season=0) AS x")
         assert "error" in result
 
-    def test_rejects_set_keyword(self):
+    def test_rejects_set_statement(self):
         result = nfl_query("SELECT * FROM plays; SET statement_timeout = '0'")
         assert "error" in result
 
     def test_rejects_copy(self):
         result = nfl_query("SELECT 1; COPY plays TO '/tmp/dump'")
         assert "error" in result
-
-    def test_rejects_pg_sleep(self):
-        result = nfl_query("SELECT pg_sleep(100)")
-        assert "error" in result
-        assert "Forbidden" in result["error"]
 
     def test_rejects_pg_read_file(self):
         result = nfl_query("SELECT pg_read_file('/etc/passwd')")
@@ -91,10 +48,10 @@ class TestNflQueryGuardrails:
         assert "error" in result
 
     def test_allows_trailing_semicolon(self):
-        # Single trailing semicolon should be stripped, not rejected
+        # A single trailing semicolon is one statement, not rejected
         result = nfl_query("SELECT 1;")
         # Should either succeed or fail on execution, not on validation
-        assert "Multiple" not in result.get("error", "")
+        assert "one statement" not in result.get("error", "")
 
     def test_max_rows_clamped(self):
         result = nfl_query("SELECT 1", max_rows=9999)
