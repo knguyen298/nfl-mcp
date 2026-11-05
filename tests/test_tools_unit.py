@@ -485,7 +485,8 @@ def test_catalog_returns_dataset_summary(monkeypatch):
     monkeypatch.setattr(
         tools,
         "_execute",
-        lambda sql, params=None: [{"dataset_id": "pbp", "table_name": "plays", "total_rows": 123}],
+        lambda sql, params=None: ([{"dataset_id": "pbp", "table_name": "plays", "total_rows": 123}]
+                                  if "_ingest_metadata" in sql else []),  # the per-table queries find none
     )
     result = tools.nfl_catalog()
     assert result["total_datasets"] == 1
@@ -754,6 +755,7 @@ def test_ftn_charting_exact_season_filter(monkeypatch):
     result = tools.nfl_ftn_charting(season=2024)
     assert "p.season = ?" in captured["sql"]
     assert captured["params"] == [2024]
+    result.pop("data_as_of", None)  # present whenever a database file exists (group J)
     assert result == {"charting": {}, "total_plays": 0}
 
 
@@ -776,6 +778,7 @@ def test_ftn_charting_handles_null_averages(monkeypatch):
 def test_ftn_charting_empty_rows(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [])
     result = tools.nfl_ftn_charting(team="KC")
+    result.pop("data_as_of", None)  # present whenever a database file exists (group J)
     assert result == {"charting": {}, "total_plays": 0}
 
 
