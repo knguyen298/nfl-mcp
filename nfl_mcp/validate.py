@@ -10,6 +10,7 @@ from pathlib import Path
 import duckdb
 
 from .database import _connection_config
+from .migrate import SCHEMA_VERSION, _read_version
 from .required_columns import REQUIRED_COLUMNS, SNAPSHOT_TABLES
 
 # A new slot may hold up to 1 percent fewer rows than the active one before it fails.
@@ -76,6 +77,19 @@ def _check_schema(columns: dict[str, set[str]]) -> list[CheckResult]:
                     "missing columns: " + ", ".join(missing_columns) if missing_columns
                     else "all required columns present"),
     ]
+
+
+def _check_schema_version(conn, columns: dict[str, set[str]]) -> CheckResult:
+    version = _read_version(conn, columns)
+    if version < SCHEMA_VERSION:
+        return CheckResult("schema_version", False,
+                           f"schema version {version} is below {SCHEMA_VERSION}; "
+                           "run nfl-mcp upgrade on it")
+    if version > SCHEMA_VERSION:
+        return CheckResult("schema_version", False,
+                           f"schema version {version} is newer than this nfl-mcp "
+                           f"({SCHEMA_VERSION}); nfl-mcp upgrade cannot downgrade it")
+    return CheckResult("schema_version", True, f"schema version {version}")
 
 
 def _check_row_counts(new, new_cols, current, current_cols) -> CheckResult:
@@ -170,6 +184,7 @@ def run_checks(new_db: Path, current_db: Path | None = None) -> list[CheckResult
 def _run(new, current) -> list[CheckResult]:
     new_cols = _columns(new)
     results = _check_schema(new_cols)
+    results.append(_check_schema_version(new, new_cols))
     current_cols = _columns(current) if current is not None else {}
     if current is not None:
         results.append(_check_row_counts(new, new_cols, current, current_cols))

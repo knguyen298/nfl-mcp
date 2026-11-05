@@ -44,6 +44,15 @@ chmod u+w "$TARGET"
 echo "[$(date -u)] Running incremental ingest..."
 NFL_MCP_DB_PATH="$TARGET" nfl-mcp ingest
 
+# Bring a slot copied from an older database up to the current schema (derived tables,
+# depth_charts season, missing raw columns) and record the version. Exit 3 means a step
+# is still pending, which validate would only catch later, so any non-zero stops here.
+echo "[$(date -u)] Upgrading $(basename "$TARGET") to the current schema..."
+if ! NFL_MCP_DB_PATH="$TARGET" nfl-mcp upgrade --db "$TARGET"; then
+    echo "[$(date -u)] ERROR: schema upgrade failed or is incomplete. Keeping $CURRENT active."
+    exit 1
+fi
+
 # Refuse to publish a bad slot: missing tables or columns, fewer rows or an older newest
 # week than the active slot, duplicate plays, or empty key columns. On failure the active
 # slot stays in place and the new slot is left on disk for inspection.

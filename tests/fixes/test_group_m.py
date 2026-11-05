@@ -1,8 +1,6 @@
 """Group M: schema version, detection and upgrade of an older database.
 
-Spec: /tmp/nfl-audit/GROUP_M_SPEC.md (binding contract). The tests below define the fix;
-every test that needs it carries a strict xfail marker (XF). Unmarked tests pin behavior
-that holds today and that the fix must keep.
+Spec: /tmp/nfl-audit/GROUP_M_SPEC.md (binding contract). The tests below define the fix.
 
 Contract corrections (the tests follow these, not the spec text)
 1. derived_tables is needed only for a structural reason: a derived table is missing, or
@@ -122,9 +120,6 @@ ROOT = Path(__file__).resolve().parents[2]
 V0_DB = Path("/tmp/grpE_v3.duckdb")
 V053_DB = Path.home() / ".nfl-mcp" / "nflread.duckdb"
 F_DB = Path("/tmp/grpF_work.duckdb")
-
-XF = pytest.mark.xfail(strict=True, reason="group m: nfl_mcp.migrate, `nfl-mcp upgrade` and "
-                                           "the script steps are not written yet")
 
 STEPS = ["derived_tables", "depth_charts_season", "raw_columns"]
 DERIVED = ["team_offense_stats", "team_defense_stats", "situational_stats", "team_records",
@@ -753,12 +748,10 @@ def test_validate_existing_checks_pass_on_grpF_work_against_itself(f_copy):
 # ═══ 2. migrate.check ══════════════════════════════════════════════════════════
 
 
-@XF
 def test_schema_version_constant_is_1():
     assert _migrate().SCHEMA_VERSION == 1
 
 
-@XF
 def test_check_v0_synthetic_reports_every_step(tmp_path):
     status = _status(v0_synth(tmp_path))
     assert (status.version, status.target, status.newer, status.upgrade_needed) == (0, 1, False, True)
@@ -767,7 +760,6 @@ def test_check_v0_synthetic_reports_every_step(tmp_path):
     assert _needed(status) == STEPS
 
 
-@XF
 def test_check_v0_synthetic_details(tmp_path):
     status = _status(v0_synth(tmp_path))
     derived = _step(status, "derived_tables").detail
@@ -779,7 +771,6 @@ def test_check_v0_synthetic_details(tmp_path):
     assert "rosters.college" in raw and "ff_rankings_draft" in raw, raw
 
 
-@XF
 def test_check_current_database_needs_nothing(tmp_path):
     status = _status(current_synth(tmp_path))
     assert (status.version, status.target, status.newer, status.upgrade_needed) == (1, 1, False, False)
@@ -787,7 +778,6 @@ def test_check_current_database_needs_nothing(tmp_path):
     assert _needed(status) == []
 
 
-@XF
 @pytest.mark.parametrize("versions", [None, ()])
 def test_check_structurally_current_but_unstamped_is_version_0(tmp_path, versions):
     # No table, or an empty table, is version 0. Correction 1: no step is needed, but the
@@ -797,13 +787,11 @@ def test_check_structurally_current_but_unstamped_is_version_0(tmp_path, version
     assert _needed(status) == []
 
 
-@XF
 def test_check_version_is_max_of_rows(tmp_path):
     status = _status(current_synth(tmp_path, versions=(1, 2)))
     assert (status.version, status.newer) == (2, True)
 
 
-@XF
 def test_check_missing_derived_table_names_it(tmp_path):
     path = current_synth(tmp_path)
     with _rw(path) as con:
@@ -814,7 +802,6 @@ def test_check_missing_derived_table_names_it(tmp_path):
     assert status.upgrade_needed
 
 
-@XF
 def test_check_depth_charts_without_season_column_is_needed(tmp_path):
     # 4 rows of the 2025 shape and no season column at all: every row lacks a season.
     status = _status(build_db(tmp_path / "d.duckdb", depth="noseason", versions=(1,)))
@@ -824,7 +811,6 @@ def test_check_depth_charts_without_season_column_is_needed(tmp_path):
     assert status.upgrade_needed
 
 
-@XF
 def test_check_without_depth_charts_table_does_not_need_restamp(tmp_path):
     # Correction 3.
     status = _status(build_db(tmp_path / "d.duckdb", depth=None, versions=(1,)))
@@ -832,7 +818,6 @@ def test_check_without_depth_charts_table_does_not_need_restamp(tmp_path):
     assert not status.upgrade_needed
 
 
-@XF
 def test_check_raw_missing_column_and_static_table(tmp_path):
     path = build_db(tmp_path / "r.duckdb", drop_tables={"ff_rankings_week"},
                     drop_columns={"rosters": ["college"]}, versions=(1,))
@@ -842,7 +827,6 @@ def test_check_raw_missing_column_and_static_table(tmp_path):
     assert "rosters.college" in detail and "ff_rankings_week" in detail
 
 
-@XF
 def test_check_writes_nothing_on_a_read_write_connection(tmp_path):
     path = v0_synth(tmp_path)
     with _rw(path) as con:
@@ -853,7 +837,6 @@ def test_check_writes_nothing_on_a_read_write_connection(tmp_path):
     assert "_schema_version" not in after
 
 
-@XF
 def test_check_works_read_only_and_leaves_file_untouched(tmp_path):
     path = v0_synth(tmp_path)
     path.chmod(0o444)
@@ -867,7 +850,6 @@ def test_check_works_read_only_and_leaves_file_untouched(tmp_path):
 # ── check on the real databases ──
 
 
-@XF
 @pytest.mark.integration
 def test_check_grpE_v3_steps_and_version():
     _need(V0_DB)
@@ -878,7 +860,6 @@ def test_check_grpE_v3_steps_and_version():
     assert _needed(status) == ["derived_tables", "depth_charts_season"]
 
 
-@XF
 @pytest.mark.integration
 def test_check_grpE_v3_derived_detail_names_season_type():
     _need(V0_DB)
@@ -887,7 +868,6 @@ def test_check_grpE_v3_derived_detail_names_season_type():
         assert col in detail, detail
 
 
-@XF
 @pytest.mark.integration
 def test_check_grpE_v3_depth_detail_gives_null_count():
     _need(V0_DB)
@@ -896,7 +876,6 @@ def test_check_grpE_v3_depth_detail_gives_null_count():
     assert _has_word(_digits(step.detail), V0_NULL_DEPTH), step.detail
 
 
-@XF
 @pytest.mark.integration
 def test_check_grpE_v3_raw_columns_not_needed():
     # Measured: no raw REQUIRED_COLUMNS table or column is missing in grpE_v3.
@@ -904,7 +883,6 @@ def test_check_grpE_v3_raw_columns_not_needed():
     assert not _step(_status(V0_DB), "raw_columns").needed
 
 
-@XF
 @pytest.mark.integration
 def test_check_grpE_v3_writes_nothing():
     _need(V0_DB)
@@ -919,7 +897,6 @@ def test_check_grpE_v3_writes_nothing():
     assert not Path(f"{V0_DB}.wal").exists()
 
 
-@XF
 @pytest.mark.integration
 def test_check_v053_reports_version_0_not_newer(v053_copy):
     # Correction 4: the derived_shape row (row_count 4) is not a schema version.
@@ -928,7 +905,6 @@ def test_check_v053_reports_version_0_not_newer(v053_copy):
     assert _needed(status) == ["derived_tables", "depth_charts_season"]
 
 
-@XF
 @pytest.mark.integration
 def test_check_v053_details(v053_copy):
     status = _status(v053_copy)
@@ -939,7 +915,6 @@ def test_check_v053_details(v053_copy):
     assert _has_word(_digits(_step(status, "depth_charts_season").detail), V0_NULL_DEPTH)
 
 
-@XF
 @pytest.mark.integration
 def test_check_grpF_work_needs_only_the_depth_restamp(f_copy):
     status = _status(f_copy)
@@ -950,7 +925,6 @@ def test_check_grpF_work_needs_only_the_depth_restamp(f_copy):
 # ═══ 3. migrate.upgrade ════════════════════════════════════════════════════════
 
 
-@XF
 def test_full_upgrade_runs_every_step_and_stamps(tmp_path, monkeypatch):
     path = v0_synth(tmp_path)
     FakeNfl().install(monkeypatch)
@@ -963,7 +937,6 @@ def test_full_upgrade_runs_every_step_and_stamps(tmp_path, monkeypatch):
     assert _versions(path) == [1]
 
 
-@XF
 def test_full_upgrade_fills_in_the_data(tmp_path, monkeypatch):
     path = v0_synth(tmp_path)
     fake = FakeNfl().install(monkeypatch)
@@ -988,7 +961,6 @@ def test_full_upgrade_fills_in_the_data(tmp_path, monkeypatch):
         con.close()
 
 
-@XF
 def test_check_after_full_upgrade_reports_current(tmp_path, monkeypatch):
     path = v0_synth(tmp_path)
     FakeNfl().install(monkeypatch)
@@ -1003,7 +975,6 @@ def test_check_after_full_upgrade_reports_current(tmp_path, monkeypatch):
         con.close()
 
 
-@XF
 def test_second_upgrade_runs_nothing_and_stamps_nothing(tmp_path, monkeypatch):
     path = v0_synth(tmp_path)
     fake = FakeNfl().install(monkeypatch)
@@ -1015,7 +986,6 @@ def test_second_upgrade_runs_nothing_and_stamps_nothing(tmp_path, monkeypatch):
     assert _versions(path) == [1]
 
 
-@XF
 def test_failed_depth_fetch_keeps_legacy_rows_and_later_steps_run(tmp_path, monkeypatch):
     path = v0_synth(tmp_path)
     fake = FakeNfl(fail={"load_depth_charts": None}).install(monkeypatch)
@@ -1038,7 +1008,6 @@ def test_failed_depth_fetch_keeps_legacy_rows_and_later_steps_run(tmp_path, monk
     assert _step(result.after, "depth_charts_season").needed
 
 
-@XF
 def test_failed_upgrade_retried_later_completes(tmp_path, monkeypatch):
     path = v0_synth(tmp_path)
     FakeNfl(fail={"load_depth_charts": None}).install(monkeypatch)
@@ -1049,7 +1018,6 @@ def test_failed_upgrade_retried_later_completes(tmp_path, monkeypatch):
     assert result.stamped and _versions(path) == [1]
 
 
-@XF
 def test_upgrade_no_fetch_runs_only_derived_tables(tmp_path, monkeypatch):
     path = v0_synth(tmp_path)
     fake = FakeNfl().install(monkeypatch)
@@ -1062,7 +1030,6 @@ def test_upgrade_no_fetch_runs_only_derived_tables(tmp_path, monkeypatch):
     assert not _step(result.after, "derived_tables").needed
 
 
-@XF
 def test_upgrade_no_fetch_stamps_when_only_derived_tables_needed(tmp_path, monkeypatch):
     path = build_db(tmp_path / "d.duckdb", derived="v0")
     FakeNfl().install(monkeypatch)
@@ -1071,7 +1038,6 @@ def test_upgrade_no_fetch_stamps_when_only_derived_tables_needed(tmp_path, monke
     assert _versions(path) == [1]
 
 
-@XF
 def test_upgrade_on_unstamped_current_database_only_stamps(tmp_path, monkeypatch):
     # Correction 1: nothing structural to do, so no step runs; the version is written.
     path = current_synth(tmp_path, versions=None)
@@ -1085,7 +1051,6 @@ def test_upgrade_on_unstamped_current_database_only_stamps(tmp_path, monkeypatch
 # ── raw_columns ──
 
 
-@XF
 def test_raw_missing_column_reingests_metadata_seasons_fresh(tmp_path, monkeypatch):
     path = build_db(tmp_path / "r.duckdb", seasons={"rosters": [2022, 2023]},
                     drop_columns={"rosters": ["college"]})
@@ -1105,7 +1070,6 @@ def test_raw_missing_column_reingests_metadata_seasons_fresh(tmp_path, monkeypat
         con.close()
 
 
-@XF
 def test_raw_missing_seasonal_table_loads_default_seasons(tmp_path, monkeypatch):
     path = build_db(tmp_path / "r.duckdb", drop_tables={"player_stats"})
     fake = FakeNfl().install(monkeypatch)
@@ -1121,7 +1085,6 @@ def test_raw_missing_seasonal_table_loads_default_seasons(tmp_path, monkeypatch)
         con.close()
 
 
-@XF
 def test_raw_missing_static_table_loads_once(tmp_path, monkeypatch):
     path = build_db(tmp_path / "r.duckdb", drop_tables={"ff_rankings_week"})
     fake = FakeNfl().install(monkeypatch)
@@ -1130,7 +1093,6 @@ def test_raw_missing_static_table_loads_once(tmp_path, monkeypatch):
     assert result.ran == ["raw_columns"] and result.stamped
 
 
-@XF
 def test_raw_missing_column_and_table_reingest_both(tmp_path, monkeypatch):
     path = build_db(tmp_path / "r.duckdb", seasons={"snap_counts": [2023]},
                     drop_tables={"ff_rankings_draft"}, drop_columns={"snap_counts": ["st_pct"]})
@@ -1141,7 +1103,6 @@ def test_raw_missing_column_and_table_reingest_both(tmp_path, monkeypatch):
     assert _versions(path) == [1]
 
 
-@XF
 def test_missing_derived_source_table_is_complete_after_two_runs(tmp_path, monkeypatch):
     # players feeds player_role_trend and injury_return_curve. Whether upgrade rebuilds the
     # derived tables after raw_columns or leaves that to a second run, two runs finish it.
@@ -1160,13 +1121,11 @@ def test_missing_derived_source_table_is_complete_after_two_runs(tmp_path, monke
 # ── newer database ──
 
 
-@XF
 def test_newer_database_is_reported(tmp_path):
     status = _status(build_db(tmp_path / "n.duckdb", derived="v0", depth="legacy", versions=(2,)))
     assert (status.version, status.target, status.newer) == (2, 1, True)
 
 
-@XF
 def test_upgrade_refuses_newer_database_and_changes_nothing(tmp_path, monkeypatch):
     path = build_db(tmp_path / "n.duckdb", derived="v0", depth="legacy", versions=(2,))
     fake = FakeNfl().install(monkeypatch)
@@ -1185,7 +1144,6 @@ def test_upgrade_refuses_newer_database_and_changes_nothing(tmp_path, monkeypatc
 # ── stamp_if_current ──
 
 
-@XF
 def test_stamp_if_current_stamps_once(tmp_path):
     path = current_synth(tmp_path, versions=None)
     with _rw(path) as con:
@@ -1194,7 +1152,6 @@ def test_stamp_if_current_stamps_once(tmp_path):
     assert _versions(path) == [1]
 
 
-@XF
 def test_stamp_if_current_on_stamped_database_adds_no_row(tmp_path):
     path = current_synth(tmp_path)
     with _rw(path) as con:
@@ -1202,7 +1159,6 @@ def test_stamp_if_current_on_stamped_database_adds_no_row(tmp_path):
     assert _versions(path) == [1]
 
 
-@XF
 @pytest.mark.parametrize("kw", [
     {"depth": "legacy"},                                   # depth_charts_season needed
     {"derived": "v0"},                                     # derived_tables needed
@@ -1218,7 +1174,6 @@ def test_stamp_if_current_refuses_when_a_step_is_needed(tmp_path, kw):
 # ── upgrade(fetch=False) on a copy of grpE_v3 ──
 
 
-@XF
 @pytest.mark.integration
 def test_grpE_v3_upgrade_no_fetch_runs_derived_and_leaves_depth_pending(v0_upgraded):
     r = v0_upgraded.get()
@@ -1233,14 +1188,12 @@ def test_grpE_v3_upgrade_no_fetch_runs_derived_and_leaves_depth_pending(v0_upgra
     assert r["null_depth"] == V0_NULL_DEPTH   # fetch=False touches no depth_charts row
 
 
-@XF
 @pytest.mark.integration
 def test_grpE_v3_upgraded_team_tables_equal_grpF_work(v0_upgraded):
     # EXCEPT ALL both ways against grpF_work (measured equal after a plain rebuild).
     assert v0_upgraded.get()["diff"] == {t: (0, 0) for t in TEAM_TABLES}
 
 
-@XF
 @pytest.mark.integration
 def test_grpE_v3_upgraded_oracle_rows(v0_upgraded):
     snap = v0_upgraded.get()["snap1"]
@@ -1252,7 +1205,6 @@ def test_grpE_v3_upgraded_oracle_rows(v0_upgraded):
     assert rec == [(2025, "KC", "KC", 17, 6, 11, 0, "nflverse")]
 
 
-@XF
 @pytest.mark.integration
 def test_grpE_v3_upgraded_situational_rows(v0_upgraded):
     # BUF 2025 REG plays per situation, measured in grpF_work.
@@ -1267,7 +1219,6 @@ def test_grpE_v3_upgraded_situational_rows(v0_upgraded):
                    "Standard": 694, "Two Minute Drill": 26}
 
 
-@XF
 @pytest.mark.integration
 def test_grpE_v3_second_no_fetch_run_is_a_no_op(v0_upgraded):
     r = v0_upgraded.get()
@@ -1289,7 +1240,6 @@ def _ingest(path, datasets=INGEST_DATASETS):
     return _quiet(ing.run_ingest_datasets, datasets, start=2024, end=2024, db_path=str(path))
 
 
-@XF
 def test_fresh_ingest_without_failures_ends_at_version_1(tmp_path, monkeypatch):
     path = tmp_path / "fresh.duckdb"
     FakeNfl().install(monkeypatch)
@@ -1299,7 +1249,6 @@ def test_fresh_ingest_without_failures_ends_at_version_1(tmp_path, monkeypatch):
     assert (status.version, status.upgrade_needed) == (1, False)
 
 
-@XF
 def test_second_clean_ingest_adds_no_version_row(tmp_path, monkeypatch):
     path = tmp_path / "fresh.duckdb"
     FakeNfl().install(monkeypatch)
@@ -1308,7 +1257,6 @@ def test_second_clean_ingest_adds_no_version_row(tmp_path, monkeypatch):
     assert _versions(path) == [1]
 
 
-@XF
 def test_ingest_with_a_failure_stays_unstamped(tmp_path, monkeypatch):
     # officials is not a required table: the structure is complete, only the failure
     # keeps the stamp off.
@@ -1321,7 +1269,6 @@ def test_ingest_with_a_failure_stays_unstamped(tmp_path, monkeypatch):
     assert status.version == 0 and _needed(status) == []
 
 
-@XF
 def test_ingest_missing_a_required_raw_table_stays_unstamped(tmp_path, monkeypatch):
     path = tmp_path / "fresh.duckdb"
     FakeNfl().install(monkeypatch)
@@ -1335,7 +1282,6 @@ def test_ingest_missing_a_required_raw_table_stays_unstamped(tmp_path, monkeypat
 # ═══ 5. CLI upgrade ════════════════════════════════════════════════════════════
 
 
-@XF
 def test_cli_check_current_exits_0(tmp_path):
     result, out = _cli("upgrade", "--check", "--db", current_synth(tmp_path))
     assert result.exit_code == 0, out
@@ -1344,7 +1290,6 @@ def test_cli_check_current_exits_0(tmp_path):
         assert re.search(r"\bok\b", line, re.IGNORECASE) and "NEEDED" not in line, line
 
 
-@XF
 def test_cli_check_old_exits_3_and_prints_each_step(tmp_path):
     result, out = _cli("upgrade", "--check", "--db", v0_synth(tmp_path))
     assert result.exit_code == 3, out
@@ -1356,13 +1301,11 @@ def test_cli_check_old_exits_3_and_prints_each_step(tmp_path):
     assert any(_has_word(v, 0) and _has_word(v, 1) for v in version), out
 
 
-@XF
 def test_cli_check_newer_exits_1(tmp_path):
     result, out = _cli("upgrade", "--check", "--db", current_synth(tmp_path, versions=(2,)))
     assert result.exit_code == 1, out
 
 
-@XF
 def test_cli_check_works_on_read_only_file(tmp_path):
     path = v0_synth(tmp_path)
     path.chmod(0o444)
@@ -1373,14 +1316,12 @@ def test_cli_check_works_on_read_only_file(tmp_path):
     assert _versions(path) == []
 
 
-@XF
 def test_cli_check_default_db_is_the_configured_path(tmp_path, monkeypatch):
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(v0_synth(tmp_path)))
     result, out = _cli("upgrade", "--check")
     assert result.exit_code == 3, out
 
 
-@XF
 @pytest.mark.parametrize("check", [True, False])
 def test_cli_missing_file_exits_1_and_creates_nothing(tmp_path, check):
     path = tmp_path / "absent.duckdb"
@@ -1390,7 +1331,6 @@ def test_cli_missing_file_exits_1_and_creates_nothing(tmp_path, check):
     assert not path.exists() and not Path(f"{path}.wal").exists()
 
 
-@XF
 def test_cli_upgrade_full_exits_0_and_stamps(tmp_path, monkeypatch):
     path = v0_synth(tmp_path)
     FakeNfl().install(monkeypatch)
@@ -1404,7 +1344,6 @@ def test_cli_upgrade_full_exits_0_and_stamps(tmp_path, monkeypatch):
     assert _versions(path) == [1]
 
 
-@XF
 def test_cli_upgrade_no_fetch_exits_3_when_network_steps_remain(tmp_path, monkeypatch):
     path = v0_synth(tmp_path)
     fake = FakeNfl().install(monkeypatch)
@@ -1419,7 +1358,6 @@ def test_cli_upgrade_no_fetch_exits_3_when_network_steps_remain(tmp_path, monkey
         con.close()
 
 
-@XF
 def test_cli_upgrade_no_fetch_exits_0_when_nothing_needs_network(tmp_path, monkeypatch):
     path = build_db(tmp_path / "d.duckdb", derived="v0")
     FakeNfl().install(monkeypatch)
@@ -1428,7 +1366,6 @@ def test_cli_upgrade_no_fetch_exits_0_when_nothing_needs_network(tmp_path, monke
     assert _versions(path) == [1]
 
 
-@XF
 def test_cli_upgrade_failed_step_exits_1(tmp_path, monkeypatch):
     path = v0_synth(tmp_path)
     FakeNfl(fail={"load_depth_charts": None}).install(monkeypatch)
@@ -1438,7 +1375,6 @@ def test_cli_upgrade_failed_step_exits_1(tmp_path, monkeypatch):
     assert _versions(path) == []
 
 
-@XF
 def test_cli_upgrade_newer_exits_1_and_changes_nothing(tmp_path, monkeypatch):
     path = build_db(tmp_path / "n.duckdb", derived="v0", versions=(2,))
     fake = FakeNfl().install(monkeypatch)
@@ -1453,7 +1389,6 @@ def _read_only_or_skip(path):
         pytest.skip("running as a user that can write a 0444 file")
 
 
-@XF
 def test_cli_upgrade_read_only_file_is_refused(tmp_path, monkeypatch):
     path = v0_synth(tmp_path)
     _read_only_or_skip(path)
@@ -1467,7 +1402,6 @@ def test_cli_upgrade_read_only_file_is_refused(tmp_path, monkeypatch):
     assert fake.calls == [] and not Path(f"{path}.wal").exists()
 
 
-@XF
 @pytest.mark.integration
 def test_cli_check_v053_exits_3(v053_copy):
     result, out = _cli("upgrade", "--check", "--db", v053_copy)
@@ -1477,7 +1411,6 @@ def test_cli_check_v053_exits_3(v053_copy):
     assert re.search(r"\bok\b", _line(out, "raw_columns"), re.IGNORECASE)
 
 
-@XF
 @pytest.mark.integration
 def test_cli_upgrade_refuses_read_only_v053_copy(v053_copy, monkeypatch):
     if os.access(v053_copy, os.W_OK):
@@ -1508,7 +1441,6 @@ def _serve(monkeypatch, caplog, db_path):
     return result, started, warnings
 
 
-@XF
 def test_serve_old_database_logs_one_upgrade_warning(tmp_path, monkeypatch, caplog):
     path = v0_synth(tmp_path)
     path.chmod(0o444)   # serve checks read-only
@@ -1527,14 +1459,12 @@ def test_serve_current_database_logs_no_warning(tmp_path, monkeypatch, caplog):
     assert warnings == []
 
 
-@XF
 def test_serve_newer_database_warns_and_starts(tmp_path, monkeypatch, caplog):
     result, started, warnings = _serve(monkeypatch, caplog, current_synth(tmp_path, versions=(2,)))
     assert result.exit_code == 0 and started == [8000]
     assert [w for w in warnings if "newer" in w.lower()], warnings
 
 
-@XF
 def test_serve_continues_when_the_check_fails(tmp_path, monkeypatch, caplog):
     # A file that exists but is not a DuckDB database: the check raises, serve warns.
     path = tmp_path / "corrupt.duckdb"
@@ -1544,7 +1474,6 @@ def test_serve_continues_when_the_check_fails(tmp_path, monkeypatch, caplog):
     assert warnings, "no warning logged for the failed check"
 
 
-@XF
 def test_serve_continues_when_check_raises(tmp_path, monkeypatch, caplog):
     # Patches the module attribute: serve calls migrate.check through the module.
     migrate = _migrate()
@@ -1569,7 +1498,6 @@ def _doctor(monkeypatch, tmp_path, db_path):
     return lines[0]
 
 
-@XF
 def test_doctor_shows_old_schema_version_and_needed_steps(tmp_path, monkeypatch):
     line = _doctor(monkeypatch, tmp_path, v0_synth(tmp_path))
     assert _has_word(line, 0) and _has_word(line, 1), line
@@ -1577,7 +1505,6 @@ def test_doctor_shows_old_schema_version_and_needed_steps(tmp_path, monkeypatch)
         assert name in line, line
 
 
-@XF
 def test_doctor_shows_current_schema_version(tmp_path, monkeypatch):
     line = _doctor(monkeypatch, tmp_path, current_synth(tmp_path))
     assert _has_word(line, 1), line
@@ -1594,7 +1521,6 @@ def _schema_check(path):
     return hits[0]
 
 
-@XF
 @pytest.mark.parametrize("versions", [None, ()])
 def test_validate_schema_version_fails_for_version_0(tmp_path, versions):
     r = _schema_check(current_synth(tmp_path, versions=versions))
@@ -1602,14 +1528,12 @@ def test_validate_schema_version_fails_for_version_0(tmp_path, versions):
     assert _has_word(r.detail, 0) and _has_word(r.detail, 1) and "nfl-mcp upgrade" in r.detail
 
 
-@XF
 def test_validate_schema_version_fails_for_newer(tmp_path):
     r = _schema_check(current_synth(tmp_path, versions=(2,)))
     assert not r.ok
     assert _has_word(r.detail, 2) and _has_word(r.detail, 1) and "nfl-mcp upgrade" in r.detail
 
 
-@XF
 def test_validate_schema_version_passes_for_1(tmp_path):
     from nfl_mcp.validate import run_checks
     path = current_synth(tmp_path)
@@ -1617,7 +1541,6 @@ def test_validate_schema_version_passes_for_1(tmp_path):
     assert [f"{r.name} {r.detail}" for r in run_checks(path, path) if not r.ok] == []
 
 
-@XF
 def test_cli_validate_exit_codes_follow_schema_version(tmp_path):
     old, out_old = _cli("validate", "--db", current_synth(tmp_path, "v0.duckdb", versions=None))
     assert old.exit_code == 1 and "schema_version" in out_old, out_old
@@ -1656,14 +1579,12 @@ def _update_positions():
     }
 
 
-@XF
 def test_update_db_upgrades_between_ingest_and_validate():
     _, pos = _update_positions()
     assert pos["upgrade"] != -1, "nfl-mcp upgrade not called"
     assert pos["chmod_w"] < pos["ingest"] < pos["upgrade"] < pos["validate"] < pos["chmod_ro"] < pos["swap"]
 
 
-@XF
 def test_update_db_upgrade_targets_the_idle_slot_with_fetch():
     lines, pos = _update_positions()
     assert pos["upgrade"] != -1
@@ -1673,7 +1594,6 @@ def test_update_db_upgrade_targets_the_idle_slot_with_fetch():
     assert "CURRENT" not in call and "SYMLINK" not in call, call
 
 
-@XF
 def test_update_db_upgrade_failure_logs_and_exits_before_validate():
     lines, pos = _update_positions()
     u, v = pos["upgrade"], pos["validate"]
@@ -1741,7 +1661,6 @@ def _entry_positions():
     }
 
 
-@XF
 def test_entrypoint_checks_the_active_link_before_serve():
     lines, pos = _entry_positions()
     assert pos["check"] != -1, "nfl-mcp upgrade --check not called"
@@ -1749,7 +1668,6 @@ def test_entrypoint_checks_the_active_link_before_serve():
     assert re.search(r'--db\s+"\$SYMLINK"', lines[pos["check"]]), lines[pos["check"]]
 
 
-@XF
 def test_entrypoint_check_has_the_opt_out():
     lines, pos = _entry_positions()
     assert pos["check"] != -1
@@ -1758,7 +1676,6 @@ def test_entrypoint_check_has_the_opt_out():
     assert re.search(r'"0"|=\s*0\b', window), window
 
 
-@XF
 def test_entrypoint_starts_one_background_update_after_the_check():
     lines, pos = _entry_positions()
     assert pos["check"] != -1 and len(pos["bg"]) == 1, pos
@@ -1767,7 +1684,6 @@ def test_entrypoint_starts_one_background_update_after_the_check():
     assert ">> /var/log/nflmcp/nfl_update.log" in lines[bg] and "2>&1" in lines[bg], lines[bg]
 
 
-@XF
 def test_entrypoint_check_cannot_fail_the_start():
     lines, pos = _entry_positions()
     assert pos["check"] != -1
@@ -1853,7 +1769,6 @@ def _wait_for(path, seconds):
     return path.exists()
 
 
-@XF
 def test_update_db_runs_upgrade_on_target_between_ingest_and_validate(tmp_path):
     sim = _sim(tmp_path)
     _active_slots(sim)
@@ -1868,7 +1783,6 @@ def test_update_db_runs_upgrade_on_target_between_ingest_and_validate(tmp_path):
     assert os.readlink(sim["data"] / "nflread.duckdb") == "nflread_b.duckdb"
 
 
-@XF
 @pytest.mark.parametrize("code", ["1", "3"])
 def test_update_db_upgrade_failure_keeps_active_slot(tmp_path, code):
     sim = _sim(tmp_path)
@@ -1882,7 +1796,6 @@ def test_update_db_upgrade_failure_keeps_active_slot(tmp_path, code):
             if re.search(r"upgrade", line, re.IGNORECASE) and re.search(r"ERROR|fail", line, re.IGNORECASE)], result.stdout
 
 
-@XF
 def test_entrypoint_old_database_starts_background_update_and_serves(tmp_path):
     sim = _sim(tmp_path)
     result = _run_sh(sim, "entry", STUB_CHECK_EXIT="3")
@@ -1895,7 +1808,6 @@ def test_entrypoint_old_database_starts_background_update_and_serves(tmp_path):
     assert len(sim["mark"].read_text().splitlines()) == 1   # started once
 
 
-@XF
 def test_entrypoint_current_database_starts_no_update(tmp_path):
     sim = _sim(tmp_path)
     result = _run_sh(sim, "entry", STUB_CHECK_EXIT="0")
@@ -1904,7 +1816,6 @@ def test_entrypoint_current_database_starts_no_update(tmp_path):
     assert not _wait_for(sim["mark"], 1)
 
 
-@XF
 def test_entrypoint_check_error_does_not_fail_the_start(tmp_path):
     sim = _sim(tmp_path)
     result = _run_sh(sim, "entry", STUB_CHECK_EXIT="1")
@@ -1913,7 +1824,6 @@ def test_entrypoint_check_error_does_not_fail_the_start(tmp_path):
     assert [a for a, _ in _calls(sim) if a.startswith("upgrade --check")], _calls(sim)
 
 
-@XF
 def test_entrypoint_opt_out_skips_the_check(tmp_path):
     sim = _sim(tmp_path)
     result = _run_sh(sim, "entry", STUB_CHECK_EXIT="3", NFL_MCP_UPGRADE_ON_START="0")
