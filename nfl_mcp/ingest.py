@@ -540,10 +540,10 @@ _CONVERSION_RULE_EXPR = """
         WHEN '3rd & Short'
             THEN 'Share of 3rd-and-3-or-less pass/run plays with first_down = 1'
         WHEN 'Red Zone'
-            THEN 'Share of 1st/2nd-down pass/run plays inside the 20 that are offensive touchdowns'
+            THEN 'Share of pass/run plays inside the 20 not in the down buckets above that are offensive touchdowns'
         WHEN 'Two Minute Drill'
             THEN 'First-down rate: share of 4th-quarter pass/run plays inside 2:00 with first_down = 1'
-        ELSE 'First-down rate: share of remaining 1st/2nd-down pass/run plays with first_down = 1'
+        ELSE 'First-down rate: share of pass/run plays not in the buckets above with first_down = 1'
     END
 """.strip()
 
@@ -575,7 +575,10 @@ def _plays_source(conn: duckdb.DuckDBPyConnection) -> str:
     have = {r[0] for r in conn.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'plays'"
     ).fetchall()}
-    pads = [f"CAST(NULL AS {t}) AS {c}" for c, t in _PLAYS_COLUMNS.items() if c not in have]
+    padded = [c for c in _PLAYS_COLUMNS if c not in have]
+    if padded:
+        print(f"    WARNING: plays lacks column(s) {', '.join(padded)}; derived tables use NULL for them")
+    pads = [f"CAST(NULL AS {_PLAYS_COLUMNS[c]}) AS {c}" for c in padded]
     return f"(SELECT *, {', '.join(pads)} FROM plays)" if pads else "plays"
 
 
@@ -726,7 +729,7 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
             play_type,
             COUNT(*) AS plays,
             ROUND(AVG(yards_gained), 2) AS avg_yards,
-            SUM(CASE WHEN touchdown=1 THEN 1 ELSE 0 END) AS touchdowns,
+            COUNT(*) FILTER (WHERE touchdown = 1 AND td_team = posteam) AS touchdowns,
             SUM(CASE WHEN interception=1 OR fumble_lost=1 THEN 1 ELSE 0 END) AS turnovers,
             ROUND(AVG(epa), 3) AS avg_epa
         FROM {src}

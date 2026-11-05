@@ -56,6 +56,7 @@ import duckdb
 import pytest
 
 from nfl_mcp import ingest, tools
+from nfl_mcp.database import get_db_connection
 
 REAL_DB = Path(os.environ.get("NFL_MCP_DB_PATH", "/tmp/grpE_v3.duckdb"))
 XF = "group f: "
@@ -632,9 +633,9 @@ def real(monkeypatch):
     if not REAL_DB.exists():
         pytest.skip(f"{REAL_DB} missing")
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(REAL_DB))
-    conn = duckdb.connect(str(REAL_DB), read_only=True)
-    yield conn
-    conn.close()
+    # Same opener as the tools, so the open oracle connection never clashes with theirs.
+    with get_db_connection() as conn:
+        yield conn
 
 
 def _official(conn, team, season_type="REG"):
@@ -711,3 +712,34 @@ def test_compare_team_post_empty_with_reason_for_non_playoff_team(real):
     res = tools.nfl_compare("KC", other, compare_type="team", season=2024, season_type="POST")
     assert res["KC"]["offense"]
     assert res[other]["offense"] == [] and res[other].get("reason")
+
+
+# ── stale (not yet rebuilt) team tables: no season_type column ───────────────
+
+@pytest.fixture
+def stale_db(tmp_path, monkeypatch):
+    path = tmp_path / "stale.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE team_offense_stats (team VARCHAR, season_year INTEGER, touchdowns INTEGER)")
+    conn.execute("CREATE TABLE team_defense_stats (team VARCHAR, season_year INTEGER, sacks INTEGER)")
+    conn.execute("CREATE TABLE situational_stats (team VARCHAR, season_year INTEGER, situation VARCHAR)")
+    conn.execute("INSERT INTO team_offense_stats VALUES ('KC', 2024, 50)")
+    conn.execute("INSERT INTO team_defense_stats VALUES ('KC', 2024, 40)")
+    conn.close()
+    monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))
+
+
+def test_stale_tables_default_reg_returns_rows_with_warning(stale_db):
+    res = tools.nfl_team_stats("KC", 2024, side="offense")
+    assert [r["touchdowns"] for r in res["offense"]] == [50]
+    assert "nfl-mcp rebuild" in res["warning"]
+    cmp = tools.nfl_compare("KC", "KC", compare_type="team", season=2024)
+    assert cmp["KC"]["offense"] and "nfl-mcp rebuild" in cmp["KC"]["warning"]
+
+
+def test_stale_tables_explicit_post_returns_error_with_code(stale_db):
+    expected = {"error": "Derived team tables are stale; run `nfl-mcp rebuild`",
+                "code": "STALE_DERIVED_TABLES"}
+    assert tools.nfl_team_stats("KC", 2024, season_type="POST") == expected
+    assert tools.nfl_compare("KC", "BUF", compare_type="team", season=2024,
+                             season_type="POST") == expected

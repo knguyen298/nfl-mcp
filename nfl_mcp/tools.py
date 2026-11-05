@@ -409,13 +409,27 @@ _STALE_TEAM_TABLES = (
 )
 
 
+class _StaleDerivedTables(Exception):
+    """A season_type other than REG was asked of derived tables built before season_type existed."""
+
+
+_STALE_ERROR = {
+    "error": "Derived team tables are stale; run `nfl-mcp rebuild`",
+    "code": "STALE_DERIVED_TABLES",
+}
+
+
 def _team_rows(
     table: str,
     team: str,
     filters: tuple[int | None, int | None, int | None, str | None],
     tail: str = "",
 ) -> tuple[list[dict], bool]:
-    """Rows of one derived team table, and whether the table lacks season_type (not rebuilt yet)."""
+    """Rows of one derived team table, and whether the table lacks season_type (not rebuilt yet).
+
+    On a table without season_type only the default REG falls back to unfiltered rows
+    (flagged by the caller); any other season_type raises _StaleDerivedTables.
+    """
     clause, params = _team_stats_filter(*filters)
     try:
         sql = (f"SELECT * FROM {table} WHERE team = ?{clause} "
@@ -424,6 +438,8 @@ def _team_rows(
     except duckdb.BinderException as e:
         if "season_type" not in str(e):
             raise
+        if (filters[3] or "REG").upper() != "REG":
+            raise _StaleDerivedTables() from e
     clause, params = _team_stats_filter(*filters[:3], "ALL")
     sql = f"SELECT * FROM {table} WHERE team = ?{clause} ORDER BY season_year{tail}"
     return _execute(sql, [team, *params]), True
@@ -459,6 +475,8 @@ def nfl_team_stats(
         if stale:
             results["warning"] = _STALE_TEAM_TABLES
         return results
+    except _StaleDerivedTables:
+        return dict(_STALE_ERROR)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -642,6 +660,8 @@ def nfl_compare(
         else:
             return {"error": "compare_type must be 'team' or 'player'"}
 
+    except _StaleDerivedTables:
+        return dict(_STALE_ERROR)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
