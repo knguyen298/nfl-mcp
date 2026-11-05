@@ -350,8 +350,7 @@ def test_situation_existing_still_work(plays_db, situation):
     assert _pids(_search(situation=situation)) == SITUATIONS_TODAY[situation]
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "unknown situation silently ignored")
-def test_situation_unknown_is_error(plays_db):
+def test_situation_unknown_is_error(plays_db):  # satisfied by group H's argument checks
     assert "error" in _search(situation="garbage_time")
 
 
