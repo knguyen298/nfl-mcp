@@ -154,7 +154,6 @@ class TestDepthChartsRefetch:
     defn = REGISTRY["depth_charts"]
 
     @MODES
-    @pytest.mark.xfail(strict=True, reason=XF + "1 depth_charts 2025+ delete key")
     def test_depth_charts_2025_shape_loaded_twice_keeps_one_copy(self, conn, monkeypatch, mode):
         _fake_nfl(monkeypatch, load_depth_charts=_loader_from({2025: _dc_new(2025, 4)}))
         ing._ingest_generic_dataset(conn, self.defn, [2025], fresh=False)
@@ -169,7 +168,6 @@ class TestDepthChartsRefetch:
         _refetch(conn, monkeypatch, self.defn, 2024, mode)
         assert _count(conn, "SELECT COUNT(*) FROM depth_charts") == 3  # 3 rows, one copy
 
-    @pytest.mark.xfail(strict=True, reason=XF + "1 depth_charts mixed-shape re-fetch")
     def test_depth_charts_mixed_db_refetch_2025_keeps_2024(self, conn, monkeypatch):
         _fake_nfl(monkeypatch, load_depth_charts=_loader_from(
             {2024: _dc_2024(3), 2025: _dc_new(2025, 4)}))
@@ -188,7 +186,6 @@ class TestDepthChartsRefetch:
         assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE gsis_id LIKE '24-%'") == 3
         assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE gsis_id LIKE '25-%'") == 4
 
-    @pytest.mark.xfail(strict=True, reason=XF + "1 depth_charts 2025 vs 2026 dt windows")
     def test_depth_charts_refetch_2026_keeps_2025_dt_rows(self, conn, monkeypatch):
         _fake_nfl(monkeypatch, load_depth_charts=_loader_from(
             {2025: _dc_new(2025, 4), 2026: _dc_new(2026, 2)}))
@@ -199,6 +196,166 @@ class TestDepthChartsRefetch:
         assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE gsis_id LIKE '26-%'") == 2
 
 
+class TestDepthChartsLegacyRestamp:
+    """Rows loaded before season stamping have season NULL and a dt that does not split by
+    date: the real 2025 file runs through 2026-03-14, the 2026 file starts 2026-03-22."""
+    defn = REGISTRY["depth_charts"]
+
+    @staticmethod
+    def _frames():
+        f25 = _dc_new(2025, 4).with_columns(pl.Series("dt", [
+            "2025-08-03T10:09:07Z", "2026-01-15T07:00:00Z",
+            "2026-03-14T07:32:09Z", "2026-03-14T07:32:09Z"]))
+        f26 = _dc_new(2026, 2).with_columns(pl.Series("dt", [
+            "2026-03-22T07:32:09Z", "2026-10-31T13:34:51Z"]))
+        return {2024: _dc_2024(3), 2025: f25, 2026: f26}
+
+    def _legacy_db(self, conn, frames):
+        """What the old loader left: 2024 with a season, 2025 and 2026 with season NULL."""
+        ing._write_df_to_table(conn, "depth_charts", frames[2024])
+        ing._record_loaded(conn, "depth_charts", "depth_charts", "load_depth_charts", 3, season=2024)
+        for season in (2025, 2026):
+            ing._write_df_to_table(conn, "depth_charts", frames[season])
+            ing._record_loaded(conn, "depth_charts", "depth_charts", "load_depth_charts",
+                               len(frames[season]), season=season)
+
+    def _run(self, conn, monkeypatch, frames, seasons):
+        _fake_nfl(monkeypatch, load_depth_charts=_loader_from(frames))
+        monkeypatch.setattr(ing, "current_season", lambda: 2026)
+        return ing._ingest_generic_dataset(conn, self.defn, seasons, fresh=False)
+
+    def _run_fresh(self, conn, monkeypatch, frames, seasons):
+        _fake_nfl(monkeypatch, load_depth_charts=_loader_from(frames))
+        monkeypatch.setattr(ing, "current_season", lambda: 2026)
+        return ing._ingest_generic_dataset(conn, self.defn, seasons, fresh=True)
+
+    def _by_season(self, conn):
+        return dict(conn.execute(
+            "SELECT season, COUNT(*) FROM depth_charts GROUP BY season").fetchall())
+
+    def test_current_season_run_restamps_both_new_shape_seasons(self, conn, monkeypatch):
+        frames = self._frames()
+        self._legacy_db(conn, frames)
+        self._run(conn, monkeypatch, frames, [2026])     # asks for 2026 only
+        assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL") == 0
+        assert self._by_season(conn) == {2024: 3, 2025: 4, 2026: 2}   # 9 = 3 + 4 + 2
+        # the 2025-file row dated 2026-03-14 is season 2025, whatever its date says
+        assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE gsis_id LIKE '25-%' "
+                            "AND season = 2025") == 4
+        assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE gsis_id LIKE '26-%' "
+                            "AND season = 2026") == 2
+        assert _meta(conn, "depth_charts", 2025) == [4]
+        assert _meta(conn, "depth_charts", 2026) == [2]
+
+    def test_second_run_changes_nothing(self, conn, monkeypatch):
+        frames = self._frames()
+        self._legacy_db(conn, frames)
+        self._run(conn, monkeypatch, frames, [2026])
+        fetched = []
+        loader = _loader_from(frames)
+
+        def spy(seasons, **kwargs):
+            fetched.append(seasons[0])
+            return loader(seasons, **kwargs)
+        _fake_nfl(monkeypatch, load_depth_charts=spy)
+        ing._ingest_generic_dataset(conn, self.defn, [2026], fresh=False)
+        assert fetched == [2026]                       # only the current season, no 2025
+        assert self._by_season(conn) == {2024: 3, 2025: 4, 2026: 2}
+
+    def test_failed_restamp_fetch_keeps_legacy_rows_and_metadata(self, conn, monkeypatch):
+        frames = self._frames()
+        self._legacy_db(conn, frames)
+        ing._FAILURES.clear()
+
+        def fail():
+            raise ConnectionError("simulated outage")
+        # 2025 and 2026 are both legacy seasons; the 2025 fetch fails, so nothing is deleted
+        self._run(conn, monkeypatch, {**frames, 2025: fail}, [2024])
+        assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL") == 6  # 4 + 2
+        assert self._by_season(conn) == {2024: 3, None: 6}
+        assert _meta(conn, "depth_charts", 2025) == [4]
+        assert _meta(conn, "depth_charts", 2026) == [2]
+        assert any(f.startswith("depth_charts 2025") for f in ing._FAILURES), ing._FAILURES
+
+    def test_failed_restamp_writes_nothing_for_a_requested_legacy_season(self, conn, monkeypatch):
+        frames = self._frames()
+        self._legacy_db(conn, frames)
+        ing._FAILURES.clear()
+
+        def fail():
+            raise ConnectionError("simulated outage")
+        self._run(conn, monkeypatch, {**frames, 2025: fail}, [2026])   # 2026 is current
+        assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE season = 2026") == 0
+        assert self._by_season(conn) == {2024: 3, None: 6}
+        assert _meta(conn, "depth_charts", 2026) == [2]
+        assert any(f.startswith("depth_charts 2025") for f in ing._FAILURES), ing._FAILURES
+
+    def test_legacy_rows_without_metadata_are_kept_and_reported(self, conn, monkeypatch):
+        frames = self._frames()
+        ing._write_df_to_table(conn, "depth_charts", frames[2024])
+        ing._record_loaded(conn, "depth_charts", "depth_charts", "load_depth_charts", 3, season=2024)
+        ing._write_df_to_table(conn, "depth_charts", frames[2025])   # NULL season, no metadata
+        ing._FAILURES.clear()
+        fetched = []
+        loader = _loader_from(frames)
+        _fake_nfl(monkeypatch, load_depth_charts=lambda s, **k: fetched.append(s[0]) or loader(s, **k))
+        monkeypatch.setattr(ing, "current_season", lambda: 2026)
+        ing._ingest_generic_dataset(conn, self.defn, [2024], fresh=False)
+        assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL") == 4
+        assert fetched == []
+        assert len(ing._FAILURES) == 1 and "--fresh" in ing._FAILURES[0], ing._FAILURES
+
+    def test_fresh_restamps_requested_seasons_when_metadata_is_missing(self, conn, monkeypatch):
+        frames = self._frames()
+        ing._write_df_to_table(conn, "depth_charts", frames[2024])
+        ing._record_loaded(conn, "depth_charts", "depth_charts", "load_depth_charts", 3, season=2024)
+        ing._write_df_to_table(conn, "depth_charts", frames[2025])   # NULL season, no metadata
+        ing._write_df_to_table(conn, "depth_charts", frames[2026])
+        ing._FAILURES.clear()
+        self._run_fresh(conn, monkeypatch, frames, [2025, 2026])
+        assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL") == 0
+        assert self._by_season(conn) == {2024: 3, 2025: 4, 2026: 2}
+        assert ing._FAILURES == []
+
+    def test_successful_restamp_fetches_everything_before_deleting(self, conn, monkeypatch):
+        frames = self._frames()
+        self._legacy_db(conn, frames)
+        legacy_seen = []
+        loader = _loader_from(frames)
+
+        def spy(seasons, **kwargs):
+            legacy_seen.append(_count(conn, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL"))
+            return loader(seasons, **kwargs)
+        _fake_nfl(monkeypatch, load_depth_charts=spy)
+        monkeypatch.setattr(ing, "current_season", lambda: 2026)
+        ing._FAILURES.clear()
+        assert ing._ingest_generic_dataset(conn, self.defn, [2026], fresh=False) == 6  # 4 + 2
+        assert legacy_seen == [6, 6]        # both fetches saw the untouched legacy rows
+        assert ing._FAILURES == []
+        assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL") == 0
+        assert self._by_season(conn) == {2024: 3, 2025: 4, 2026: 2}
+        assert _meta(conn, "depth_charts", 2025) == [4]
+        assert _meta(conn, "depth_charts", 2026) == [2]
+
+    def test_clean_db_is_not_refetched(self, conn, monkeypatch):
+        frames = self._frames()
+        self._run(conn, monkeypatch, frames, [2024, 2025, 2026])
+        fetched = []
+        loader = _loader_from(frames)
+        _fake_nfl(monkeypatch, load_depth_charts=lambda s, **k: fetched.append(s[0]) or loader(s, **k))
+        ing._ingest_generic_dataset(conn, self.defn, [2024, 2025], fresh=False)
+        assert fetched == []
+
+    def test_table_without_season_column_is_restamped(self, conn, monkeypatch):
+        frames = self._frames()
+        raw = frames[2025].select(["dt", "team", "player_name", "gsis_id"])
+        conn.register("raw25", raw.to_arrow())
+        conn.execute("CREATE TABLE depth_charts AS SELECT * FROM raw25")
+        ing._record_loaded(conn, "depth_charts", "depth_charts", "load_depth_charts", 4, season=2025)
+        self._run(conn, monkeypatch, frames, [2026])
+        assert self._by_season(conn) == {2025: 4, 2026: 2}
+
+
 # ── 2. participation re-fetch does not duplicate ───────────────────────────────
 
 class TestParticipationRefetch:
@@ -207,14 +364,12 @@ class TestParticipationRefetch:
     p24 = staticmethod(lambda: _part(2024, [("01_TEN_CHI", 2)]))                    # 2 rows
 
     @MODES
-    @pytest.mark.xfail(strict=True, reason=XF + "2 participation game-id prefix delete")
     def test_participation_2025_loaded_twice_keeps_one_copy(self, conn, monkeypatch, mode):
         _fake_nfl(monkeypatch, load_participation=_loader_from({2025: self.p25}))
         ing._ingest_generic_dataset(conn, self.defn, [2025], fresh=False)
         _refetch(conn, monkeypatch, self.defn, 2025, mode)
         assert _count(conn, "SELECT COUNT(*) FROM participation") == 3  # today: 6
 
-    @pytest.mark.xfail(strict=True, reason=XF + "2 participation game-id prefix delete")
     def test_participation_refetch_2025_with_2024_present_counts_exact(self, conn, monkeypatch):
         _fake_nfl(monkeypatch, load_participation=_loader_from({2024: self.p24, 2025: self.p25}))
         ing._ingest_generic_dataset(conn, self.defn, [2024, 2025], fresh=False)
@@ -250,7 +405,6 @@ def _missing_key_case(name):
 
 
 class TestDeleteFailureIsLoud:
-    @pytest.mark.xfail(strict=True, reason=XF + "3 bare except around DELETE")
     def test_generic_loader_source_has_no_bare_except_around_delete(self):
         src = inspect.getsource(ing._ingest_generic_dataset)
         swallowed = [m for m in re.finditer(r"except Exception:\s*\n\s*pass", src)
@@ -258,7 +412,6 @@ class TestDeleteFailureIsLoud:
         assert swallowed == [], "DELETE is still wrapped in `except Exception: pass`"
 
     @pytest.mark.parametrize("case", ["generic_season", "participation"])
-    @pytest.mark.xfail(strict=True, reason=XF + "3 explicit delete-key check")
     def test_missing_delete_key_column_is_not_a_silent_append(self, conn, monkeypatch, case):
         defn, ddl, df = _missing_key_case(case)
         for sql in ddl:
@@ -327,7 +480,6 @@ class TestSeasonTransaction:
     defn = REGISTRY["schedules"]
 
     @pytest.mark.parametrize("fail_in", ["_write_df_to_table", "_record_loaded"])
-    @pytest.mark.xfail(strict=True, reason=XF + "4 DELETE+INSERT+metadata in one transaction")
     def test_failure_after_delete_leaves_old_season(self, conn, monkeypatch, fail_in):
         _fake_nfl(monkeypatch, load_schedules=_loader_from({2024: _sched(2024, 3)}))
         ing._ingest_generic_dataset(conn, self.defn, [2024], fresh=False)   # 3 rows, meta 3
@@ -347,7 +499,6 @@ class TestSeasonTransaction:
         assert _count(conn, "SELECT COUNT(*) FROM schedules WHERE season = 2024") == 3
         assert _meta(conn, "schedules", 2024) == [3]
 
-    @pytest.mark.xfail(strict=True, reason=XF + "4 pbp DELETE+INSERT in one transaction")
     def test_pbp_insert_failure_keeps_previous_plays(self, conn, monkeypatch):
         _fake_nfl(monkeypatch, load_pbp=lambda seasons: _pbp(2024, 3))
         ing._create_plays_table(conn, _pbp(2024, 3))
@@ -396,7 +547,6 @@ class TestExitStatus:
         ("schedules", "rosters", "rosters"),
         ("rosters", "schedules", "schedules"),
     ])
-    @pytest.mark.xfail(strict=True, reason=XF + "5 non-zero exit on loader failure")
     def test_failed_fetch_continues_then_exits_nonzero(self, monkeypatch, tmp_path,
                                                        failing, ok, ok_table):
         good = {"schedules": lambda s, **k: _sched(s[0], 2), "rosters": lambda s, **k: _roster(s[0], 2)}
@@ -408,7 +558,6 @@ class TestExitStatus:
         assert result.exit_code != 0, result.output
         assert failing in result.output
 
-    @pytest.mark.xfail(strict=True, reason=XF + "5 non-zero exit on pbp season failure")
     def test_failed_pbp_season_exits_nonzero(self, monkeypatch, tmp_path):
         # schema discovery (2025) works, the 2024 season fetch fails -> soft failure today
         def load_pbp(seasons):
@@ -431,6 +580,24 @@ class TestExitStatus:
         assert _db_count(db, "SELECT COUNT(*) FROM rosters") == 3
 
 
+class TestAllowFailures:
+    ARGS = ["--dataset", "schedules", "--dataset", "rosters", "--start", "2024", "--end", "2024"]
+
+    def test_flag_lists_failure_but_exits_zero(self, monkeypatch, tmp_path):
+        _fake_nfl(monkeypatch, load_schedules=_boom, load_rosters=lambda s, **k: _roster(s[0], 2))
+        result, db = _run_cli(monkeypatch, tmp_path, [*self.ARGS, "--allow-failures"])
+        assert result.exit_code == 0, result.output
+        assert "schedules 2024" in result.output and "--allow-failures" in result.output
+        assert _db_count(db, "SELECT COUNT(*) FROM rosters") == 2
+
+    def test_flag_on_clean_run_exits_zero_without_failure_text(self, monkeypatch, tmp_path):
+        _fake_nfl(monkeypatch, load_schedules=lambda s, **k: _sched(s[0], 2),
+                  load_rosters=lambda s, **k: _roster(s[0], 2))
+        result, _ = _run_cli(monkeypatch, tmp_path, [*self.ARGS, "--allow-failures"])
+        assert result.exit_code == 0, result.output
+        assert "Ingest failed" not in result.output
+
+
 # ── 6. --fresh scope ───────────────────────────────────────────────────────────
 
 class TestFreshScope:
@@ -443,7 +610,6 @@ class TestFreshScope:
         return sizes, db
 
     @pytest.mark.parametrize("target, other, other_n", [(2025, 2024, 3), (2024, 2025, 2)])
-    @pytest.mark.xfail(strict=True, reason=XF + "6 --fresh drops only requested seasons")
     def test_fresh_one_season_keeps_other_season_plays(self, monkeypatch, tmp_path,
                                                        target, other, other_n):
         sizes, db = self._seed(monkeypatch, tmp_path)
@@ -454,7 +620,6 @@ class TestFreshScope:
         assert _db_count(db, f"SELECT COUNT(*) FROM plays WHERE season = {other}") == other_n
         assert _db_count(db, f"SELECT COUNT(*) FROM plays WHERE season = {target}") == 4
 
-    @pytest.mark.xfail(strict=True, reason=XF + "6 --fresh leaves metadata consistent")
     def test_fresh_one_season_metadata_matches_plays(self, monkeypatch, tmp_path):
         sizes, db = self._seed(monkeypatch, tmp_path)
         sizes[2025] = 4

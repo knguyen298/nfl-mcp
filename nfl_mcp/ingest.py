@@ -7,6 +7,7 @@ PBP ingestion preserves its existing enhanced_description logic.
 Called by: nfl-mcp init / nfl-mcp ingest
 """
 
+import contextlib
 import datetime
 import os
 import duckdb
@@ -57,6 +58,32 @@ def _clip_to_window(season_list, dataset_def):
         if (dataset_def.min_season is None or s >= dataset_def.min_season)
         and (dataset_def.max_season is None or s <= dataset_def.max_season)
     ]
+
+
+# Soft failures of the current run (a fetch that raised, a season write that rolled back).
+# The loaders keep going and return 0 rows; run_ingest_datasets reports this list and the
+# CLI turns it into a non-zero exit.
+_FAILURES: list[str] = []
+
+
+def _note_failure(dataset_id: str, season: int | None, err: Exception) -> None:
+    label = dataset_id if season is None else f"{dataset_id} {season}"
+    _FAILURES.append(f"{label}: {err}")
+
+
+@contextlib.contextmanager
+def _transaction(conn: duckdb.DuckDBPyConnection):
+    """BEGIN ... COMMIT, or ROLLBACK and re-raise, so a season is replaced all or nothing."""
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        yield
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception as rollback_err:  # noqa: BLE001 - keep the original error
+            print(f"    Rollback failed: {rollback_err}")
+        raise
+    conn.execute("COMMIT")
 
 
 def _safe_col(name: str) -> str:
@@ -276,12 +303,14 @@ def _create_plays_table(conn: duckdb.DuckDBPyConnection, sample_df: pl.DataFrame
 
 
 def _ingest_pbp_season(conn: duckdb.DuckDBPyConnection, season: int) -> int:
+    """Replace one season of plays; DELETE, INSERT and the metadata row commit together."""
     import nflreadpy
     print(f"\n  {season}")
     try:
         df = nflreadpy.load_pbp([season])
     except Exception as e:
         print(f"    Failed to load: {e}")
+        _note_failure("pbp", season, e)
         return 0
 
     print(f"    {len(df):,} plays, {len(df.columns)} columns")
@@ -303,13 +332,24 @@ def _ingest_pbp_season(conn: duckdb.DuckDBPyConnection, season: int) -> int:
     ]
     df = df.with_columns(pl.Series("enhanced_description", descriptions))
 
-    _reconcile_schema(conn, "plays", df)
     # Replace, not append: the fetch above succeeded, so it is safe to drop the stale
-    # copy of this season (a partial in-progress season, or a --fresh re-run).
-    conn.execute("DELETE FROM plays WHERE season = ?", [season])
-    conn.register("_ingest_df", df.to_arrow())
-    conn.execute("INSERT INTO plays BY NAME SELECT * FROM _ingest_df")
-    conn.unregister("_ingest_df")
+    # copy of this season (a partial in-progress season, or a --fresh re-run). If the
+    # INSERT fails the transaction rolls back and the old season stays.
+    try:
+        with _transaction(conn):
+            _reconcile_schema(conn, "plays", df)
+            conn.execute("DELETE FROM plays WHERE season = ?", [season])
+            conn.register("_ingest_df", df.to_arrow())
+            conn.execute("INSERT INTO plays BY NAME SELECT * FROM _ingest_df")
+            if total:
+                _record_loaded(conn, "pbp", "plays", "load_pbp", total, season)
+    except Exception as e:  # noqa: BLE001 - soft failure, reported at the end of the run
+        print(f"    Failed to write, kept the previous rows: {e}")
+        _note_failure("pbp", season, e)
+        return 0
+    finally:
+        with contextlib.suppress(Exception):
+            conn.unregister("_ingest_df")
     print(f"    {total:,} rows inserted")
     return total
 
@@ -326,16 +366,116 @@ def _write_df_to_table(
     if replace:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
 
+    conn.register("_load_df", df.to_arrow())
     try:
-        conn.execute(f"SELECT 1 FROM {table} LIMIT 0")
-        _reconcile_schema(conn, table, df)
-        conn.register("_load_df", df.to_arrow())
-        conn.execute(f"INSERT INTO {table} BY NAME SELECT * FROM _load_df")
-        conn.unregister("_load_df")
-    except duckdb.CatalogException:
-        conn.register("_load_df", df.to_arrow())
-        conn.execute(f"CREATE TABLE {table} AS SELECT * FROM _load_df")
-        conn.unregister("_load_df")
+        if _table_exists(conn, table):
+            _reconcile_schema(conn, table, df)
+            conn.execute(f"INSERT INTO {table} BY NAME SELECT * FROM _load_df")
+        else:
+            conn.execute(f"CREATE TABLE {table} AS SELECT * FROM _load_df")
+    finally:
+        with contextlib.suppress(Exception):
+            conn.unregister("_load_df")
+
+
+def _table_columns(conn: duckdb.DuckDBPyConnection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+
+
+def _stamp_season(df: pl.DataFrame, season: int) -> pl.DataFrame:
+    """Add a season column to a frame that has none (the file is the season we asked for)."""
+    if "season" in df.columns:
+        return df
+    return df.with_columns(pl.lit(season, dtype=pl.Int64).alias("season"))
+
+
+def _legacy_restamp_plan(conn: duckdb.DuckDBPyConnection, dataset_def) -> tuple[bool, list[int]]:
+    """Find rows loaded before season stamping. Returns (has_legacy_rows, seasons to re-fetch).
+
+    Old loads left season NULL (depth_charts 2025+ files have none) and nothing in those
+    rows says which season they belong to: dt does not split cleanly (the real 2025 file
+    runs through 2026-03-14, the 2026 file starts 2026-03-22). The seasons are the ones in
+    metadata that have no stamped rows. Adds the season column if the table has none;
+    deletes nothing (see _restamp_legacy_seasons).
+    """
+    table = dataset_def.table_name
+    if not _table_exists(conn, table):
+        return False, []
+    if "season" not in _table_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN season BIGINT")
+    if not conn.execute(f"SELECT COUNT(*) FROM {table} WHERE season IS NULL").fetchone()[0]:
+        return False, []
+    seasons = sorted(r[0] for r in conn.execute(
+        "SELECT DISTINCT season FROM _ingest_metadata WHERE dataset_id = ? "
+        f"AND season IS NOT NULL AND season NOT IN "
+        f"(SELECT DISTINCT season FROM {table} WHERE season IS NOT NULL)",
+        [dataset_def.dataset_id],
+    ).fetchall())
+    return True, seasons
+
+
+def _restamp_legacy_seasons(conn, dataset_def, loader, seasons: list[int]) -> dict[int, int]:
+    """Re-fetch every legacy season, then swap them in. Returns {season: rows}, {} if skipped.
+
+    Every fetch happens before anything is deleted. If one fails (or comes back empty) the
+    legacy rows and their metadata stay as they are and the failure is recorded. If all
+    succeed, one transaction drops the NULL-season rows and writes each season stamped.
+    A second run finds no NULL rows and does nothing.
+    """
+    print(f"    INFO: {dataset_def.dataset_id}: re-fetching seasons {seasons} to stamp a season "
+          f"on rows loaded before season stamping")
+    frames: dict[int, pl.DataFrame] = {}
+    for season in seasons:
+        try:
+            df = loader([season], **dataset_def.extra_params)
+            if df is None or len(df) == 0:
+                raise ValueError("no data returned")
+        except Exception as e:  # noqa: BLE001 - soft failure, reported at the end of the run
+            print(f"    Failed to re-fetch {dataset_def.dataset_id} {season}: {e}; "
+                  f"keeping the existing rows, restamp skipped")
+            _note_failure(dataset_def.dataset_id, season, e)
+            return {}
+        frames[season] = _stamp_season(_safe_rename(df), season)
+    try:
+        with _transaction(conn):
+            for df in frames.values():      # new columns first: DuckDB cannot ALTER after a DELETE
+                _reconcile_schema(conn, dataset_def.table_name, df)
+            conn.execute(f"DELETE FROM {dataset_def.table_name} WHERE season IS NULL")
+            for season, df in frames.items():
+                conn.execute(
+                    "DELETE FROM _ingest_metadata WHERE dataset_id = ? AND season = ?",
+                    [dataset_def.dataset_id, season],
+                )
+                _replace_season(conn, dataset_def, df, season)
+    except Exception as e:  # noqa: BLE001 - soft failure, reported at the end of the run
+        print(f"    Failed to restamp {dataset_def.dataset_id}, kept the previous rows: {e}")
+        _note_failure(dataset_def.dataset_id, None, e)
+        return {}
+    for season, df in frames.items():
+        print(f"    {dataset_def.dataset_id} {season}: {len(df):,} rows restamped")
+    return {season: len(df) for season, df in frames.items()}
+
+
+def _replace_season(conn, dataset_def, df: pl.DataFrame, season: int) -> None:
+    """DELETE the season's old rows, INSERT the new ones, upsert metadata (caller's transaction).
+
+    The old rows are found by the dataset's delete key, never by a swallowed error: if the
+    existing table has no such column the season cannot be replaced safely, so this raises.
+    """
+    table = dataset_def.table_name
+    key = dataset_def.delete_key
+    if _table_exists(conn, table):
+        if key not in _table_columns(conn, table):
+            raise ValueError(
+                f"table {table} has no '{key}' column, cannot replace season {season}"
+            )
+        _reconcile_schema(conn, table, df)          # before the DELETE, see _restamp_legacy_seasons
+        if dataset_def.delete_match == "id_prefix":
+            conn.execute(f'DELETE FROM {table} WHERE starts_with("{key}", ?)', [f"{season}_"])
+        else:
+            conn.execute(f'DELETE FROM {table} WHERE "{key}" = ?', [season])
+    _write_df_to_table(conn, table, df)
+    _record_loaded(conn, dataset_def.dataset_id, table, dataset_def.loader_fn, len(df), season)
 
 
 def _ingest_generic_dataset(
@@ -344,7 +484,14 @@ def _ingest_generic_dataset(
     seasons: list[int] | None,          # None = load all via seasons=True
     fresh: bool = False,
 ) -> int:
-    """Load a single dataset (non-pbp) into DuckDB. Returns total rows inserted."""
+    """Load a single dataset (non-pbp) into DuckDB. Returns total rows inserted.
+
+    A season is replaced by the dataset's delete key (registry delete_key/delete_match).
+    depth_charts keys by a season column the loader stamps on files that lack one
+    (2025+), not by a dt range. Rows from before stamping (NULL season) are dropped and
+    their seasons re-fetched in the same run, fetch first (_restamp_legacy_seasons).
+    Each season's DELETE, INSERT and metadata upsert run in one transaction.
+    """
     import nflreadpy
 
     loader = getattr(nflreadpy, dataset_def.loader_fn)
@@ -364,6 +511,7 @@ def _ingest_generic_dataset(
             df = loader(**dataset_def.extra_params)
         except Exception as e:
             print(f"    Failed to load: {e}")
+            _note_failure(dataset_def.dataset_id, None, e)
             return 0
 
         if df is None or len(df) == 0:
@@ -372,13 +520,44 @@ def _ingest_generic_dataset(
 
         df = _safe_rename(df)
         print(f"    {len(df):,} rows, {len(df.columns)} columns")
-        _write_df_to_table(conn, table, df, replace=True)
-        _record_loaded(conn, dataset_def.dataset_id, table, dataset_def.loader_fn, len(df))
+        try:
+            with _transaction(conn):
+                _write_df_to_table(conn, table, df, replace=True)
+                _record_loaded(conn, dataset_def.dataset_id, table, dataset_def.loader_fn, len(df))
+        except Exception as e:  # noqa: BLE001 - soft failure, reported at the end of the run
+            print(f"    Failed to write, kept the previous table: {e}")
+            _note_failure(dataset_def.dataset_id, None, e)
+            return 0
         total_rows = len(df)
 
     else:
         # Seasonal dataset — iterate per season (bulk mode uses ALL_SEASONS)
         season_list = _clip_to_window(ALL_SEASONS if bulk_mode else seasons, dataset_def)
+        if dataset_def.stamp_season:
+            try:
+                has_legacy, legacy_seasons = _legacy_restamp_plan(conn, dataset_def)
+            except Exception as e:  # noqa: BLE001 - soft failure, reported at the end of the run
+                print(f"    Failed to prepare {table}: {e}")
+                _note_failure(dataset_def.dataset_id, None, e)
+                return 0
+            if has_legacy and not legacy_seasons and fresh and season_list:
+                # --fresh re-fetches what was asked for, so those seasons can replace the rows.
+                legacy_seasons = list(season_list)
+            if has_legacy and not legacy_seasons:
+                # Nothing says which seasons these rows belong to, so nothing can be
+                # re-fetched to replace them; deleting them would only lose data.
+                n_null = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE season IS NULL").fetchone()[0]
+                print(f"    WARNING: {table} has {n_null:,} rows with no season and no metadata "
+                      f"saying which seasons to re-fetch; leaving them in place")
+                _note_failure(dataset_def.dataset_id, None, RuntimeError(
+                    f"{n_null} rows in {table} have no season and cannot be restamped; "
+                    f"run: nfl-mcp ingest --dataset {dataset_def.dataset_id} --fresh"))
+            elif has_legacy:
+                restamped = _restamp_legacy_seasons(conn, dataset_def, loader, legacy_seasons)
+                total_rows += sum(restamped.values())
+                # Restamp is all or nothing. If it did not complete, write nothing for
+                # these seasons now: a stamped copy would sit next to the NULL-season rows.
+                season_list = [s for s in season_list if s not in legacy_seasons]
         for season in season_list:
             already = _is_loaded(conn, dataset_def.dataset_id, season)
             if already and not fresh and season not in _refresh_seasons():
@@ -392,6 +571,7 @@ def _ingest_generic_dataset(
                 df = loader([season], **dataset_def.extra_params)
             except Exception as e:
                 print(f"    Failed to load: {e}")
+                _note_failure(dataset_def.dataset_id, season, e)
                 continue
 
             if df is None or len(df) == 0:
@@ -399,17 +579,19 @@ def _ingest_generic_dataset(
                 continue
 
             df = _safe_rename(df)
+            if dataset_def.stamp_season:
+                df = _stamp_season(df, season)
             print(f"    {len(df):,} rows, {len(df.columns)} columns")
 
-            # Replace, not append: the fetch succeeded, so drop any stale rows for this
-            # season (no-op on first load; table may not exist yet).
+            # Replace, not append: the fetch succeeded, so drop this season's stale rows
+            # (no-op on first load) and write the new ones, all or nothing.
             try:
-                conn.execute(f"DELETE FROM {table} WHERE season = {season}")
-            except Exception:
-                pass
-
-            _write_df_to_table(conn, table, df)
-            _record_loaded(conn, dataset_def.dataset_id, table, dataset_def.loader_fn, len(df), season)
+                with _transaction(conn):
+                    _replace_season(conn, dataset_def, df, season)
+            except Exception as e:  # noqa: BLE001 - soft failure, reported at the end of the run
+                print(f"    Failed to write, kept the previous rows: {e}")
+                _note_failure(dataset_def.dataset_id, season, e)
+                continue
             total_rows += len(df)
             print(f"    {len(df):,} rows inserted")
 
@@ -1188,12 +1370,16 @@ def run_ingest_datasets(
     fresh: bool = False,
     skip_views: bool = False,
     db_path: str | None = None,
-) -> None:
+) -> list[str]:
     """
     Ingest one or more datasets into DuckDB.
 
     dataset_ids: list of keys from REGISTRY (e.g. ["pbp", "schedules"])
     start/end:   season range; if both are None, loads all available seasons.
+    fresh:       re-fetch the requested seasons; rows of other seasons are kept.
+
+    A failed fetch or season write does not stop the other datasets. Returns the failures
+    ("<dataset> <season>: <error>"), empty on a clean run; the CLI exits non-zero on any.
     """
     import nflreadpy
     from .config import get_duckdb_path
@@ -1206,6 +1392,7 @@ def run_ingest_datasets(
         if start > end:
             raise ValueError("start must be less than or equal to end")
 
+    _FAILURES.clear()
     path = db_path or str(get_duckdb_path())
     # Build the widest range the caller asked for; each dataset is then clipped to its
     # own min_season/max_season, so asking for 1966 does not make load_pbp try 1966.
@@ -1252,7 +1439,9 @@ def run_ingest_datasets(
             raise RuntimeError("Could not load play-by-play for any requested season")
         print(f"  {len(sample_df.columns)} columns · {len(sample_df):,} rows")
 
-        _create_plays_table(conn, sample_df, fresh=fresh)
+        # --fresh re-fetches the requested seasons below (each replaces its own rows); it
+        # must not drop the table, which would delete seasons outside --start/--end.
+        _create_plays_table(conn, sample_df)
 
         loaded_pbp = {
             row[0] for row in conn.execute(
@@ -1274,10 +1463,7 @@ def run_ingest_datasets(
         else:
             print(f"  Will ingest: {to_ingest}")
             for season in to_ingest:
-                rows = _ingest_pbp_season(conn, season)
-                pbp_ingested += rows
-                if rows:
-                    _record_loaded(conn, "pbp", "plays", "load_pbp", rows, season)
+                pbp_ingested += _ingest_pbp_season(conn, season)
 
         _create_indexes(conn)
 
@@ -1296,7 +1482,11 @@ def run_ingest_datasets(
             if defn.source == "espn":
                 _ingest_espn_records(conn, seasons, fresh=fresh)
             else:
-                _ingest_generic_dataset(conn, defn, seasons, fresh=fresh)
+                try:
+                    _ingest_generic_dataset(conn, defn, seasons, fresh=fresh)
+                except Exception as e:  # noqa: BLE001 - soft failure, reported at the end of the run
+                    print(f"    Failed: {e}")
+                    _note_failure(dataset_id, None, e)
 
     # ── Fantasy derived tables (built from already-ingested sources) ────────
     if not skip_views:
@@ -1304,14 +1494,21 @@ def run_ingest_datasets(
         _create_team_records(conn)
 
     conn.close()
+    failures = list(_FAILURES)
     print("\n" + "=" * 60)
-    print("Ingestion complete!")
+    if failures:
+        print(f"Ingestion finished with {len(failures)} failure(s):")
+        for failure in failures:
+            print(f"  FAILED {failure}")
+    else:
+        print("Ingestion complete!")
     if has_pbp and pbp_ingested:
         print(f"  PBP plays ingested this run: {pbp_ingested:,}")
     season_label = "all available" if bulk_mode else f"{seasons[0]}–{seasons[-1]}"
     print(f"  Seasons: {season_label}")
     print(f"  DB: {path}")
     print("=" * 60)
+    return failures
 
 
 def run_ingest(
@@ -1320,9 +1517,9 @@ def run_ingest(
     fresh: bool = False,
     skip_views: bool = False,
     db_path: str | None = None,
-) -> None:
-    """Backward-compatible entry point — ingests PBP only."""
-    run_ingest_datasets(
+) -> list[str]:
+    """Backward-compatible entry point — ingests PBP only. Returns the failures."""
+    return run_ingest_datasets(
         dataset_ids=["pbp"],
         start=start,
         end=end,

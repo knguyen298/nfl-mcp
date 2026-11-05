@@ -95,7 +95,11 @@ def serve(host, port):
               help="Print all available dataset names and exit.")
 @click.option("--pre1999", is_flag=True,
               help="Also pull pre-1999 season win-loss records from ESPN (opt-in external source).")
-def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999):
+@click.option("--allow-failures", is_flag=True,
+              help="Exit 0 even if a dataset or season failed to load (the failures are still "
+                   "listed). For image builds and first-start loads that should not stop on "
+                   "one flaky fetch.")
+def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, allow_failures):
     """Download NFL data via nflreadpy and load into DuckDB.
 
     Examples:
@@ -148,13 +152,18 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999):
         dataset_ids.append("espn_records")
 
     from .ingest import run_ingest_datasets
-    run_ingest_datasets(
+    failures = run_ingest_datasets(
         dataset_ids=dataset_ids,
         start=start,
         end=end,
         fresh=fresh,
         skip_views=skip_views,
     )
+    if failures:
+        message = "Ingest failed for: " + "; ".join(failures)
+        if not allow_failures:
+            raise click.ClickException(message)
+        click.echo(f"{message} (ignored: --allow-failures)")
 
 
 # ── rebuild ────────────────────────────────────────────────────────────────────
@@ -235,13 +244,16 @@ def init(start, end, skip_ingest):
         click.echo()
         from .ingest import run_ingest_datasets
         from .registry import DEFAULT_DATASETS
-        run_ingest_datasets(
+        failures = run_ingest_datasets(
             dataset_ids=DEFAULT_DATASETS,
             start=start,
             end=end,
             fresh=False,
             skip_views=False,
         )
+        if failures:
+            click.secho("  Warning: some data failed to load: " + "; ".join(failures)
+                        + ". Run 'nfl-mcp ingest' again to retry.", fg="yellow")
 
     # ── 4. Set up IDE client ───────────────────────────────────────────────
     click.echo()
