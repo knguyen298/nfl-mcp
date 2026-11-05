@@ -383,6 +383,8 @@ class TestNflSnapCounts:
                 assert field in row
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("require_db")
 class TestNflFantasyOpportunity:
     def test_no_filters_returns_results(self):
         result = nfl_fantasy_opportunity(season=2024)
@@ -411,6 +413,8 @@ class TestNflFantasyOpportunity:
         assert "boom" in result["error"]
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("require_db")
 class TestNflFantasyRankings:
     def test_draft_scope_returns_results(self):
         result = nfl_fantasy_rankings(scope="draft")

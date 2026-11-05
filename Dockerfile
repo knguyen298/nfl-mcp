@@ -51,9 +51,12 @@ ENV NFL_MCP_DB_PATH=/data/nflread.duckdb
 # that fails to fetch is simply absent from the seed (the ingest prints "Ingest failed for:"
 # naming it) and the build still passes. The row check below still fails an empty seed.
 #
-# The container runs as the non-root user nflmcp (created here, before the bake). It owns /data
-# and /var/log/nflmcp so update_db.sh can copy, chmod and swap slots, and entrypoint.sh can seed
-# slot A and write the cron log. chmod 777 keeps both writable under an arbitrary `--user`.
+# The container serves as the non-root user nflmcp (created here, before the bake). The image
+# does not set USER: entrypoint.sh starts as root, chowns /data and /var/log/nflmcp to nflmcp
+# when a mounted volume left them with another owner, then re-executes itself as nflmcp with
+# setpriv (util-linux, always present in Debian). So update_db.sh can copy, chmod and swap
+# slots, and entrypoint.sh can seed slot A and write the cron log, even on a root-owned mount.
+# `--user` skips the root step. chmod 777 keeps both dirs writable under an arbitrary `--user`.
 # supercronic needs no privileges: its crontab is /tmp/crontab, written by entrypoint.sh.
 ARG INGEST_ARGS=""
 RUN useradd --create-home --shell /usr/sbin/nologin nflmcp \
@@ -85,15 +88,12 @@ EXPOSE 8000
 
 # GET /healthz is 200 when the database opens, 503 otherwise. It sits behind the bearer token
 # when NFL_MCP_AUTH_TOKEN is set, so send the header only then. The start period covers the
-# first-boot seed copy into /data.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+# first-boot seed copy into /data, which can be slow on a network volume.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \
     CMD if [ -n "$NFL_MCP_AUTH_TOKEN" ]; then \
             curl -fsS -H "Authorization: Bearer $NFL_MCP_AUTH_TOKEN" http://127.0.0.1:8000/healthz; \
         else \
             curl -fsS http://127.0.0.1:8000/healthz; \
         fi
-
-# Run as the unprivileged user from here on (the seed bake above needed root for /seed).
-USER nflmcp
 
 ENTRYPOINT ["/entrypoint.sh"]

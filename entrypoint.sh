@@ -11,6 +11,21 @@ mkdir -p "$DB_DIR"
 # must not abort startup over a log directory.
 mkdir -p /var/log/nflmcp 2>/dev/null || true
 
+# Started as root (the image's default): a mounted /data or log directory can be owned by
+# root or another uid (bind mounts, volumes from older images), and the updater runs as
+# nflmcp. Hand them over only when the owner differs, then re-run this script as nflmcp
+# so everything below, including supercronic and the server, is unprivileged. When started
+# with `--user`, this block is skipped and the script continues as that user.
+if [ "$(id -u)" = 0 ]; then
+    for dir in "$DB_DIR" /var/log/nflmcp; do
+        if [ -d "$dir" ] && [ "$(stat -c %U "$dir")" != nflmcp ]; then
+            echo "[init] $dir is not owned by nflmcp; changing owner (recursive)"
+            chown -R nflmcp:nflmcp "$dir" || echo "[init] WARNING: could not chown $dir; updates may fail"
+        fi
+    done
+    exec env HOME=/home/nflmcp setpriv --reuid=nflmcp --regid=nflmcp --init-groups "$0" "$@"
+fi
+
 # Seed slot A rather than ingesting on first start. The published image bakes a
 # database at /seed, so a cold container becomes queryable in seconds. A full ingest
 # here would take 10+ minutes, which blocks readiness on any platform with a startup

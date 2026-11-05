@@ -372,12 +372,17 @@ def test_healthcheck_in_final_stage_on_exposed_port_with_curl_kept():
 
 # ── 4. non-root USER with writable runtime dirs ────────────────────────────────
 
+def _entrypoint_text() -> str:
+    return (ROOT / "entrypoint.sh").read_text()
+
+
 def _runtime_user() -> tuple[int, str]:
+    """(index of ENTRYPOINT/CMD in the final stage, user entrypoint.sh drops to with setpriv)."""
     stage = _final_stage()
     entry = min(i for i in (_index(stage, "ENTRYPOINT"), _index(stage, "CMD")) if i is not None)
-    users = [(i, a.strip()) for i, (k, a) in enumerate(stage) if k == "USER" and i < entry]
-    assert users, "no USER before ENTRYPOINT/CMD in the final stage"
-    return users[-1]
+    m = re.search(r"setpriv\s+--reuid=(\w+)", _entrypoint_text())
+    assert m, "entrypoint.sh does not drop privileges with setpriv"
+    return entry, m.group(1)
 
 
 def test_required_writable_dirs_match_the_container_scripts():
@@ -388,9 +393,23 @@ def test_required_writable_dirs_match_the_container_scripts():
     assert db_dirs | log_dirs == set(REQUIRED_WRITABLE_DIRS)
 
 
-def test_dockerfile_switches_to_non_root_user_before_entrypoint():
+def test_entrypoint_drops_to_non_root_user_with_setpriv_before_writes():
+    # Design change by the reviewer: the image keeps root as its start user so entrypoint.sh
+    # can chown a root-owned /data mount, then re-executes itself as nflmcp.
+    ep = _entrypoint_text()
     _, user = _runtime_user()
-    assert user.split(":")[0] not in {"root", "0"}, user
+    assert user not in {"root", "0"}
+    assert not any(k == "USER" for k, _ in _final_stage()), "USER would skip the chown step"
+    guard = ep.index('if [ "$(id -u)" = 0 ]')
+    chown = ep.index("chown -R", guard)
+    drop = ep.index("setpriv --reuid=", guard)
+    assert "--regid=" in ep[drop:drop + 80] and "--init-groups" in ep[drop:drop + 120]
+    assert '"$0" "$@"' in ep[drop:drop + 200]
+    assert guard < chown < drop
+    # Every write to /data, the cron file and the server start come after the drop.
+    for write in ('cp "$SEED"', 'mv "$SYMLINK"', 'ln -sfn', "nfl-mcp ingest", "cat > /tmp/crontab",
+                  "supercronic /tmp/crontab", "exec nfl-mcp serve"):
+        assert drop < ep.index(write), write
 
 
 @pytest.mark.parametrize("directory", REQUIRED_WRITABLE_DIRS)
@@ -431,7 +450,7 @@ def test_serve_help_shows_loopback_default():
 
 def test_entrypoint_serves_all_interfaces_on_exposed_port():
     lines = [ln for ln in (ROOT / "entrypoint.sh").read_text().splitlines()
-             if ln.strip().startswith("exec ")]
+             if ln.strip().startswith("exec nfl-mcp")]   # not the exec setpriv re-run
     assert len(lines) == 1
     argv = shlex.split(lines[0])
     assert argv[1:3] == ["nfl-mcp", "serve"]
