@@ -168,7 +168,6 @@ def live_server(app):
 
 # ── 1. serializer ───────────────────────────────────────────────────────────────
 
-@pytest.mark.xfail(strict=True, reason="group C: to_json serializer")
 @pytest.mark.parametrize("value, expected", [
     (float("nan"), None),
     (float("inf"), None),
@@ -183,13 +182,11 @@ def test_to_json_scalar_conversion(value, expected):
     assert out == {"v": expected}
 
 
-@pytest.mark.xfail(strict=True, reason="group C: to_json serializer")
 def test_to_json_decimal_is_number_not_string():
     out = to_json()({"d": Decimal("1.50")})
     assert '"1.50"' not in out and isinstance(json.loads(out)["d"], (int, float))
 
 
-@pytest.mark.xfail(strict=True, reason="group C: to_json serializer")
 def test_to_json_nested_lists_and_dicts():
     obj = {"rows": [{"a": float("nan"), "b": [Decimal("0.25"), float("-inf"), {"d": dt.date(2025, 1, 2)}]}],
            "meta": {"x": [1, 2, {"y": float("inf")}]}}
@@ -199,7 +196,6 @@ def test_to_json_nested_lists_and_dicts():
     }
 
 
-@pytest.mark.xfail(strict=True, reason="group C: to_json no indent")
 @pytest.mark.parametrize("obj", [{"a": 1, "b": {"c": [1, 2]}}, [{"x": 1}, {"y": [2, 3]}]])
 def test_to_json_has_no_indentation(obj):
     out = to_json()(obj)
@@ -207,14 +203,12 @@ def test_to_json_has_no_indentation(obj):
     assert json.loads(out) == obj
 
 
-@pytest.mark.xfail(strict=True, reason="group C: strict JSON end to end")
 def test_call_tool_nfl_query_output_is_strict_json(synth_db, clean_env):
     sql = "SELECT 'nan'::DOUBLE AS x, 1.5::DECIMAL(10,2) AS d, DATE '2024-09-05' AS dt"
     payload = strict_loads(text_of(call("nfl_query", {"sql": sql})))
     assert first_row(payload) == {"x": None, "d": 1.5, "dt": "2024-09-05"}
 
 
-@pytest.mark.xfail(strict=True, reason="group C: strict JSON end to end")
 def test_call_tool_infinity_is_null(synth_db, clean_env):
     sql = "SELECT 'inf'::DOUBLE AS p, '-inf'::DOUBLE AS n, 2::DECIMAL(10,0) AS whole"
     payload = strict_loads(text_of(call("nfl_query", {"sql": sql})))
@@ -237,14 +231,12 @@ def _error_case(case, tmp_path, monkeypatch):
 ERROR_CASES = ["unknown_tool", "unknown_argument", "sql_error", "missing_db"]
 
 
-@pytest.mark.xfail(strict=True, reason="group C: CallToolResult isError")
 @pytest.mark.parametrize("case", ERROR_CASES)
 def test_failure_is_flagged_is_error(case, synth_db, clean_env, tmp_path, monkeypatch):
     result = _error_case(case, tmp_path, monkeypatch)
     assert isinstance(result, CallToolResult) and result.isError is True
 
 
-@pytest.mark.xfail(strict=True, reason="group C: one error shape")
 def test_failure_payloads_share_top_level_keys(synth_db, clean_env, tmp_path, monkeypatch):
     payloads = {c: json.loads(text_of(_error_case(c, tmp_path, monkeypatch))) for c in ERROR_CASES}
     key_sets = {c: frozenset(p) for c, p in payloads.items()}
@@ -253,13 +245,11 @@ def test_failure_payloads_share_top_level_keys(synth_db, clean_env, tmp_path, mo
         assert isinstance(p["error"], str) and isinstance(p["code"], str)
 
 
-@pytest.mark.xfail(strict=True, reason="group C: CallToolResult isError")
 def test_success_is_not_flagged(synth_db, clean_env):
     result = call("nfl_query", {"sql": "SELECT x FROM t"})
     assert isinstance(result, CallToolResult) and result.isError is False
 
 
-@pytest.mark.xfail(strict=True, reason="group C: unknown argument lists valid names")
 @pytest.mark.parametrize("tool, args", [
     ("nfl_query", {"sql": "SELECT 1", "bogus": 1}),
     ("nfl_team_records", {"team": "GB", "bogus": 1}),
@@ -288,7 +278,6 @@ async def _status_while_slow(slow_args):
     return status_elapsed, slow_running
 
 
-@pytest.mark.xfail(strict=True, reason="group C: tool calls off the event loop")
 def test_status_not_blocked_by_sleeping_tool(monkeypatch, synth_db, clean_env):
     patch_tool(monkeypatch, "nfl_query", sleeper(2.5))
     patch_tool(monkeypatch, "nfl_status", fast_status)
@@ -296,7 +285,6 @@ def test_status_not_blocked_by_sleeping_tool(monkeypatch, synth_db, clean_env):
     assert elapsed < 1.0 and slow_running
 
 
-@pytest.mark.xfail(strict=True, reason="group C: tool calls off the event loop")
 def test_status_not_blocked_by_slow_duckdb_query(monkeypatch, synth_db, clean_env):
     # Real _execute path: a ~3 s cross join, nfl_status replaced by a fast fake.
     patch_tool(monkeypatch, "nfl_status", fast_status)
@@ -304,7 +292,6 @@ def test_status_not_blocked_by_slow_duckdb_query(monkeypatch, synth_db, clean_en
     assert elapsed < 1.0 and slow_running
 
 
-@pytest.mark.xfail(strict=True, reason="group C: tool calls off the event loop (HTTP)")
 def test_http_second_session_not_blocked(monkeypatch, synth_db, clean_env):
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
@@ -349,7 +336,6 @@ def test_limiter_one_runs_calls_serially(monkeypatch, synth_db, clean_env):
     assert asyncio.run(_two_slow_calls()) >= 0.95  # 2 x 0.5 s
 
 
-@pytest.mark.xfail(strict=True, reason="group C: CapacityLimiter overlap")
 @pytest.mark.parametrize("limit", [None, "2"])
 def test_limiter_two_overlaps_calls(limit, monkeypatch, synth_db, clean_env):
     if limit:
@@ -358,7 +344,6 @@ def test_limiter_two_overlaps_calls(limit, monkeypatch, synth_db, clean_env):
     assert asyncio.run(_two_slow_calls()) < 0.85  # ~0.5 s when overlapped
 
 
-@pytest.mark.xfail(strict=True, reason="group C: get_tool_limiter")
 @pytest.mark.parametrize("env, tokens", [(None, 2), ("1", 1), ("4", 4)])
 def test_get_tool_limiter_reads_env(env, tokens, monkeypatch, clean_env):
     if env:
@@ -379,7 +364,6 @@ def _timed_query(sql):
     return out, time.monotonic() - t0
 
 
-@pytest.mark.xfail(strict=True, reason="group C: NFL_MCP_QUERY_TIMEOUT_SECONDS")
 @pytest.mark.parametrize("seconds", [1, 2])
 def test_timeout_env_cuts_slow_query(seconds, monkeypatch, synth_db, clean_env):
     monkeypatch.setenv("NFL_MCP_QUERY_TIMEOUT_SECONDS", str(seconds))
@@ -416,7 +400,6 @@ def _post_init(client, headers=None):
     return client.post("/mcp", json=INIT, headers={**MCP_HEADERS, **(headers or {})})
 
 
-@pytest.mark.xfail(strict=True, reason="group C: bearer auth")
 @pytest.mark.parametrize("headers", [
     None,
     {"Authorization": "Bearer wrong-token"},
@@ -443,7 +426,6 @@ def test_no_auth_required_when_env_unset(synth_db, clean_env):
     assert resp.status_code == 200 and '"serverInfo"' in resp.text
 
 
-@pytest.mark.xfail(strict=True, reason="group C: auth covers /healthz")
 @pytest.mark.parametrize("headers, status", [(None, 401), ({"Authorization": f"Bearer {TOKEN}"}, 200)])
 def test_healthz_is_protected_by_auth(headers, status, monkeypatch, synth_db, clean_env):
     monkeypatch.setenv("NFL_MCP_AUTH_TOKEN", TOKEN)
@@ -459,7 +441,6 @@ def test_preflight_needs_no_token(monkeypatch, synth_db, clean_env):
     assert resp.status_code == 200
 
 
-@pytest.mark.xfail(strict=True, reason="group C: constant-time compare (weak proxy)")
 def test_auth_uses_compare_digest():
     # Weak proxy: proves hmac.compare_digest is called somewhere in server.py, not that it is the only path.
     assert "compare_digest" in inspect.getsource(server)
@@ -472,7 +453,6 @@ def _preflight(client, origin):
                                            "Access-Control-Request-Headers": "content-type"})
 
 
-@pytest.mark.xfail(strict=True, reason="group C: NFL_MCP_CORS_ORIGINS")
 @pytest.mark.parametrize("env", ["https://a.example,https://b.example", " https://a.example , https://b.example "])
 @pytest.mark.parametrize("origin", ["https://a.example", "https://b.example"])
 def test_cors_allows_listed_origin(env, origin, monkeypatch, synth_db, clean_env):
@@ -481,7 +461,6 @@ def test_cors_allows_listed_origin(env, origin, monkeypatch, synth_db, clean_env
         assert _preflight(client, origin).headers.get("access-control-allow-origin") == origin
 
 
-@pytest.mark.xfail(strict=True, reason="group C: NFL_MCP_CORS_ORIGINS")
 @pytest.mark.parametrize("origin", ["https://evil.example", "http://a.example"])
 def test_cors_rejects_unlisted_origin(origin, monkeypatch, synth_db, clean_env):
     monkeypatch.setenv("NFL_MCP_CORS_ORIGINS", "https://a.example,https://b.example")
@@ -494,7 +473,6 @@ def test_cors_unset_allows_any_origin(synth_db, clean_env):
         assert _preflight(client, "https://evil.example").headers["access-control-allow-origin"] == "*"
 
 
-@pytest.mark.xfail(strict=True, reason="group C: warn when CORS unset")
 def test_cors_unset_logs_warning(synth_db, clean_env, caplog):
     with caplog.at_level(logging.WARNING, logger="nfl-mcp"):
         with TestClient(server.create_app()):
@@ -513,7 +491,6 @@ def test_cors_set_logs_no_cors_warning(monkeypatch, synth_db, clean_env, caplog)
 
 # ── 8. /healthz ─────────────────────────────────────────────────────────────────
 
-@pytest.mark.xfail(strict=True, reason="group C: /healthz")
 def test_healthz_ok_on_synthetic_db(synth_db, clean_env):
     with TestClient(server.create_app()) as client:
         resp = client.get("/healthz")
@@ -521,7 +498,6 @@ def test_healthz_ok_on_synthetic_db(synth_db, clean_env):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="group C: /healthz")
 def test_healthz_ok_on_real_db(monkeypatch, clean_env):
     from pathlib import Path
     real = Path("/tmp/grpE_v3.duckdb")
@@ -533,7 +509,6 @@ def test_healthz_ok_on_real_db(monkeypatch, clean_env):
     assert resp.status_code == 200 and resp.json()["ok"] is True
 
 
-@pytest.mark.xfail(strict=True, reason="group C: /healthz")
 @pytest.mark.parametrize("rel", ["missing.duckdb", "no_dir/missing.duckdb"])
 def test_healthz_503_when_db_missing(rel, tmp_path, monkeypatch, clean_env):
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(tmp_path / rel))
@@ -549,7 +524,6 @@ def _call_records(caplog, tool):
             and re.search(r"duration", r.getMessage())]
 
 
-@pytest.mark.xfail(strict=True, reason="group C: per-call log")
 @pytest.mark.parametrize("sql, rows, truncated", [
     ("SELECT x FROM t", 3, "false"),             # t has 3 hand-written rows
     ("SELECT * FROM range(150)", 100, "true"),   # 150 rows, default max_rows 100
@@ -565,7 +539,6 @@ def test_call_log_has_tool_duration_rows_truncated(sql, rows, truncated, synth_d
     assert re.search(rf"\btruncated\s*[=:]\s*{truncated}\b", msg, re.IGNORECASE)
 
 
-@pytest.mark.xfail(strict=True, reason="group C: per-call log error code")
 def test_call_log_records_error_code(synth_db, clean_env, caplog):
     with caplog.at_level(logging.INFO, logger="nfl-mcp"):
         call("nfl_query", {"sql": "SELECT * FROM no_such_table_xyz"})
@@ -573,7 +546,6 @@ def test_call_log_records_error_code(synth_db, clean_env, caplog):
     assert len(recs) == 1 and re.search(r"\b(error|code)\s*[=:]", recs[0].getMessage())
 
 
-@pytest.mark.xfail(strict=True, reason="group C: SQL cut in per-call log")
 def test_call_log_cuts_long_sql(synth_db, clean_env, caplog):
     sql = "SELECT '" + "a" * 5000 + "' AS s"
     with caplog.at_level(logging.INFO, logger="nfl-mcp"):
@@ -585,8 +557,7 @@ def test_call_log_cuts_long_sql(synth_db, clean_env, caplog):
 @pytest.mark.parametrize("sql", [
     "SELECT '{a}' AS s",
     # Today the error path logs the DuckDB binder message with the full column name (tools.py:290).
-    pytest.param("SELECT no_such_col_{a} FROM t",
-                 marks=pytest.mark.xfail(strict=True, reason="group C: SQL cut in error log")),
+    "SELECT no_such_col_{a} FROM t",
 ])
 def test_no_log_record_carries_full_long_sql(sql, synth_db, clean_env, caplog):
     long_sql = sql.format(a="a" * 5000)
@@ -609,3 +580,54 @@ def test_auth_token_never_logged(monkeypatch, synth_db, clean_env, caplog):
     for r in caplog.records:
         text = r.getMessage() + (r.exc_text or "")
         assert TOKEN not in text and wrong not in text
+
+
+# ── 10. review fixes ────────────────────────────────────────────────────────────
+
+def test_tool_error_dict_with_message_and_tool_keys_keeps_envelope(monkeypatch, clean_env):
+    patch_tool(monkeypatch, "nfl_status", lambda: {"error": "boom", "message": "m", "tool": "t"})
+    result = call("nfl_status", {})
+    payload = json.loads(text_of(result))
+    assert result.isError is True
+    assert payload["error"] == "boom" and isinstance(payload["code"], str)
+    assert payload["details"]["message"] == "m"
+
+
+@pytest.mark.parametrize("raw", ["inf", "nan", "-1", "0", "abc"])
+def test_timeout_env_non_finite_or_invalid_falls_back_to_default(raw, monkeypatch):
+    monkeypatch.setenv("NFL_MCP_QUERY_TIMEOUT_SECONDS", raw)
+    assert tools._query_timeout() == tools._QUERY_TIMEOUT_SECONDS
+
+
+def test_auth_env_token_is_stripped(monkeypatch, synth_db, clean_env):
+    monkeypatch.setenv("NFL_MCP_AUTH_TOKEN", f"  {TOKEN}\n")
+    with TestClient(server.create_app()) as client:
+        assert _post_init(client, {"Authorization": f"Bearer {TOKEN}"}).status_code == 200
+        assert _post_init(client).status_code == 401
+
+
+def test_auth_whitespace_only_token_means_unset_with_warning(monkeypatch, synth_db, clean_env, caplog):
+    monkeypatch.setenv("NFL_MCP_AUTH_TOKEN", "   ")
+    with caplog.at_level(logging.WARNING, logger="nfl-mcp"):
+        with TestClient(server.create_app()) as client:
+            assert _post_init(client).status_code == 200
+    assert any("NFL_MCP_AUTH_TOKEN" in r.getMessage() for r in caplog.records)
+
+
+def test_log_filter_survives_format_args_mismatch():
+    record = logging.LogRecord("nfl-mcp", logging.INFO, __file__, 1, "mismatch %s %s", (1,), None)
+    assert server._CutLongRecords().filter(record) is True
+
+
+@pytest.mark.parametrize("value", [" ", "  \t\n"])
+def test_serve_exits_1_on_whitespace_only_auth_token(value, monkeypatch):
+    from click.testing import CliRunner
+    from nfl_mcp.cli import main
+
+    started = []
+    monkeypatch.setattr("nfl_mcp.cli.uvicorn.run", lambda *a, **k: started.append(1))
+    monkeypatch.setenv("NFL_MCP_AUTH_TOKEN", value)
+    result = CliRunner().invoke(main, ["serve"])
+    assert result.exit_code == 1
+    assert "NFL_MCP_AUTH_TOKEN" in result.output
+    assert started == []

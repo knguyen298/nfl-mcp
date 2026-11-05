@@ -34,6 +34,15 @@ def main():
     """NFL play-by-play MCP server."""
 
 
+def _check_auth_token_env() -> None:
+    """Exit 1 when NFL_MCP_AUTH_TOKEN is set but empty after strip: the operator meant to require auth."""
+    raw = os.environ.get("NFL_MCP_AUTH_TOKEN")
+    if raw and not raw.strip():
+        raise click.ClickException(
+            "NFL_MCP_AUTH_TOKEN is set but empty. Set a token or unset the variable."
+        )
+
+
 # ── serve ──────────────────────────────────────────────────────────────────────
 
 def _exit_on_config_problem():
@@ -54,6 +63,7 @@ def _exit_on_config_problem():
 def serve(host, port):
     """Start the MCP server over Streamable HTTP."""
     _exit_on_config_problem()
+    _check_auth_token_env()
     display_host = "localhost" if host == "0.0.0.0" else host
     click.echo(f"🏈 NFL MCP server listening on http://{display_host}:{port}/mcp")
     if host == "0.0.0.0":
@@ -215,6 +225,7 @@ def init(start, end, skip_ingest):
     click.echo()
     if click.confirm("  Start the server now?", default=True):
         _exit_on_config_problem()
+        _check_auth_token_env()
         click.secho("   Starting server on http://localhost:8000/mcp  (Ctrl-C to stop)", fg="cyan")
         click.echo()
         uvicorn.run(create_app(), host="127.0.0.1", port=8000)
