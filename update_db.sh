@@ -10,8 +10,9 @@ if [ ! -L "$SYMLINK" ]; then
 fi
 
 # One update at a time: a cron run that starts while the boot-time update is still working
-# would pick the same idle slot and delete the file the first run has open.
-exec 9>"$DB_DIR/.update.lock"
+# would pick the same idle slot and delete the file the first run has open. The lock is on
+# the directory itself, so no lock file can be left behind owned by another user.
+exec 9<"$DB_DIR"
 if ! flock -n 9; then
     echo "[$(date -u)] Another update is already running; skipping this run."
     exit 0
