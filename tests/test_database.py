@@ -3,7 +3,7 @@
 import duckdb
 import pytest
 
-from nfl_mcp.database import connection_config_problem, get_db_connection
+from nfl_mcp.database import _memory_limit_problem, connection_config_problem, get_db_connection
 
 
 @pytest.fixture
@@ -47,6 +47,26 @@ class TestConnectionConfig:
                 ).fetchone()[0]
             finally:
                 ref.close()
+
+
+class TestMemoryProbeCache:
+    def test_probe_runs_once_per_value(self, db_file, monkeypatch):
+        monkeypatch.setenv("NFL_MCP_DB_PATH", str(db_file))
+        monkeypatch.setenv("NFL_MCP_DUCKDB_MEMORY_LIMIT", "300MB")
+        _memory_limit_problem.cache_clear()
+        real_connect = duckdb.connect
+        probes = []
+
+        def counting(database, *args, **kwargs):
+            if database == ":memory:":
+                probes.append(kwargs.get("config"))
+            return real_connect(database, *args, **kwargs)
+
+        monkeypatch.setattr(duckdb, "connect", counting)
+        for _ in range(2):
+            with get_db_connection() as conn:
+                conn.execute("SELECT 1")
+        assert probes == [{"memory_limit": "300MB"}]  # one probe for two opens
 
 
 class TestGetDbConnection:
