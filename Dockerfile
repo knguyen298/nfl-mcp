@@ -2,8 +2,8 @@ FROM python:3.12-slim
 
 ARG SUPERCRONIC_VERSION=0.2.33
 
-# supercronic runs the in-container database updater (see entrypoint.sh). curl is only
-# needed to fetch it and is removed with the apt lists afterwards.
+# supercronic runs the in-container database updater (see entrypoint.sh). curl fetches it
+# and stays in the image: the HEALTHCHECK below uses it. Only the apt lists are removed.
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL "https://github.com/aptible/supercronic/releases/download/v${SUPERCRONIC_VERSION}/supercronic-linux-amd64" \
@@ -47,15 +47,24 @@ ENV NFL_MCP_DB_PATH=/data/nflread.duckdb
 # --pre1999 is passed unconditionally so the seed carries 1970-1998 season records from
 # ESPN (about 60 requests, roughly a minute). It is build-time only: the runtime ingest in
 # entrypoint.sh and update_db.sh leaves it out, so a running container never waits on ESPN.
-# A season that fails to fetch is simply absent from the seed and the build still passes.
+# `nfl-mcp ingest` exits 1 on any fetch failure, so the bake passes --allow-failures: a season
+# that fails to fetch is simply absent from the seed (the ingest prints "Ingest failed for:"
+# naming it) and the build still passes. The row check below still fails an empty seed.
+#
+# The container runs as the non-root user nflmcp (created here, before the bake). It owns /data
+# and /var/log/nflmcp so update_db.sh can copy, chmod and swap slots, and entrypoint.sh can seed
+# slot A and write the cron log. chmod 777 keeps both writable under an arbitrary `--user`.
+# supercronic needs no privileges: its crontab is /tmp/crontab, written by entrypoint.sh.
 ARG INGEST_ARGS=""
-RUN mkdir -p /seed /data /var/log/nflmcp \
+RUN useradd --create-home --shell /usr/sbin/nologin nflmcp \
+ && mkdir -p /seed /data /var/log/nflmcp \
+ && chown nflmcp:nflmcp /data /var/log/nflmcp \
  && chmod 777 /data /var/log/nflmcp \
  && NFL_MCP_DB_PATH=/seed/nflread.duckdb \
     NFL_MCP_DUCKDB_MEMORY_LIMIT=3GB \
     NFL_MCP_DUCKDB_THREADS=2 \
     POLARS_MAX_THREADS=2 \
-    nfl-mcp ingest --pre1999 ${INGEST_ARGS} \
+    nfl-mcp ingest --pre1999 ${INGEST_ARGS} --allow-failures \
  && rm -rf /seed/.duckdb_spill /data/.duckdb_spill /root/.cache \
  && test ! -e /seed/nflread.duckdb.wal \
  && python -c "import duckdb,sys; c=duckdb.connect('/seed/nflread.duckdb',read_only=True); rows={t:c.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in ('plays','schedules')}; print('baked rows:',rows); sys.exit(0 if all(v>0 for v in rows.values()) else 1)"
@@ -73,5 +82,18 @@ ENV NFL_MCP_DUCKDB_MEMORY_LIMIT=512MB \
     NFL_MCP_DUCKDB_TEMP_DIR=/tmp/.duckdb_spill
 
 EXPOSE 8000
+
+# GET /healthz is 200 when the database opens, 503 otherwise. It sits behind the bearer token
+# when NFL_MCP_AUTH_TOKEN is set, so send the header only then. The start period covers the
+# first-boot seed copy into /data.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD if [ -n "$NFL_MCP_AUTH_TOKEN" ]; then \
+            curl -fsS -H "Authorization: Bearer $NFL_MCP_AUTH_TOKEN" http://127.0.0.1:8000/healthz; \
+        else \
+            curl -fsS http://127.0.0.1:8000/healthz; \
+        fi
+
+# Run as the unprivileged user from here on (the seed bake above needed root for /seed).
+USER nflmcp
 
 ENTRYPOINT ["/entrypoint.sh"]

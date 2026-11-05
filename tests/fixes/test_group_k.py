@@ -55,11 +55,6 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
 REQUIRED_WRITABLE_DIRS = ("/data", "/var/log/nflmcp")
 
-XF_UNIT = pytest.mark.xfail(strict=True, reason="group k: unit-test job on push/PR")
-XF_GATE = pytest.mark.xfail(strict=True, reason="group k: publish job depends on unit tests")
-XF_HEALTH = pytest.mark.xfail(strict=True, reason="group k: Dockerfile HEALTHCHECK on /healthz")
-XF_USER = pytest.mark.xfail(strict=True, reason="group k: non-root container user")
-
 
 # ── minimal workflow reader ────────────────────────────────────────────────────
 
@@ -280,20 +275,17 @@ def test_workflow_reader_parses_triggers_jobs_and_needs():
 
 # ── 1. unit-test job on push and pull_request, no network ingest ───────────────
 
-@XF_UNIT
 def test_unit_job_runs_pytest_with_unit_marker():
     # Today ci.yml runs `pytest -q --cov-fail-under=100` (no -m) after an ingest step.
     assert _unit_jobs(), "no workflow job runs pytest -m unit without an ingest step"
 
 
-@XF_UNIT
 def test_unit_job_workflow_triggers_on_push_and_pull_request():
     wfs = _workflows()
     hits = [(f, j) for f, j in _unit_jobs() if {"push", "pull_request"} <= wfs[f].triggers]
     assert hits, "no unit-test job lives in a workflow triggered by both push and pull_request"
 
 
-@XF_UNIT
 @pytest.mark.parametrize("wf_name", ["ci.yml"])
 def test_ci_has_unit_job_with_no_ingest_in_job_or_needs(wf_name):
     wf = _workflows()[wf_name]
@@ -311,7 +303,6 @@ def test_ci_still_triggers_on_push_and_pull_request():
 
 # ── 2. image publish depends on the unit-test job ──────────────────────────────
 
-@XF_GATE
 def test_docker_publish_job_needs_unit_test_job():
     wfs = _workflows()
     wf = wfs["docker.yml"]
@@ -355,21 +346,18 @@ def _healthcheck() -> str:
     return hits[0]
 
 
-@XF_HEALTH
 def test_healthcheck_probes_healthz_with_curl_or_urllib():
     hc = _healthcheck()
     assert " CMD " in f" {hc} " and "/healthz" in hc
     assert "curl" in hc or ("python" in hc and "urllib" in hc), hc
 
 
-@XF_HEALTH
 def test_healthcheck_sets_interval_and_start_period():
     opts = _healthcheck().split(" CMD ")[0]
     assert re.search(r"--interval=\d+[smh]", opts), opts
     assert re.search(r"--start-period=\d+[smh]", opts), opts
 
 
-@XF_HEALTH
 def test_healthcheck_in_final_stage_on_exposed_port_with_curl_kept():
     stage = _final_stage()
     hc_i = _index(stage, "HEALTHCHECK")
@@ -400,13 +388,11 @@ def test_required_writable_dirs_match_the_container_scripts():
     assert db_dirs | log_dirs == set(REQUIRED_WRITABLE_DIRS)
 
 
-@XF_USER
 def test_dockerfile_switches_to_non_root_user_before_entrypoint():
     _, user = _runtime_user()
     assert user.split(":")[0] not in {"root", "0"}, user
 
 
-@XF_USER
 @pytest.mark.parametrize("directory", REQUIRED_WRITABLE_DIRS)
 def test_runtime_dir_made_writable_before_user_switch(directory):
     idx, user = _runtime_user()
@@ -418,7 +404,6 @@ def test_runtime_dir_made_writable_before_user_switch(directory):
     assert any(chown.search(r) or chmod.search(r) for r in runs), directory
 
 
-@XF_USER
 def test_runtime_user_is_created_and_seed_bake_runs_before_it():
     idx, user = _runtime_user()
     stage = _final_stage()
