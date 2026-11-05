@@ -209,11 +209,28 @@ TOOLS = [
                     "type": "integer",
                     "description": "Season year. Omit for all available seasons.",
                 },
+                "season_from": {
+                    "type": "integer",
+                    "description": "Start of season range (inclusive), e.g. 2020 for 'since 2020'",
+                },
+                "season_to": {
+                    "type": "integer",
+                    "description": "End of season range (inclusive)",
+                },
                 "side": {
                     "type": "string",
                     "enum": ["offense", "defense", "situational", "both"],
                     "description": "Which stats to return (default: both offense + defense + situational)",
                     "default": "both",
+                },
+                "season_type": {
+                    "type": "string",
+                    "enum": ["REG", "POST", "ALL"],
+                    "description": (
+                        "REG (regular season, default), POST (playoffs), or ALL for both "
+                        "(one row per season and season type, never summed together)"
+                    ),
+                    "default": "REG",
                 },
             },
             "required": ["team"],
@@ -300,7 +317,11 @@ TOOLS = [
                 "season_type": {
                     "type": "string",
                     "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs)",
+                    "description": (
+                        "Filter by season type: REG (regular season) or POST (playoffs). "
+                        "Team mode defaults to REG; a team with no rows for the filter "
+                        "returns empty lists and a reason."
+                    ),
                 },
             },
             "required": ["entity1", "entity2"],

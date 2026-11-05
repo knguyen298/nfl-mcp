@@ -4,6 +4,7 @@ NFL MCP — command-line entry point
   nfl-mcp init                Interactive setup wizard
   nfl-mcp serve               Start the MCP server (Streamable HTTP)
   nfl-mcp ingest              Load NFL play-by-play data into the database
+  nfl-mcp rebuild             Rebuild the derived tables from the loaded data
   nfl-mcp setup-client        Configure Claude Desktop / VS Code MCP
   nfl-mcp doctor              Check that everything is working
 """
@@ -133,6 +134,37 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999):
         fresh=fresh,
         skip_views=skip_views,
     )
+
+
+# ── rebuild ────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option("--db", "db_path", default=None, type=click.Path(dir_okay=False),
+              help="Database file to rebuild (default: the configured path / NFL_MCP_DB_PATH).")
+def rebuild(db_path):
+    """Rebuild every derived table (team, situational, fantasy, records) in one transaction.
+
+    No data is downloaded. If any table fails the previous tables are kept and the
+    command exits with an error.
+    """
+    import duckdb
+
+    from .config import get_duckdb_path
+    from .ingest import _apply_duckdb_pragmas, rebuild_derived_tables
+
+    path = Path(db_path).expanduser() if db_path else get_duckdb_path()
+    if not path.exists():
+        raise click.ClickException(f"Database not found at {path}. Run 'nfl-mcp ingest' first.")
+
+    conn = duckdb.connect(str(path))
+    try:
+        _apply_duckdb_pragmas(conn, str(path))
+        rebuild_derived_tables(conn)
+    except duckdb.Error as e:
+        raise click.ClickException(f"Rebuild failed, previous derived tables kept: {e}")
+    finally:
+        conn.close()
+    click.secho("Derived tables rebuilt.", fg="green")
 
 
 # ── init ───────────────────────────────────────────────────────────────────────

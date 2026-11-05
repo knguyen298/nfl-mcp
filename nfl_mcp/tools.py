@@ -378,33 +378,86 @@ def nfl_search_plays(
         return {"error": str(e)}
 
 
+def _team_stats_filter(
+    season: int | None,
+    season_from: int | None,
+    season_to: int | None,
+    season_type: str | None,
+) -> tuple[str, list[Any]]:
+    """WHERE fragment and params for the derived team tables ('ALL' keeps both season types)."""
+    clause = ""
+    params: list[Any] = []
+    if season:
+        clause += " AND season_year = ?"
+        params.append(int(season))
+    if season_from:
+        clause += " AND season_year >= ?"
+        params.append(int(season_from))
+    if season_to:
+        clause += " AND season_year <= ?"
+        params.append(int(season_to))
+    season_type = (season_type or "REG").upper()
+    if season_type != "ALL":
+        clause += " AND season_type = ?"
+        params.append(season_type)
+    return clause, params
+
+
+_STALE_TEAM_TABLES = (
+    "Derived team tables predate season_type; the season_type filter was not applied "
+    "and rows blend REG and POST. Run 'nfl-mcp rebuild'."
+)
+
+
+def _team_rows(
+    table: str,
+    team: str,
+    filters: tuple[int | None, int | None, int | None, str | None],
+    tail: str = "",
+) -> tuple[list[dict], bool]:
+    """Rows of one derived team table, and whether the table lacks season_type (not rebuilt yet)."""
+    clause, params = _team_stats_filter(*filters)
+    try:
+        sql = (f"SELECT * FROM {table} WHERE team = ?{clause} "
+               f"ORDER BY season_year, season_type DESC{tail}")
+        return _execute(sql, [team, *params]), False
+    except duckdb.BinderException as e:
+        if "season_type" not in str(e):
+            raise
+    clause, params = _team_stats_filter(*filters[:3], "ALL")
+    sql = f"SELECT * FROM {table} WHERE team = ?{clause} ORDER BY season_year{tail}"
+    return _execute(sql, [team, *params]), True
+
+
 def nfl_team_stats(
     team: str,
     season: int | None = None,
+    season_from: int | None = None,
+    season_to: int | None = None,
     side: str = "both",
+    season_type: str = "REG",
 ) -> Dict[str, Any]:
-    """Get pre-aggregated team stats (offense, defense, or both)."""
+    """Get pre-aggregated team stats (offense, defense, or both) for REG, POST, or ALL games."""
     team = team.upper()
     results = {}
-    season_clause = ""
-    season_params: list[Any] = []
-    if season:
-        season_clause = " AND season_year = ?"
-        season_params.append(int(season))
+    filters = (season, season_from, season_to, season_type)
 
     try:
+        stale = False
         if side in ("offense", "both"):
-            sql = f"SELECT * FROM team_offense_stats WHERE team = ?{season_clause} ORDER BY season_year"
-            results["offense"] = _execute(sql, [team, *season_params])
+            results["offense"], old = _team_rows("team_offense_stats", team, filters)
+            stale = stale or old
 
         if side in ("defense", "both"):
-            sql = f"SELECT * FROM team_defense_stats WHERE team = ?{season_clause} ORDER BY season_year"
-            results["defense"] = _execute(sql, [team, *season_params])
+            results["defense"], old = _team_rows("team_defense_stats", team, filters)
+            stale = stale or old
 
         if side in ("situational", "both"):
-            sql = f"SELECT * FROM situational_stats WHERE team = ?{season_clause} ORDER BY season_year, situation"
-            results["situational"] = _execute(sql, [team, *season_params])
+            results["situational"], old = _team_rows("situational_stats", team, filters, ", situation")
+            stale = stale or old
 
+        if stale:
+            results["warning"] = _STALE_TEAM_TABLES
         return results
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -490,6 +543,84 @@ def nfl_player_stats(
         return {"error": str(e)}
 
 
+def _compare_teams(
+    entity1: str,
+    entity2: str,
+    season: int | None,
+    season_from: int | None,
+    season_to: int | None,
+    season_type: str | None,
+) -> dict[str, Any]:
+    """Team side of nfl_compare: offense and defense rows for each team under one filter."""
+    filters = (season, season_from, season_to, season_type)
+    shown = (season_type or "REG").upper()
+    result: dict[str, Any] = {}
+    for label in (entity1, entity2):
+        team = label.upper()
+        offense, old_off = _team_rows("team_offense_stats", team, filters)
+        defense, old_def = _team_rows("team_defense_stats", team, filters)
+        entry: dict[str, Any] = {"offense": offense, "defense": defense}
+        if old_off or old_def:
+            entry["warning"] = _STALE_TEAM_TABLES
+        if not offense and not defense:
+            scope = f" in {season}" if season else ""
+            entry["reason"] = f"No {shown} team stats for {team}{scope} with the filters given"
+        result[label] = entry
+    return result
+
+
+def _compare_players(
+    entity1: str,
+    entity2: str,
+    season: int | None,
+    season_from: int | None,
+    season_to: int | None,
+    season_type: str | None,
+) -> dict[str, Any]:
+    """Player side of nfl_compare: passing, rushing and receiving rows for each player."""
+    e1, e2 = entity1, entity2
+    season_filter = ""
+    season_params: list[Any] = []
+    if season:
+        season_filter += " AND season = ?"
+        season_params.append(int(season))
+    if season_from:
+        season_filter += " AND season >= ?"
+        season_params.append(int(season_from))
+    if season_to:
+        season_filter += " AND season <= ?"
+        season_params.append(int(season_to))
+    if season_type:
+        season_filter += " AND season_type = ?"
+        season_params.append(season_type)
+
+    result = {}
+    for p, label in [(e1, entity1), (e2, entity2)]:
+        p = _normalize_player_name(p)
+        stats = {}
+        for stype, col, ptype in [
+            ("passing", "passer_player_name", "pass"),
+            ("rushing", "rusher_player_name", "run"),
+            ("receiving", "receiver_player_name", "pass"),
+        ]:
+            count_sql = (
+                f"SELECT COUNT(*) AS n FROM plays "
+                f"WHERE {col} ILIKE ? AND play_type = ?{season_filter}"
+            )
+            count_row = _execute(count_sql, [f"%{p}%", ptype, *season_params])
+            if count_row and count_row[0].get("n", 0) > 0:
+                player_result = nfl_player_stats(
+                    label, season=season, season_from=season_from,
+                    season_to=season_to, season_type=season_type,
+                    stat_type=stype,
+                )
+                if "seasons" in player_result:
+                    stats[stype] = player_result["seasons"]
+        result[label] = stats
+
+    return result
+
+
 def nfl_compare(
     entity1: str,
     entity2: str,
@@ -499,87 +630,15 @@ def nfl_compare(
     season_to: int | None = None,
     season_type: str | None = None,
 ) -> Dict[str, Any]:
-    """Side-by-side comparison of two teams or players."""
-    e1, e2 = entity1, entity2
+    """Side-by-side comparison of two teams or players.
 
+    Team mode reads the derived team tables for season_type (REG by default, POST, or ALL).
+    """
     try:
         if compare_type == "team":
-            t1, t2 = e1.upper(), e2.upper()
-            season_filter = ""
-            season_params: list[Any] = []
-            if season:
-                season_filter += " AND season_year = ?"
-                season_params.append(int(season))
-            if season_from:
-                season_filter += " AND season_year >= ?"
-                season_params.append(int(season_from))
-            if season_to:
-                season_filter += " AND season_year <= ?"
-                season_params.append(int(season_to))
-
-            off1 = _execute(
-                f"SELECT * FROM team_offense_stats WHERE team = ?{season_filter} ORDER BY season_year",
-                [t1, *season_params],
-            )
-            off2 = _execute(
-                f"SELECT * FROM team_offense_stats WHERE team = ?{season_filter} ORDER BY season_year",
-                [t2, *season_params],
-            )
-            def1 = _execute(
-                f"SELECT * FROM team_defense_stats WHERE team = ?{season_filter} ORDER BY season_year",
-                [t1, *season_params],
-            )
-            def2 = _execute(
-                f"SELECT * FROM team_defense_stats WHERE team = ?{season_filter} ORDER BY season_year",
-                [t2, *season_params],
-            )
-
-            return {
-                entity1: {"offense": off1, "defense": def1},
-                entity2: {"offense": off2, "defense": def2},
-            }
-
+            return _compare_teams(entity1, entity2, season, season_from, season_to, season_type)
         elif compare_type == "player":
-            season_filter = ""
-            season_params: list[Any] = []
-            if season:
-                season_filter += " AND season = ?"
-                season_params.append(int(season))
-            if season_from:
-                season_filter += " AND season >= ?"
-                season_params.append(int(season_from))
-            if season_to:
-                season_filter += " AND season <= ?"
-                season_params.append(int(season_to))
-            if season_type:
-                season_filter += " AND season_type = ?"
-                season_params.append(season_type)
-
-            result = {}
-            for p, label in [(e1, entity1), (e2, entity2)]:
-                p = _normalize_player_name(p)
-                stats = {}
-                for stype, col, ptype in [
-                    ("passing", "passer_player_name", "pass"),
-                    ("rushing", "rusher_player_name", "run"),
-                    ("receiving", "receiver_player_name", "pass"),
-                ]:
-                    count_sql = (
-                        f"SELECT COUNT(*) AS n FROM plays "
-                        f"WHERE {col} ILIKE ? AND play_type = ?{season_filter}"
-                    )
-                    count_row = _execute(count_sql, [f"%{p}%", ptype, *season_params])
-                    if count_row and count_row[0].get("n", 0) > 0:
-                        player_result = nfl_player_stats(
-                            label, season=season, season_from=season_from,
-                            season_to=season_to, season_type=season_type,
-                            stat_type=stype,
-                        )
-                        if "seasons" in player_result:
-                            stats[stype] = player_result["seasons"]
-                result[label] = stats
-
-            return result
+            return _compare_players(entity1, entity2, season, season_from, season_to, season_type)
         else:
             return {"error": "compare_type must be 'team' or 'player'"}
 
