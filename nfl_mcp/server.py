@@ -246,11 +246,11 @@ TOOLS = [
             "properties": {
                 "team": {
                     "type": "string",
-                    "description": "Offensive team abbreviation (e.g. KC, PHI, BUF)",
+                    "description": "Offensive team abbreviation (e.g. KC, PHI, BUF). Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
                 },
                 "opponent": {
                     "type": "string",
-                    "description": "Defensive team abbreviation",
+                    "description": "Defensive team abbreviation. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
                 },
                 "player": {
                     "type": "string",
@@ -275,7 +275,7 @@ TOOLS = [
                 "season_type": {
                     "type": "string",
                     "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs)",
+                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Playoff rounds (WC, DIV, CON, SB) are not valid here.",
                 },
                 "play_type": {
                     "type": "string",
@@ -319,7 +319,7 @@ TOOLS = [
             "properties": {
                 "team": {
                     "type": "string",
-                    "description": "Team abbreviation (e.g. KC, PHI, BUF, BAL)",
+                    "description": "Team abbreviation (e.g. KC, PHI, BUF, BAL). Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
                 },
                 "season": {
                     "type": "integer",
@@ -430,7 +430,7 @@ TOOLS = [
                 "season_type": {
                     "type": "string",
                     "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Omit for one row per type.",
+                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Omit for one row per type. Playoff rounds (WC, DIV, CON, SB) are not valid here.",
                 },
                 "stat_type": {
                     "type": "string",
@@ -454,11 +454,11 @@ TOOLS = [
             "properties": {
                 "entity1": {
                     "type": "string",
-                    "description": "First team abbreviation or player name",
+                    "description": "First team abbreviation or player name. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
                 },
                 "entity2": {
                     "type": "string",
-                    "description": "Second team abbreviation or player name",
+                    "description": "Second team abbreviation or player name. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
                 },
                 "compare_type": {
                     "type": "string",
@@ -512,7 +512,7 @@ TOOLS = [
             "properties": {
                 "team": {
                     "type": "string",
-                    "description": "Team abbreviation (e.g. KC, PHI, BUF)",
+                    "description": "Team abbreviation (e.g. KC, PHI, BUF). Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
                 },
                 "season": {
                     "type": "integer",
@@ -538,7 +538,7 @@ TOOLS = [
             "properties": {
                 "team": {
                     "type": "string",
-                    "description": "Team abbreviation (e.g. KC, PHI)",
+                    "description": "Team abbreviation (e.g. KC, PHI). Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
                 },
                 "season": {
                     "type": "integer",
@@ -571,7 +571,7 @@ TOOLS = [
             "properties": {
                 "team": {
                     "type": "string",
-                    "description": "Team abbreviation — returns all games where team is home or away.",
+                    "description": "Team abbreviation — returns all games where team is home or away. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
                 },
                 "season": {
                     "type": "integer",
@@ -583,8 +583,11 @@ TOOLS = [
                 },
                 "season_type": {
                     "type": "string",
-                    "enum": ["REG", "POST", "SB"],
-                    "description": "Season type filter: REG, POST, or SB (Super Bowl).",
+                    "enum": ["REG", "POST", "WC", "DIV", "CON", "SB"],
+                    "description": (
+                        "Season type filter: REG, POST (all four playoff rounds), or one round: "
+                        "WC (wild card), DIV (divisional), CON (conference), SB (Super Bowl)."
+                    ),
                 },
             },
         },
@@ -612,7 +615,7 @@ TOOLS = [
                 },
                 "team": {
                     "type": "string",
-                    "description": "Team abbreviation (e.g. KC, PHI)",
+                    "description": "Team abbreviation (e.g. KC, PHI). Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
                 },
                 "season": {
                     "type": "integer",
@@ -625,6 +628,14 @@ TOOLS = [
                 "position": {
                     "type": "string",
                     "description": "Position filter (e.g. TE, WR, CB).",
+                },
+                "season_type": {
+                    "type": "string",
+                    "enum": ["REG", "POST", "WC", "DIV", "CON", "SB"],
+                    "description": (
+                        "Season type filter: REG, POST (all four playoff rounds), or one round: "
+                        "WC (wild card), DIV (divisional), CON (conference), SB (Super Bowl)."
+                    ),
                 },
             },
         },
@@ -653,7 +664,7 @@ TOOLS = [
                 },
                 "team": {
                     "type": "string",
-                    "description": "Team abbreviation (e.g. KC, PHI)",
+                    "description": "Team abbreviation (e.g. KC, PHI). Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
                 },
                 "season": {
                     "type": "integer",
@@ -693,7 +704,7 @@ TOOLS = [
                 },
                 "team": {
                     "type": "string",
-                    "description": "Team abbreviation (e.g. KC, PHI).",
+                    "description": "Team abbreviation (e.g. KC, PHI). Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
                 },
                 "scope": {
                     "type": "string",
@@ -729,11 +740,11 @@ TOOLS = [
             "properties": {
                 "team": {
                     "type": "string",
-                    "description": "Offensive team abbreviation (e.g. KC, PHI).",
+                    "description": "Offensive team abbreviation (e.g. KC, PHI). Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
                 },
                 "opponent": {
                     "type": "string",
-                    "description": "Defensive team abbreviation.",
+                    "description": "Defensive team abbreviation. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
                 },
                 "player": {
                     "type": "string",
@@ -765,7 +776,7 @@ TOOLS = [
                 "season_type": {
                     "type": "string",
                     "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG or POST.",
+                    "description": "Filter by season type: REG or POST. Playoff rounds (WC, DIV, CON, SB) are not valid here.",
                 },
             },
         },
@@ -786,7 +797,7 @@ TOOLS = [
                 "player": {"type": "string", "description": "Player name, e.g. 'Justin Jefferson'. A name that matches several players returns ambiguous candidates; then pass player_id."},
                 "player_id": {"type": "string", "description": "Player gsis_id (from nfl_player_lookup). Takes precedence over a name."},
                 "position": {"type": "string", "description": "Position filter (e.g. WR, RB, TE)."},
-                "team": {"type": "string", "description": "Team abbreviation (e.g. KC)."},
+                "team": {"type": "string", "description": "Team abbreviation (e.g. KC). Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work."},
                 "season": {"type": "integer", "description": "Exact season year."},
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
             },
@@ -807,7 +818,7 @@ TOOLS = [
                 "player": {"type": "string", "description": "Player name, e.g. 'Justin Jefferson'. A name that matches several players returns ambiguous candidates; then pass player_id."},
                 "player_id": {"type": "string", "description": "Player gsis_id (from nfl_player_lookup). Takes precedence over a name."},
                 "position": {"type": "string", "description": "Position filter (e.g. WR, RB)."},
-                "team": {"type": "string", "description": "Team abbreviation."},
+                "team": {"type": "string", "description": "Team abbreviation. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work."},
                 "season": {"type": "integer", "description": "Exact season year."},
                 "week": {"type": "integer", "description": "Week number."},
                 "min_snap_pct": {"type": "number", "description": "Minimum snap % (0–100) for the week."},
@@ -830,7 +841,7 @@ TOOLS = [
                 "player": {"type": "string", "description": "Player name, e.g. 'Justin Jefferson'. A name that matches several players returns ambiguous candidates; then pass player_id."},
                 "player_id": {"type": "string", "description": "Player gsis_id (from nfl_player_lookup). Takes precedence over a name."},
                 "position": {"type": "string", "description": "Position filter (e.g. WR, TE)."},
-                "team": {"type": "string", "description": "Team abbreviation."},
+                "team": {"type": "string", "description": "Team abbreviation. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work."},
                 "season": {"type": "integer", "description": "Exact season year (2016+)."},
                 "regression_candidate": {
                     "type": "boolean",
@@ -854,7 +865,7 @@ TOOLS = [
             "properties": {
                 "player": {"type": "string", "description": "Player name, e.g. 'Justin Jefferson'. A name that matches several players returns ambiguous candidates; then pass player_id."},
                 "player_id": {"type": "string", "description": "Player gsis_id (from nfl_player_lookup). Takes precedence over a name."},
-                "team": {"type": "string", "description": "Team abbreviation."},
+                "team": {"type": "string", "description": "Team abbreviation. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work."},
                 "season": {"type": "integer", "description": "Exact season year (2022+)."},
                 "min_targets": {"type": "integer", "description": "Minimum catchable targets to qualify."},
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
@@ -876,7 +887,7 @@ TOOLS = [
                 "player": {"type": "string", "description": "Player name, e.g. 'Justin Jefferson'. A name that matches several players returns ambiguous candidates; then pass player_id."},
                 "player_id": {"type": "string", "description": "Player gsis_id (from nfl_player_lookup). Takes precedence over a name."},
                 "position": {"type": "string", "description": "Position filter (e.g. RB, WR)."},
-                "team": {"type": "string", "description": "Team abbreviation."},
+                "team": {"type": "string", "description": "Team abbreviation. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work."},
                 "season": {"type": "integer", "description": "Exact season year."},
                 "min_apy": {"type": "number", "description": "Minimum APY in $millions."},
                 "max_apy": {"type": "number", "description": "Maximum APY in $millions."},

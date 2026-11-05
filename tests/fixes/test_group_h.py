@@ -57,6 +57,9 @@ PLAY_COLS = {
     "qb_dropback": "INTEGER", "pass_attempt": "INTEGER", "rush_attempt": "INTEGER",
     "qb_scramble": "INTEGER", "two_point_attempt": "INTEGER", "pass": "INTEGER",
     "rush": "INTEGER", "qb_kneel": "INTEGER", "qb_spike": "INTEGER",
+    "lateral_receiver_player_id": "VARCHAR", "lateral_rusher_player_id": "VARCHAR",
+    "lateral_receiving_yards": "DOUBLE", "lateral_rushing_yards": "DOUBLE",
+    "td_player_id": "VARCHAR",
 }
 
 QB, TE, WR, RB = ("P.Mahomes", "00-0000001"), ("T.Kelce", "00-0000002"), \
@@ -277,15 +280,16 @@ def _build(path: Path) -> None:
     c.executemany("INSERT INTO team_defense_stats VALUES (?,?,?,100,500,3,0.0)", TEAM_SEASONS)
     c.executemany("INSERT INTO situational_stats VALUES (?,?,?,'Red Zone',10,3.0,2,40.0,0.2)", TEAM_SEASONS)
 
-    c.execute("""CREATE TABLE players (gsis_id VARCHAR, display_name VARCHAR, first_name VARCHAR,
+    c.execute("""CREATE TABLE players (gsis_id VARCHAR, display_name VARCHAR,
+        common_first_name VARCHAR, first_name VARCHAR,
         last_name VARCHAR, short_name VARCHAR, football_name VARCHAR, suffix VARCHAR,
         pfr_id VARCHAR, position VARCHAR, latest_team VARCHAR, rookie_season INTEGER,
         last_season INTEGER, status VARCHAR)""")
-    c.executemany("INSERT INTO players VALUES (?,?,?,?,?,?,NULL,?,?,?,2017,2024,'ACT')", [
-        ("00-0000001", "Patrick Mahomes", "Patrick", "Mahomes", "P.Mahomes", "Patrick", "pfrPat", "QB", "KC"),
-        ("00-0000002", "Travis Kelce", "Travis", "Kelce", "T.Kelce", "Travis", "pfrTra", "TE", "KC"),
-        ("00-0000003", "Rashee Rice", "Rashee", "Rice", "R.Rice", "Rashee", "pfrRas", "WR", "KC"),
-        ("00-0000004", "Isiah Pacheco", "Isiah", "Pacheco", "I.Pacheco", "Isiah", "pfrIsi", "RB", "KC"),
+    c.executemany("INSERT INTO players VALUES (?,?,?,?,?,?,?,NULL,?,?,?,2017,2024,'ACT')", [
+        ("00-0000001", "Patrick Mahomes", "Patrick", "Patrick", "Mahomes", "P.Mahomes", "Patrick", "pfrPat", "QB", "KC"),
+        ("00-0000002", "Travis Kelce", "Travis", "Travis", "Kelce", "T.Kelce", "Travis", "pfrTra", "TE", "KC"),
+        ("00-0000003", "Rashee Rice", "Rashee", "Rashee", "Rice", "R.Rice", "Rashee", "pfrRas", "WR", "KC"),
+        ("00-0000004", "Isiah Pacheco", "Isiah", "Isiah", "Pacheco", "I.Pacheco", "Isiah", "pfrIsi", "RB", "KC"),
     ])
 
     c.execute("""CREATE TABLE _ingest_metadata (dataset_id VARCHAR, table_name VARCHAR,
@@ -340,23 +344,16 @@ TEAM_TOOLS = {
     "nfl_team_records": (lambda t: tools.nfl_team_records(team=t), "records", 1),
 }
 
-_XF = pytest.mark.xfail(strict=True, reason="group H: team helper (canonical_team, strip, upper)")
-
-
-def _params(cases, xfail_ids, mark=_XF):
-    return [pytest.param(*c, id="-".join(map(str, c)),
-                         marks=[mark] if "-".join(map(str, c)) in xfail_ids else [])
-            for c in cases]
+def _params(cases):
+    return [pytest.param(*c, id="-".join(map(str, c))) for c in cases]
 
 
 # ── 1. Case-insensitive team on every team-taking tool ────────────────────────
 
-_CASE_PASS = {f"{t}-kc" for t in TEAM_TOOLS if t != "nfl_search_plays"} | {"nfl_team_records- KC "}
 _CASE = [(t, s) for t in TEAM_TOOLS for s in ("kc", " KC ")]
 
 
-@pytest.mark.parametrize("tool,spelling", _params(
-    _CASE, {"-".join(c) for c in _CASE} - _CASE_PASS))
+@pytest.mark.parametrize("tool,spelling", _params(_CASE))
 def test_team_case_insensitive_matches_upper(db, tool, spelling):
     call, key, hand = TEAM_TOOLS[tool]
     expected = _n(call("KC"), key)
@@ -373,9 +370,7 @@ _ALIAS = [("OAK", 2), ("LV", 2), ("SD", 2), ("LAC", 2), ("STL", 2), ("LA", 2), (
 
 
 @pytest.mark.parametrize("code,expected", [
-    pytest.param(c, e, id=c, marks=[] if c == "WAS" else
-                 [pytest.mark.xfail(strict=True, reason="group H: alias expansion in plays filters")])
-    for c, e in _ALIAS])
+    pytest.param(c, e, id=c) for c, e in _ALIAS])
 def test_search_plays_alias_returns_all_franchise_codes(db, code, expected):
     # Two rows per franchise: OAK 2019 + LV 2024, SD 2016 + LAC 2024, STL 2015 + LA 2024,
     # JAC 2019 + JAX 2024, WAS 2019 + WAS 2024.
@@ -384,7 +379,6 @@ def test_search_plays_alias_returns_all_franchise_codes(db, code, expected):
     assert len({r["season"] for r in res["rows"]}) == 2
 
 
-@pytest.mark.xfail(strict=True, reason="group H: alias expansion for opponent")
 def test_search_plays_opponent_alias_oak_finds_lv_defense(db):
     # defteam LV appears once (play 7, 2024); no OAK defteam rows -> 1
     assert _n(tools.nfl_search_plays(opponent="oak"), "rows") == 1
@@ -392,8 +386,8 @@ def test_search_plays_opponent_alias_oak_finds_lv_defense(db):
 
 @pytest.mark.parametrize("code,expected", [
     pytest.param("LAR", 2, id="LAR"), pytest.param("JAC", 1, id="JAC"),
-    pytest.param("LA", 2, id="LA", marks=_XF), pytest.param("JAX", 1, id="JAX", marks=_XF),
-    pytest.param("stl", 2, id="stl", marks=_XF)])
+    pytest.param("LA", 2, id="LA"), pytest.param("JAX", 1, id="JAX"),
+    pytest.param("stl", 2, id="stl")])
 def test_fantasy_rankings_alias_finds_fantasypros_codes(db, code, expected):
     # ff_rankings_draft stores LAR (Nacua, Kupp) and JAC (Etienne)
     assert _n(tools.nfl_fantasy_rankings(team=code), "fantasy_rankings") == expected
@@ -402,12 +396,9 @@ def test_fantasy_rankings_alias_finds_fantasypros_codes(db, code, expected):
 # ── 3. Unknown team code ──────────────────────────────────────────────────────
 
 _UNK = [(t, c) for t in TEAM_TOOLS for c in ("XX", "KCC", "", 12)]
-# Pass today: nfl_team_records already uses canonical_team; nfl_search_plays(team=12) hits a
-# DuckDB conversion error that is returned as {"error": ...}.
-_UNK_PASS = {"nfl_team_records-XX", "nfl_team_records-KCC", "nfl_team_records-", "nfl_search_plays-12"}
 
 
-@pytest.mark.parametrize("tool,code", _params(_UNK, {"-".join(map(str, c)) for c in _UNK} - _UNK_PASS))
+@pytest.mark.parametrize("tool,code", _params(_UNK))
 def test_unknown_team_returns_error(db, tool, code):
     res = TEAM_TOOLS[tool][0](code)
     assert isinstance(res, dict) and "error" in res, res
@@ -417,11 +408,9 @@ def test_unknown_team_returns_error(db, tool, code):
 
 # ── 4. season_type on nfl_schedule and nfl_snap_counts ───────────────────────
 
-_XST = pytest.mark.xfail(strict=True, reason="group H: season_type helper (POST -> WC/DIV/CON/SB)")
-
 
 @pytest.mark.parametrize("value,expected", [
-    pytest.param("POST", 5, marks=_XST), pytest.param("post", 5, marks=_XST),
+    ("POST", 5), ("post", 5),
     ("WC", 2), ("DIV", 1), ("CON", 1), ("SB", 1), ("REG", 3), ("reg", 3), ("sb", 1)])
 def test_schedule_season_type_2024(db, value, expected):
     # 2024: REG 3, WC 2, DIV 1, CON 1, SB 1 -> POST 5
@@ -429,7 +418,6 @@ def test_schedule_season_type_2024(db, value, expected):
     assert _n(res, "games") == expected
 
 
-@pytest.mark.xfail(strict=True, reason="group H: season_type helper (POST -> WC/DIV/CON/SB)")
 def test_schedule_post_kc_has_one_game_per_round(db):
     res = tools.nfl_schedule(team="KC", season=2024, season_type="POST")
     assert sorted(g["game_type"] for g in res["games"]) == ["CON", "DIV", "SB", "WC"]
@@ -440,7 +428,6 @@ def test_schedule_reg_excludes_playoffs(db):
     assert {g["game_type"] for g in res["games"]} == {"REG"} and res["count"] == 3
 
 
-@pytest.mark.xfail(strict=True, reason="group H: season_type validation")
 @pytest.mark.parametrize("value", ["XYZ", "playoffs"])
 def test_schedule_unknown_season_type_lists_allowed(db, value):
     res = tools.nfl_schedule(season=2024, season_type=value)
@@ -449,7 +436,6 @@ def test_schedule_unknown_season_type_lists_allowed(db, value):
         assert allowed in res["error"]
 
 
-@pytest.mark.xfail(strict=True, reason="group H: nfl_snap_counts gains season_type")
 @pytest.mark.parametrize("value,expected", [("POST", 5), ("post", 5), ("SB", 2), ("WC", 1), ("REG", 2)])
 def test_snap_counts_season_type(db, value, expected):
     # KC 2024 snaps: REG 2, WC 1, DIV 1, CON 1, SB 2 -> POST 5
@@ -457,7 +443,6 @@ def test_snap_counts_season_type(db, value, expected):
     assert _n(res, "snap_counts") == expected
 
 
-@pytest.mark.xfail(strict=True, reason="group H: nfl_snap_counts gains season_type")
 def test_snap_counts_unknown_season_type_errors(db):
     res = tools.nfl_snap_counts(team="KC", **{"season_type": "XYZ"})
     assert "error" in res and "POST" in res["error"]
@@ -465,17 +450,14 @@ def test_snap_counts_unknown_season_type_errors(db):
 
 # ── 5. season_type on play-based tools ────────────────────────────────────────
 
-_XPT = pytest.mark.xfail(strict=True, reason="group H: REG/POST upper-cased and validated for plays")
-
 
 @pytest.mark.parametrize("value,expected", [
-    ("REG", KC_REG_PLAYS), pytest.param("reg", KC_REG_PLAYS, marks=_XPT),
-    ("POST", KC_POST_PLAYS), pytest.param("post", KC_POST_PLAYS, marks=_XPT)])
+    ("REG", KC_REG_PLAYS), ("reg", KC_REG_PLAYS),
+    ("POST", KC_POST_PLAYS), ("post", KC_POST_PLAYS)])
 def test_search_plays_season_type_case(db, value, expected):
     assert _n(tools.nfl_search_plays(team="KC", season_type=value), "rows") == expected
 
 
-@_XPT
 def test_player_stats_season_type_lower_equals_upper(db):
     upper = tools.nfl_player_stats(player_name="Patrick Mahomes", season_type="REG")
     lower = tools.nfl_player_stats(player_name="Patrick Mahomes", season_type="reg")
@@ -483,7 +465,6 @@ def test_player_stats_season_type_lower_equals_upper(db):
     assert lower["seasons"] == upper["seasons"]
 
 
-@_XPT
 def test_compare_player_season_type_lower_equals_upper(db):
     kw = dict(compare_type="player")
     upper = tools.nfl_compare("Patrick Mahomes", "Travis Kelce", season_type="REG", **kw)
@@ -498,7 +479,6 @@ def test_ftn_charting_season_type_case(db, value):
     assert tools.nfl_ftn_charting(team="KC", season_type=value)["total_plays"] == KC_REG_PLAYS
 
 
-@_XPT
 @pytest.mark.parametrize("tool", ["search_plays", "player_stats", "ftn_charting", "compare"])
 def test_plays_tools_reject_sb(db, tool):
     calls = {
@@ -514,7 +494,6 @@ def test_plays_tools_reject_sb(db, tool):
 
 # ── 6. Zero is a filter, not "no filter" ──────────────────────────────────────
 
-_XZ = pytest.mark.xfail(strict=True, reason="group H: explicit None checks (0 is a value)")
 # tool -> (call(**kw), key, unfiltered hand count)
 _ZERO = {
     "search_plays": (lambda **k: tools.nfl_search_plays(**k), "rows", N_PLAYS),
@@ -526,7 +505,6 @@ _ZERO = {
 }
 
 
-@_XZ
 @pytest.mark.parametrize("tool,arg", [(t, "season") for t in _ZERO]
                          + [(t, "week") for t in ("search_plays", "injuries", "schedule", "snap_counts")])
 def test_zero_season_or_week_is_applied(db, tool, arg):
@@ -544,7 +522,6 @@ def test_min_yards_zero_is_applied(db, team, expected):
 
 # ── 7. Out-of-range season or week gives a reason ─────────────────────────────
 
-_XR = pytest.mark.xfail(strict=True, reason="group H: out-of-range reason")
 _RANGE = {
     "search_plays": (lambda: tools.nfl_search_plays(season=2030), "rows"),
     "player_stats": (lambda: tools.nfl_player_stats(player_name="Patrick Mahomes", season=2030), "seasons"),
@@ -554,7 +531,6 @@ _RANGE = {
 }
 
 
-@_XR
 @pytest.mark.parametrize("tool", list(_RANGE))
 def test_season_out_of_range_reason_names_loaded_range(db, tool):
     call, key = _RANGE[tool]
@@ -564,7 +540,6 @@ def test_season_out_of_range_reason_names_loaded_range(db, tool):
     assert "2015" in res["reason"] and "2024" in res["reason"]  # synthetic range 2015-2024
 
 
-@_XR
 @pytest.mark.parametrize("kw", [{"season": 2024, "week": 25}, {"week": 25}], ids=["2024", "any"])
 def test_week_out_of_range_reason(db, kw):
     res = tools.nfl_search_plays(**kw)
@@ -574,7 +549,6 @@ def test_week_out_of_range_reason(db, kw):
 
 # ── 8. Empty / None / malformed arguments return an error ─────────────────────
 
-_XE = pytest.mark.xfail(strict=True, reason="group H: argument hygiene (error, never raise)")
 _BAD = {
     "team_stats_none": lambda: tools.nfl_team_stats(None),
     "team_stats_empty": lambda: tools.nfl_team_stats(""),
@@ -591,7 +565,6 @@ _BAD = {
 }
 
 
-@_XE
 @pytest.mark.parametrize("case", list(_BAD))
 def test_bad_argument_returns_error(db, case):
     res = _BAD[case]()
@@ -599,7 +572,7 @@ def test_bad_argument_returns_error(db, case):
 
 
 @pytest.mark.parametrize("value,expected", [
-    pytest.param("false", N_PLAYS, marks=_XE), pytest.param("FALSE", N_PLAYS, marks=_XE),
+    ("false", N_PLAYS), ("FALSE", N_PLAYS),
     ("true", N_TD_PLAYS), (True, N_TD_PLAYS), (False, N_PLAYS)])
 def test_is_touchdown_string_booleans_parse(db, value, expected):
     # 17 plays, 2 touchdowns (plays 11, 15)
@@ -608,14 +581,12 @@ def test_is_touchdown_string_booleans_parse(db, value, expected):
 
 # ── 9. nfl_compare team mode keys ─────────────────────────────────────────────
 
-@pytest.mark.xfail(strict=True, reason="group H: compare keys by canonical code")
 @pytest.mark.parametrize("a,b,ka,kb", [("kc", "buf", "KC", "BUF"), (" Kc", "oak", "KC", "LV")])
 def test_compare_team_keys_are_canonical(db, a, b, ka, kb):
     res = tools.nfl_compare(a, b)
     assert ka in res and kb in res and a not in res and b not in res
 
 
-@pytest.mark.xfail(strict=True, reason="group H: compare same franchise is an error")
 @pytest.mark.parametrize("a,b", [("KC", "KC"), ("KC", "kc"), ("OAK", "LV")])
 def test_compare_team_with_itself_errors(db, a, b):
     assert "error" in tools.nfl_compare(a, b)
@@ -660,7 +631,6 @@ _KC_GAMES = ("SELECT COUNT(*) FROM schedules WHERE season = 2024 "
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="group H: season_type helper (POST -> WC/DIV/CON/SB)")
 def test_integration_schedule_kc_2024_post():
     path = _real_db()
     expected = _scalar(path, _KC_GAMES + "('WC', 'DIV', 'CON', 'SB')")
@@ -680,7 +650,6 @@ def test_integration_schedule_kc_2024_reg(value):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="group H: team helper (canonical_team, strip, upper)")
 def test_integration_search_plays_lowercase_team():
     _real_db()
     res = tools.nfl_search_plays(team="kc", season=2024, max_rows=5)
@@ -688,7 +657,6 @@ def test_integration_search_plays_lowercase_team():
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="group H: alias expansion (LA -> LAR in ff_rankings)")
 def test_integration_fantasy_rankings_la_finds_lar():
     path = _real_db()
     n_lar = _scalar(path, "SELECT COUNT(*) FROM ff_rankings_draft WHERE team = 'LAR'")
@@ -698,7 +666,6 @@ def test_integration_fantasy_rankings_la_finds_lar():
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="group H: nfl_snap_counts gains season_type")
 def test_integration_snap_counts_kc_2024_sb():
     path = _real_db()
     expected = _scalar(path, "SELECT COUNT(*) FROM snap_counts WHERE season = 2024 "

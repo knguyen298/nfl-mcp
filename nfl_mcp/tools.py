@@ -11,6 +11,7 @@ NFL MCP Server tools:
 """
 
 import difflib
+import functools
 import logging
 import math
 import os
@@ -29,8 +30,8 @@ from .database import get_db_connection
 from .franchises import (
     RECORDS_FIRST_NFLVERSE_SEASON,
     availability,
-    canonical_team,
     era_name,
+    team_codes,
 )
 from .schema_pbp import _SCHEMA_SUMMARY, _SCHEMA_CATEGORIES
 
@@ -41,6 +42,191 @@ logger = logging.getLogger("nfl-mcp")
 
 _MAX_ROWS = 500
 _QUERY_TIMEOUT_SECONDS = 10
+
+
+# ── Argument handling ──────────────────────────────────────────────────────────
+# Shared by every tool that filters on a team, a season, a week, a season type or a
+# number. A bad value raises _BadArgument; @_checked turns it into an error dict.
+
+class _BadArgument(Exception):
+    """An argument failed validation. as_error() is the dict the tool returns."""
+
+    def __init__(self, message: str, code: str = "INVALID_ARGUMENT"):
+        super().__init__(message)
+        self.code = code
+
+    def as_error(self) -> dict[str, Any]:
+        return {"error": str(self), "code": self.code}
+
+
+def _checked(fn):
+    """Decorator for a tool: a _BadArgument raised inside becomes {"error", "code"}."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except _BadArgument as e:
+            return e.as_error()
+    return wrapper
+
+
+def _int_arg(name: str, value: Any) -> int | None:
+    """None stays None. An int, an integral float or a numeric string gives an int; 0 is a value."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise _BadArgument(f"{name} must be an integer, got {value!r}")
+    try:
+        if isinstance(value, float):
+            if not value.is_integer():
+                raise ValueError
+            return int(value)
+        return int(str(value).strip())
+    except (TypeError, ValueError, OverflowError):
+        raise _BadArgument(f"{name} must be an integer, got {value!r}") from None
+
+
+def _num_arg(name: str, value: Any) -> float | None:
+    """None stays None. A finite number or numeric string gives a float; 0 is a value."""
+    if value is None:
+        return None
+    try:
+        number = None if isinstance(value, bool) else float(value)
+    except (TypeError, ValueError):
+        number = None
+    if number is None or not math.isfinite(number):
+        raise _BadArgument(f"{name} must be a number, got {value!r}")
+    return number
+
+
+def _bool_arg(name: str, value: Any, default: bool | None = False) -> bool | None:
+    """True or False, or default for None. The strings "true" and "false" (any case) parse."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise _BadArgument(f"{name} must be true or false, got {value!r}")
+
+
+def _choice_arg(name: str, value: Any, allowed: Sequence[str]) -> str | None:
+    """None stays None. Otherwise a case-insensitive match against allowed, else an error."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in allowed:
+        return value.strip().lower()
+    raise _BadArgument(f"Unknown {name} '{value}'. Use one of: {', '.join(allowed)}.")
+
+
+def _team_codes(value: Any, name: str = "team", required: bool = False) -> tuple[str, ...] | None:
+    """Every stored code of the franchise a team value names, or None for None (no filter).
+
+    Strips and upper-cases, and accepts historical codes (OAK, SD, STL, JAC, WSH), so the
+    caller filters on all the codes that franchise was stored under. "" and unknown values
+    raise UNKNOWN_TEAM; a missing required value raises MISSING_ARGUMENT.
+    """
+    if value is None:
+        if required:
+            raise _BadArgument(f"{name} is required", "MISSING_ARGUMENT")
+        return None
+    codes = team_codes(value)
+    if codes is None:
+        raise _BadArgument(f"Unknown team '{value}'", "UNKNOWN_TEAM")
+    return codes
+
+
+def _in_clause(column: str, values: Sequence[str]) -> tuple[str, list[str]]:
+    """'col = ?' for one value, 'col IN (?, ?)' for several."""
+    if len(values) == 1:
+        return f"{column} = ?", list(values)
+    return f"{column} IN ({', '.join('?' for _ in values)})", list(values)
+
+
+def _team_filter(column: str, value: Any, name: str = "team") -> tuple[str, list[str]] | None:
+    """(condition, params) matching a team value on column across the franchise's codes, or None."""
+    codes = _team_codes(value, name)
+    return None if codes is None else _in_clause(column, codes)
+
+
+_PLAYOFF_ROUNDS = ("WC", "DIV", "CON", "SB")
+_GAME_TYPES = ("REG", *_PLAYOFF_ROUNDS)
+
+
+def _game_types(value: Any) -> tuple[str, ...] | None:
+    """game_type values for a schedules or snap_counts season_type: POST is WC, DIV, CON and SB."""
+    if value is None:
+        return None
+    key = value.strip().upper() if isinstance(value, str) else None
+    if key == "POST":
+        return _PLAYOFF_ROUNDS
+    if key in _GAME_TYPES:
+        return (key,)
+    raise _BadArgument(f"Unknown season_type '{value}'. Use one of: REG, POST, WC, DIV, CON, SB.")
+
+
+def _play_season_type(value: Any) -> str | None:
+    """REG or POST for the plays table (season_type there is only REG or POST), else an error."""
+    if value is None:
+        return None
+    key = value.strip().upper() if isinstance(value, str) else None
+    if key in ("REG", "POST"):
+        return key
+    raise _BadArgument(
+        f"Unknown season_type '{value}'. Use REG or POST; plays are stored as REG or POST only.")
+
+
+def _range_reason(
+    table: str,
+    *,
+    season: int | None = None,
+    season_from: int | None = None,
+    season_to: int | None = None,
+    week: int | None = None,
+    season_col: str = "season",
+) -> str | None:
+    """Why a season or week filter found nothing: it lies outside what `table` holds.
+
+    Call it only when a query returned no rows. Returns None when the filter is inside the
+    loaded range or the range cannot be read.
+    """
+    if season is None and season_from is None and season_to is None and week is None:
+        return None
+    try:
+        span = _execute(f"SELECT MIN({season_col}) AS lo, MAX({season_col}) AS hi FROM {table}")[0]
+        lo, hi = span["lo"], span["hi"]
+        if lo is None or hi is None:
+            return None
+        reasons = []
+        if season is not None and not lo <= season <= hi:
+            reasons.append(f"Season {season} is outside the loaded range {lo} to {hi}.")
+        if season_from is not None and season_from > hi:
+            reasons.append(f"season_from {season_from} is after the last loaded season ({hi}).")
+        if season_to is not None and season_to < lo:
+            reasons.append(f"season_to {season_to} is before the first loaded season ({lo}).")
+        if week is not None:
+            scoped = season is not None and lo <= season <= hi
+            sql = f"SELECT MIN(week) AS lo, MAX(week) AS hi FROM {table}"
+            if scoped:
+                sql += f" WHERE {season_col} = ?"
+            weeks = _execute(sql, [season] if scoped else None)[0]
+            if weeks["lo"] is not None and not weeks["lo"] <= week <= weeks["hi"]:
+                where = f" for {season}" if scoped else ""
+                reasons.append(
+                    f"Week {week} is outside the loaded range {weeks['lo']} to {weeks['hi']}{where}.")
+        return " ".join(reasons) or None
+    except Exception:  # a reason is best effort; never let it hide the real (empty) result
+        logger.debug("Range lookup failed for %s", table, exc_info=True)
+        return None
+
+
+def _with_reason(result: dict[str, Any], rows: Any, table: str, **filters: Any) -> dict[str, Any]:
+    """Add "reason" to an empty result when the season or week filter is out of range."""
+    if not rows:
+        reason = _range_reason(table, **filters)
+        if reason:
+            result["reason"] = reason
+    return result
 
 
 # ── Player identity ────────────────────────────────────────────────────────────
@@ -644,6 +830,7 @@ def nfl_query(sql: str, max_rows: int = 100) -> Dict[str, Any]:
     }
 
 
+@_checked
 def nfl_search_plays(
     team: str | None = None,
     opponent: str | None = None,
@@ -661,14 +848,22 @@ def nfl_search_plays(
     max_rows: int = 50,
 ) -> Dict[str, Any]:
     """Search for plays using structured filters instead of raw SQL."""
+    season, season_from, season_to = (_int_arg(n, v) for n, v in (
+        ("season", season), ("season_from", season_from), ("season_to", season_to)))
+    week, min_yards, max_rows = (_int_arg(n, v) for n, v in (
+        ("week", week), ("min_yards", min_yards), ("max_rows", max_rows)))
+    season_type = _play_season_type(season_type)
+    situation = _choice_arg(
+        "situation", situation, ("red_zone", "third_down", "fourth_down", "two_minute"))
+    is_touchdown = _bool_arg("is_touchdown", is_touchdown)
+    is_turnover = _bool_arg("is_turnover", is_turnover)
     conditions = []
     params: list[Any] = []
-    if team:
-        conditions.append("posteam = ?")
-        params.append(team)
-    if opponent:
-        conditions.append("defteam = ?")
-        params.append(opponent)
+    for column, value, label in (("posteam", team, "team"), ("defteam", opponent, "opponent")):
+        clause = _team_filter(column, value, label)
+        if clause:
+            conditions.append(clause[0])
+            params.extend(clause[1])
     if player:
         player = _normalize_player_name(player)
         conditions.append(
@@ -678,18 +873,18 @@ def nfl_search_plays(
         )
         pattern = f"%{player}%"
         params.extend([pattern, pattern, pattern])
-    if season:
+    if season is not None:
         conditions.append("season = ?")
-        params.append(int(season))
-    if season_from:
+        params.append(season)
+    if season_from is not None:
         conditions.append("season >= ?")
-        params.append(int(season_from))
-    if season_to:
+        params.append(season_from)
+    if season_to is not None:
         conditions.append("season <= ?")
-        params.append(int(season_to))
-    if week:
+        params.append(season_to)
+    if week is not None:
         conditions.append("week = ?")
-        params.append(int(week))
+        params.append(week)
     if season_type:
         conditions.append("season_type = ?")
         params.append(season_type)
@@ -710,10 +905,10 @@ def nfl_search_plays(
         conditions.append("(interception = 1 OR fumble_lost = 1)")
     if min_yards is not None:
         conditions.append("yards_gained >= ?")
-        params.append(int(min_yards))
+        params.append(min_yards)
 
     where = " AND ".join(conditions) if conditions else "1=1"
-    max_rows = min(max_rows, _MAX_ROWS)
+    max_rows = min(max_rows if max_rows is not None else 50, _MAX_ROWS)
 
     sql = (
         f"SELECT season, week, posteam, defteam, down, ydstogo, play_type, "
@@ -725,7 +920,8 @@ def nfl_search_plays(
 
     try:
         rows = _execute(sql, params)
-        return {"rows": rows, "row_count": len(rows)}
+        return _with_reason({"rows": rows, "row_count": len(rows)}, rows, "plays",
+                            season=season, season_from=season_from, season_to=season_to, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -740,16 +936,20 @@ def _team_stats_filter(
     """WHERE fragment and params for the derived team tables ('ALL' keeps both season types)."""
     clause = ""
     params: list[Any] = []
-    if season:
+    season, season_from, season_to = (_int_arg(n, v) for n, v in (
+        ("season", season), ("season_from", season_from), ("season_to", season_to)))
+    if season is not None:
         clause += " AND season_year = ?"
-        params.append(int(season))
-    if season_from:
+        params.append(season)
+    if season_from is not None:
         clause += " AND season_year >= ?"
-        params.append(int(season_from))
-    if season_to:
+        params.append(season_from)
+    if season_to is not None:
         clause += " AND season_year <= ?"
-        params.append(int(season_to))
-    season_type = (season_type or "REG").upper()
+        params.append(season_to)
+    season_type = "REG" if season_type is None else str(season_type).strip().upper()
+    if season_type not in ("REG", "POST", "ALL"):
+        raise _BadArgument(f"Unknown season_type '{season_type}'. Use REG, POST or ALL.")
     if season_type != "ALL":
         clause += " AND season_type = ?"
         params.append(season_type)
@@ -774,30 +974,33 @@ _STALE_ERROR = {
 
 def _team_rows(
     table: str,
-    team: str,
+    codes: Sequence[str],
     filters: tuple[int | None, int | None, int | None, str | None],
     tail: str = "",
 ) -> tuple[list[dict], bool]:
-    """Rows of one derived team table, and whether the table lacks season_type (not rebuilt yet).
+    """Rows of one derived team table for a franchise's codes, and whether the table lacks
+    season_type (not rebuilt yet).
 
     On a table without season_type only the default REG falls back to unfiltered rows
     (flagged by the caller); any other season_type raises _StaleDerivedTables.
     """
     clause, params = _team_stats_filter(*filters)
+    team_sql, team_params = _in_clause("team", codes)
     try:
-        sql = (f"SELECT * FROM {table} WHERE team = ?{clause} "
+        sql = (f"SELECT * FROM {table} WHERE {team_sql}{clause} "
                f"ORDER BY season_year, season_type DESC{tail}")
-        return _execute(sql, [team, *params]), False
+        return _execute(sql, [*team_params, *params]), False
     except duckdb.BinderException as e:
         if "season_type" not in str(e):
             raise
         if (filters[3] or "REG").upper() != "REG":
             raise _StaleDerivedTables() from e
     clause, params = _team_stats_filter(*filters[:3], "ALL")
-    sql = f"SELECT * FROM {table} WHERE team = ?{clause} ORDER BY season_year{tail}"
-    return _execute(sql, [team, *params]), True
+    sql = f"SELECT * FROM {table} WHERE {team_sql}{clause} ORDER BY season_year{tail}"
+    return _execute(sql, [*team_params, *params]), True
 
 
+@_checked
 def nfl_team_stats(
     team: str,
     season: int | None = None,
@@ -807,27 +1010,34 @@ def nfl_team_stats(
     season_type: str = "REG",
 ) -> Dict[str, Any]:
     """Get pre-aggregated team stats (offense, defense, or both) for REG, POST, or ALL games."""
-    team = team.upper()
+    codes = _team_codes(team, required=True)
+    side = _choice_arg("side", "both" if side is None else side,
+                       ("offense", "defense", "situational", "both"))
     results = {}
     filters = (season, season_from, season_to, season_type)
+    _team_stats_filter(*filters)  # validate before any query
 
     try:
         stale = False
         if side in ("offense", "both"):
-            results["offense"], old = _team_rows("team_offense_stats", team, filters)
+            results["offense"], old = _team_rows("team_offense_stats", codes, filters)
             stale = stale or old
 
         if side in ("defense", "both"):
-            results["defense"], old = _team_rows("team_defense_stats", team, filters)
+            results["defense"], old = _team_rows("team_defense_stats", codes, filters)
             stale = stale or old
 
         if side in ("situational", "both"):
-            results["situational"], old = _team_rows("situational_stats", team, filters, ", situation")
+            results["situational"], old = _team_rows("situational_stats", codes, filters, ", situation")
             stale = stale or old
 
         if stale:
             results["warning"] = _STALE_TEAM_TABLES
-        return results
+        return _with_reason(
+            results, any(results.get(k) for k in ("offense", "defense", "situational")),
+            "team_offense_stats", season=_int_arg("season", season),
+            season_from=_int_arg("season_from", season_from),
+            season_to=_int_arg("season_to", season_to), season_col="season_year")
     except _StaleDerivedTables:
         return dict(_STALE_ERROR)
     except (duckdb.Error, ValueError, TimeoutError) as e:
@@ -984,18 +1194,21 @@ def _player_seasons(
     """Per season and season type passing, rushing and receiving stats for one gsis_id."""
     sql = _PLAYER_STATS_SQL
     params: list[Any] = [gsis_id]
+    season, season_from, season_to = (_int_arg(n, v) for n, v in (
+        ("season", season), ("season_from", season_from), ("season_to", season_to)))
+    season_type = _play_season_type(season_type)
     if season is not None:
         sql += " AND season = ?"
-        params.append(int(season))
+        params.append(season)
     if season_from is not None:
         sql += " AND season >= ?"
-        params.append(int(season_from))
+        params.append(season_from)
     if season_to is not None:
         sql += " AND season <= ?"
-        params.append(int(season_to))
+        params.append(season_to)
     if season_type:
         sql += " AND season_type = ?"
-        params.append(str(season_type).upper())
+        params.append(season_type)
     sql += (" GROUP BY season, season_type"
             " ORDER BY season, CASE season_type WHEN 'REG' THEN 0 ELSE 1 END, season_type")
     return [_season_row(row) for row in _execute(sql, params)]
@@ -1004,6 +1217,7 @@ def _player_seasons(
 _STAT_BLOCKS = ("passing", "rushing", "receiving")
 
 
+@_checked
 def nfl_player_stats(
     player_name: str | None = None,
     player_id: str | None = None,
@@ -1019,6 +1233,9 @@ def nfl_player_stats(
     """
     if stat_type is not None and stat_type not in _STAT_BLOCKS:
         return {"error": f"Unknown stat_type: {stat_type}. Use 'passing', 'rushing', or 'receiving'."}
+    season, season_from, season_to = (_int_arg(n, v) for n, v in (
+        ("season", season), ("season_from", season_from), ("season_to", season_to)))
+    season_type = _play_season_type(season_type)
     try:
         player, early = _resolve_player(
             player_name, player_id, season=season, season_from=season_from, season_to=season_to)
@@ -1034,8 +1251,10 @@ def nfl_player_stats(
     if stat_type:
         seasons = [{k: v for k, v in s.items() if k not in _STAT_BLOCKS or k == stat_type}
                    for s in seasons]
-    return {"player_id": player["gsis_id"], "player_name": player["display_name"],
-            "seasons": seasons, "definitions": dict(_STAT_DEFINITIONS)}
+    result = {"player_id": player["gsis_id"], "player_name": player["display_name"],
+              "seasons": seasons, "definitions": dict(_STAT_DEFINITIONS)}
+    return _with_reason(result, seasons, "plays",
+                        season=season, season_from=season_from, season_to=season_to)
 
 
 def _compare_teams(
@@ -1048,19 +1267,31 @@ def _compare_teams(
 ) -> dict[str, Any]:
     """Team side of nfl_compare: offense and defense rows for each team under one filter."""
     filters = (season, season_from, season_to, season_type)
-    shown = (season_type or "REG").upper()
+    _team_stats_filter(*filters)  # validate before any query
+    shown = "REG" if season_type is None else str(season_type).strip().upper()
+    first, second = (_team_codes(e, n, required=True)
+                     for e, n in ((entity1, "entity1"), (entity2, "entity2")))
+    if first[0] == second[0]:
+        raise _BadArgument(
+            f"'{entity1}' and '{entity2}' are the same franchise ({first[0]}). Compare two different teams.")
     result: dict[str, Any] = {}
-    for label in (entity1, entity2):
-        team = label.upper()
-        offense, old_off = _team_rows("team_offense_stats", team, filters)
-        defense, old_def = _team_rows("team_defense_stats", team, filters)
+    for codes in (first, second):
+        team = codes[0]
+        offense, old_off = _team_rows("team_offense_stats", codes, filters)
+        defense, old_def = _team_rows("team_defense_stats", codes, filters)
         entry: dict[str, Any] = {"offense": offense, "defense": defense}
         if old_off or old_def:
             entry["warning"] = _STALE_TEAM_TABLES
         if not offense and not defense:
-            scope = f" in {season}" if season else ""
+            scope = f" in {season}" if season is not None else ""
             entry["reason"] = f"No {shown} team stats for {team}{scope} with the filters given"
-        result[label] = entry
+            outside = _range_reason(
+                "team_offense_stats", season_col="season_year", season=_int_arg("season", season),
+                season_from=_int_arg("season_from", season_from),
+                season_to=_int_arg("season_to", season_to))
+            if outside:
+                entry["reason"] += f". {outside}"
+        result[team] = entry
     return result
 
 
@@ -1084,15 +1315,15 @@ def _compare_players(
             entries.append({"player_id": None, "player_name": entity, "seasons": [],
                             "reason": f"No player matches '{entity}'. Try nfl_player_lookup."})
             continue
-        entries.append({
-            "player_id": player["gsis_id"],
-            "player_name": player["display_name"],
-            "seasons": _player_seasons(
-                player["gsis_id"], season, season_from, season_to, season_type),
-        })
+        seasons = _player_seasons(player["gsis_id"], season, season_from, season_to, season_type)
+        entries.append(_with_reason(
+            {"player_id": player["gsis_id"], "player_name": player["display_name"], "seasons": seasons},
+            seasons, "plays", season=_int_arg("season", season),
+            season_from=_int_arg("season_from", season_from), season_to=_int_arg("season_to", season_to)))
     return {"players": entries, "definitions": dict(_STAT_DEFINITIONS)}
 
 
+@_checked
 def nfl_compare(
     entity1: str,
     entity2: str,
@@ -1209,6 +1440,7 @@ def nfl_catalog() -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+@_checked
 def nfl_roster(
     team: str | None = None,
     season: int | None = None,
@@ -1218,13 +1450,15 @@ def nfl_roster(
     Look up roster data — who was on a team's roster in a given season.
     Returns name, position, status, jersey number, experience, and measurables.
     """
+    season = _int_arg("season", season)
     conditions, params = [], []
-    if team:
-        conditions.append("team = ?")
-        params.append(team.upper())
-    if season:
+    clause = _team_filter("team", team)
+    if clause:
+        conditions.append(clause[0])
+        params.extend(clause[1])
+    if season is not None:
         conditions.append("season = ?")
-        params.append(int(season))
+        params.append(season)
     if position:
         conditions.append("position ILIKE ?")
         params.append(position.upper())
@@ -1240,12 +1474,13 @@ def nfl_roster(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return {"players": rows, "count": len(rows)}
+        return _with_reason({"players": rows, "count": len(rows)}, rows, "rosters", season=season)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
 
 
+@_checked
 def nfl_injuries(
     team: str | None = None,
     season: int | None = None,
@@ -1257,16 +1492,18 @@ def nfl_injuries(
     Look up injury report data. Filter by team, season, week, player name, or
     report status (e.g. 'Out', 'Questionable', 'Doubtful', 'Full Participation').
     """
+    season, week = _int_arg("season", season), _int_arg("week", week)
     conditions, params = [], []
-    if team:
-        conditions.append("team = ?")
-        params.append(team.upper())
-    if season:
+    clause = _team_filter("team", team)
+    if clause:
+        conditions.append(clause[0])
+        params.extend(clause[1])
+    if season is not None:
         conditions.append("season = ?")
-        params.append(int(season))
-    if week:
+        params.append(season)
+    if week is not None:
         conditions.append("week = ?")
-        params.append(int(week))
+        params.append(week)
     if player:
         conditions.append("full_name ILIKE ?")
         params.append(f"%{player}%")
@@ -1286,12 +1523,14 @@ def nfl_injuries(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return {"injuries": rows, "count": len(rows)}
+        return _with_reason({"injuries": rows, "count": len(rows)}, rows, "injuries",
+                            season=season, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
 
 
+@_checked
 def nfl_schedule(
     team: str | None = None,
     season: int | None = None,
@@ -1302,20 +1541,24 @@ def nfl_schedule(
     Look up game schedules and results. Filter by team, season, week, or season type.
     Returns scores, spread lines, weather, stadium, and coaching info.
     """
+    season, week = _int_arg("season", season), _int_arg("week", week)
+    game_types = _game_types(season_type)
     conditions, params = [], []
-    if team:
-        t = team.upper()
-        conditions.append("(home_team = ? OR away_team = ?)")
-        params.extend([t, t])
-    if season:
+    codes = _team_codes(team)
+    if codes:
+        home, away = _in_clause("home_team", codes), _in_clause("away_team", codes)
+        conditions.append(f"({home[0]} OR {away[0]})")
+        params.extend([*home[1], *away[1]])
+    if season is not None:
         conditions.append("season = ?")
-        params.append(int(season))
-    if week:
+        params.append(season)
+    if week is not None:
         conditions.append("week = ?")
-        params.append(int(week))
-    if season_type:
-        conditions.append("game_type = ?")
-        params.append(season_type.upper())
+        params.append(week)
+    if game_types:
+        clause = _in_clause("game_type", game_types)
+        conditions.append(clause[0])
+        params.extend(clause[1])
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
@@ -1331,7 +1574,8 @@ def nfl_schedule(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return {"games": rows, "count": len(rows)}
+        return _with_reason({"games": rows, "count": len(rows)}, rows, "schedules",
+                            season=season, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1339,6 +1583,7 @@ def nfl_schedule(
 
 # ── Team records (1970–present) ───────────────────────────────────────────────
 
+@_checked
 def nfl_team_records(
     team: str | None = None,
     season: int | None = None,
@@ -1355,17 +1600,18 @@ def nfl_team_records(
     a franchise ESPN's archive does not cover is reported as record_not_available rather
     than estimated.
     """
-    if not team and season is None and from_season is None and to_season is None:
+    season, from_season, to_season = (_int_arg(n, v) for n, v in (
+        ("season", season), ("from_season", from_season), ("to_season", to_season)))
+    if team is None and season is None and from_season is None and to_season is None:
         return {"error": "Provide team, season, or a from_season/to_season range."}
 
-    key = canonical_team(team) if team else None
-    if team and key is None:
-        return {"error": f"Unknown team '{team}'."}
+    codes = _team_codes(team)
+    key = codes[0] if codes else None
 
     if key and season is not None:
         note = availability(key, season)
         if note:
-            return {"team": key, "season": int(season), "records": [], "count": 0, **note}
+            return {"team": key, "season": season, "records": [], "count": 0, **note}
 
     conditions: list[str] = []
     params: list[Any] = []
@@ -1374,13 +1620,13 @@ def nfl_team_records(
         params.append(key)
     if season is not None:
         conditions.append("season = ?")
-        params.append(int(season))
+        params.append(season)
     if from_season is not None:
         conditions.append("season >= ?")
-        params.append(int(from_season))
+        params.append(from_season)
     if to_season is not None:
         conditions.append("season <= ?")
-        params.append(int(to_season))
+        params.append(to_season)
     where = " AND ".join(conditions) or "1=1"
 
     sql = f"""
@@ -1413,6 +1659,7 @@ def nfl_team_records(
     return result
 
 
+@_checked
 def nfl_snap_counts(
     player: str | None = None,
     team: str | None = None,
@@ -1420,14 +1667,18 @@ def nfl_snap_counts(
     week: int | None = None,
     position: str | None = None,
     player_id: str | None = None,
+    season_type: str | None = None,
 ) -> Dict[str, Any]:
     """
     Look up snap count data — how many snaps a player or team unit played.
     Returns offense, defense, and special teams snap counts and percentages.
     player matches the full names stored in snap_counts ('Travis Kelce' or 'Kelce'),
     ignoring case, accents and punctuation. player_id (gsis_id) maps through
-    players.pfr_id to snap_counts.pfr_player_id.
+    players.pfr_id to snap_counts.pfr_player_id. season_type is REG, POST, WC, DIV, CON or SB
+    (POST is the four playoff rounds).
     """
+    season, week = _int_arg("season", season), _int_arg("week", week)
+    game_types = _game_types(season_type)
     conditions, params = [], []
     try:
         if player_id:
@@ -1444,15 +1695,20 @@ def nfl_snap_counts(
             query = _fold(str(player), strip_suffix=True)
             conditions.append(f"{_fold_sql('player')} LIKE ?")
             params.append(f"%{query}%")
-        if team:
-            conditions.append("team = ?")
-            params.append(team.upper())
-        if season:
+        clause = _team_filter("team", team)
+        if clause:
+            conditions.append(clause[0])
+            params.extend(clause[1])
+        if season is not None:
             conditions.append("season = ?")
-            params.append(int(season))
-        if week:
+            params.append(season)
+        if week is not None:
             conditions.append("week = ?")
-            params.append(int(week))
+            params.append(week)
+        if game_types:
+            clause = _in_clause("game_type", game_types)
+            conditions.append(clause[0])
+            params.extend(clause[1])
         if position:
             conditions.append("position ILIKE ?")
             params.append(position.upper())
@@ -1468,12 +1724,14 @@ def nfl_snap_counts(
             LIMIT 500
         """
         rows = _execute(sql, params if params else None)
-        return {"snap_counts": rows, "count": len(rows)}
+        return _with_reason({"snap_counts": rows, "count": len(rows)}, rows, "snap_counts",
+                            season=season, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
 
 
+@_checked
 def nfl_fantasy_opportunity(
     player: str | None = None,
     team: str | None = None,
@@ -1486,6 +1744,9 @@ def nfl_fantasy_opportunity(
     Look up fantasy football opportunity data — target share, air yards share,
     carry share, and opportunity scores per player per week. Available 2006–present.
     """
+    season, week = _int_arg("season", season), _int_arg("week", week)
+    team_clause = _team_filter("posteam", team)
+    team = team.strip() if team else None
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
         player, player_id, "ff_opportunity", "full_name", team=team, season=season)
@@ -1494,15 +1755,15 @@ def nfl_fantasy_opportunity(
     if cond:
         conditions.append(cond)
         params.extend(cparams)
-    if team:
-        conditions.append("posteam = ?")
-        params.append(team.upper())
-    if season:
+    if team_clause:
+        conditions.append(team_clause[0])
+        params.extend(team_clause[1])
+    if season is not None:
         conditions.append("season = ?")
-        params.append(int(season))
-    if week:
+        params.append(season)
+    if week is not None:
         conditions.append("week = ?")
-        params.append(int(week))
+        params.append(week)
     if position:
         conditions.append("position ILIKE ?")
         params.append(position.upper())
@@ -1522,12 +1783,14 @@ def nfl_fantasy_opportunity(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return _with_player({"fantasy_opportunity": rows, "count": len(rows)}, resolved)
+        return _with_reason(_with_player({"fantasy_opportunity": rows, "count": len(rows)}, resolved),
+                            rows, "ff_opportunity", season=season, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
 
 
+@_checked
 def nfl_fantasy_rankings(
     player: str | None = None,
     position: str | None = None,
@@ -1576,9 +1839,10 @@ def nfl_fantasy_rankings(
     if position:
         conditions.append("pos ILIKE ?")
         params.append(position.upper())
-    if team:
-        conditions.append("team = ?")
-        params.append(team.upper())
+    team_clause = _team_filter("team", team)
+    if team_clause:
+        conditions.append(team_clause[0])
+        params.extend(team_clause[1])
     if ranking_set:
         conditions.append(f"{set_col} ILIKE ?")
         params.append(f"%{ranking_set}%")
@@ -1599,6 +1863,7 @@ def nfl_fantasy_rankings(
         return {"error": str(e)}
 
 
+@_checked
 def nfl_ftn_charting(
     team: str | None = None,
     opponent: str | None = None,
@@ -1622,12 +1887,16 @@ def nfl_ftn_charting(
     conditions = ["f.nflverse_game_id = p.game_id", "f.nflverse_play_id = p.play_id",
                   "p.play_type IN ('pass', 'run')"]
     params: list[Any] = []
-    if team:
-        conditions.append("p.posteam = ?")
-        params.append(team.upper())
-    if opponent:
-        conditions.append("p.defteam = ?")
-        params.append(opponent.upper())
+    season, season_from, season_to = (_int_arg(n, v) for n, v in (
+        ("season", season), ("season_from", season_from), ("season_to", season_to)))
+    week = _int_arg("week", week)
+    season_type = _play_season_type(season_type)
+    for column, value, label in (("p.posteam", team, "team"), ("p.defteam", opponent, "opponent")):
+        clause = _team_filter(column, value, label)
+        if clause:
+            conditions.append(clause[0])
+            params.extend(clause[1])
+    team = team.strip() if team else None
     resolved = None
     if player or player_id:
         try:
@@ -1645,21 +1914,21 @@ def nfl_ftn_charting(
         conditions.append(
             "(p.passer_player_id = ? OR p.rusher_player_id = ? OR p.receiver_player_id = ?)")
         params.extend([resolved["gsis_id"]] * 3)
-    if season:
+    if season is not None:
         conditions.append("p.season = ?")
-        params.append(int(season))
-    if season_from:
+        params.append(season)
+    if season_from is not None:
         conditions.append("p.season >= ?")
-        params.append(int(season_from))
-    if season_to:
+        params.append(season_from)
+    if season_to is not None:
         conditions.append("p.season <= ?")
-        params.append(int(season_to))
-    if week:
+        params.append(season_to)
+    if week is not None:
         conditions.append("p.week = ?")
-        params.append(int(week))
+        params.append(week)
     if season_type:
         conditions.append("p.season_type = ?")
-        params.append(season_type.upper())
+        params.append(season_type)
 
     where = " AND ".join(conditions)
     sql = f"""
@@ -1686,7 +1955,8 @@ def nfl_ftn_charting(
     agg = rows[0] if rows else {}
     total = agg.get("total_plays") or 0
     if not total:
-        return _with_player({"charting": {}, "total_plays": 0}, resolved)
+        return _with_reason(_with_player({"charting": {}, "total_plays": 0}, resolved), None, "plays",
+                            season=season, season_from=season_from, season_to=season_to, week=week)
 
     def _pct(n: Any) -> float:
         return round(100.0 * (n or 0) / total, 1)
@@ -1711,6 +1981,7 @@ def nfl_ftn_charting(
     }, resolved)
 
 
+@_checked
 def nfl_td_luck(
     player: str | None = None,
     position: str | None = None,
@@ -1730,6 +2001,9 @@ def nfl_td_luck(
     except (TypeError, ValueError):
         limit = 50
 
+    season = _int_arg("season", season)
+    team_clause = _team_filter("team", team)
+    team = team.strip() if team else None
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
         player, player_id, "player_td_luck", "full_name", team=team, season=season)
@@ -1741,12 +2015,12 @@ def nfl_td_luck(
     if position:
         conditions.append("position ILIKE ?")
         params.append(position.upper())
-    if team:
-        conditions.append("team = ?")
-        params.append(team.upper())
-    if season:
+    if team_clause:
+        conditions.append(team_clause[0])
+        params.extend(team_clause[1])
+    if season is not None:
         conditions.append("season = ?")
-        params.append(int(season))
+        params.append(season)
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
@@ -1761,12 +2035,14 @@ def nfl_td_luck(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return _with_player({"td_luck": rows, "count": len(rows)}, resolved)
+        return _with_reason(_with_player({"td_luck": rows, "count": len(rows)}, resolved),
+                            rows, "player_td_luck", season=season)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
 
 
+@_checked
 def nfl_role_trend(
     player: str | None = None,
     position: str | None = None,
@@ -1788,6 +2064,10 @@ def nfl_role_trend(
     except (TypeError, ValueError):
         limit = 50
 
+    season, week = _int_arg("season", season), _int_arg("week", week)
+    min_snap_pct = _num_arg("min_snap_pct", min_snap_pct)
+    team_clause = _team_filter("team", team)
+    team = team.strip() if team else None
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
         player, player_id, "player_role_trend", "full_name", team=team, season=season)
@@ -1799,18 +2079,18 @@ def nfl_role_trend(
     if position:
         conditions.append("position ILIKE ?")
         params.append(position.upper())
-    if team:
-        conditions.append("team = ?")
-        params.append(team.upper())
-    if season:
+    if team_clause:
+        conditions.append(team_clause[0])
+        params.extend(team_clause[1])
+    if season is not None:
         conditions.append("season = ?")
-        params.append(int(season))
-    if week:
+        params.append(season)
+    if week is not None:
         conditions.append("week = ?")
-        params.append(int(week))
+        params.append(week)
     if min_snap_pct is not None:
         conditions.append("snap_pct >= ?")
-        params.append(float(min_snap_pct))
+        params.append(min_snap_pct)
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
@@ -1825,12 +2105,14 @@ def nfl_role_trend(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return _with_player({"role_trend": rows, "count": len(rows)}, resolved)
+        return _with_reason(_with_player({"role_trend": rows, "count": len(rows)}, resolved),
+                            rows, "player_role_trend", season=season, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
 
 
+@_checked
 def nfl_separation_opportunity(
     player: str | None = None,
     position: str | None = None,
@@ -1853,9 +2135,13 @@ def nfl_separation_opportunity(
     except (TypeError, ValueError):
         limit = 50
 
-    if season is not None and int(season) < 2016:
+    season = _int_arg("season", season)
+    if season is not None and season < 2016:
         return {"error": "Next Gen Stats receiving data is only available from 2016 onward"}
 
+    regression_candidate = _bool_arg("regression_candidate", regression_candidate, default=None)
+    team_clause = _team_filter("team", team)
+    team = team.strip() if team else None
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
         player, player_id, "player_separation_opportunity", "full_name", team=team, season=season)
@@ -1867,15 +2153,15 @@ def nfl_separation_opportunity(
     if position:
         conditions.append("position ILIKE ?")
         params.append(position.upper())
-    if team:
-        conditions.append("team = ?")
-        params.append(team.upper())
-    if season:
+    if team_clause:
+        conditions.append(team_clause[0])
+        params.extend(team_clause[1])
+    if season is not None:
         conditions.append("season = ?")
-        params.append(int(season))
+        params.append(season)
     if regression_candidate is not None:
         conditions.append("regression_candidate = ?")
-        params.append(bool(regression_candidate))
+        params.append(regression_candidate)
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
@@ -1891,12 +2177,14 @@ def nfl_separation_opportunity(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return _with_player({"separation_opportunity": rows, "count": len(rows)}, resolved)
+        return _with_reason(_with_player({"separation_opportunity": rows, "count": len(rows)}, resolved),
+                            rows, "player_separation_opportunity", season=season)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
 
 
+@_checked
 def nfl_drop_rate(
     player: str | None = None,
     team: str | None = None,
@@ -1917,9 +2205,13 @@ def nfl_drop_rate(
     except (TypeError, ValueError):
         limit = 50
 
-    if season is not None and int(season) < 2022:
+    season = _int_arg("season", season)
+    if season is not None and season < 2022:
         return {"error": "FTN charting (drop) data is only available from 2022 onward"}
 
+    min_targets = _int_arg("min_targets", min_targets)
+    team_clause = _team_filter("team", team)
+    team = team.strip() if team else None
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
         player, player_id, "player_drop_rate", "player", team=team, season=season)
@@ -1928,15 +2220,15 @@ def nfl_drop_rate(
     if cond:
         conditions.append(cond)
         params.extend(cparams)
-    if team:
-        conditions.append("team = ?")
-        params.append(team.upper())
-    if season:
+    if team_clause:
+        conditions.append(team_clause[0])
+        params.extend(team_clause[1])
+    if season is not None:
         conditions.append("season = ?")
-        params.append(int(season))
+        params.append(season)
     if min_targets is not None:
         conditions.append("catchable_targets >= ?")
-        params.append(int(min_targets))
+        params.append(min_targets)
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
@@ -1950,12 +2242,14 @@ def nfl_drop_rate(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return _with_player({"drop_rate": rows, "count": len(rows)}, resolved)
+        return _with_reason(_with_player({"drop_rate": rows, "count": len(rows)}, resolved),
+                            rows, "player_drop_rate", season=season)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
 
 
+@_checked
 def nfl_contract_value(
     player: str | None = None,
     position: str | None = None,
@@ -1977,6 +2271,10 @@ def nfl_contract_value(
     except (TypeError, ValueError):
         limit = 50
 
+    season = _int_arg("season", season)
+    min_apy, max_apy = _num_arg("min_apy", min_apy), _num_arg("max_apy", max_apy)
+    team_clause = _team_filter("team", team)
+    team = team.strip() if team else None
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
         player, player_id, "player_contract_value", "full_name", team=team, season=season)
@@ -1988,18 +2286,18 @@ def nfl_contract_value(
     if position:
         conditions.append("position ILIKE ?")
         params.append(position.upper())
-    if team:
-        conditions.append("team = ?")
-        params.append(team.upper())
-    if season:
+    if team_clause:
+        conditions.append(team_clause[0])
+        params.extend(team_clause[1])
+    if season is not None:
         conditions.append("season = ?")
-        params.append(int(season))
+        params.append(season)
     if min_apy is not None:
         conditions.append("apy >= ?")
-        params.append(float(min_apy))
+        params.append(min_apy)
     if max_apy is not None:
         conditions.append("apy <= ?")
-        params.append(float(max_apy))
+        params.append(max_apy)
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
@@ -2012,12 +2310,14 @@ def nfl_contract_value(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return _with_player({"contract_value": rows, "count": len(rows)}, resolved)
+        return _with_reason(_with_player({"contract_value": rows, "count": len(rows)}, resolved),
+                            rows, "player_contract_value", season=season)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
 
 
+@_checked
 def nfl_injury_return(
     injury_type: str | None = None,
     position: str | None = None,
@@ -2036,6 +2336,7 @@ def nfl_injury_return(
     except (TypeError, ValueError):
         limit = 50
 
+    week_post_return = _int_arg("week_post_return", week_post_return)
     conditions, params = [], []
     if injury_type:
         conditions.append("injury_type ILIKE ?")
@@ -2045,7 +2346,7 @@ def nfl_injury_return(
         params.append(position.upper())
     if week_post_return is not None:
         conditions.append("week_post_return = ?")
-        params.append(int(week_post_return))
+        params.append(week_post_return)
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""

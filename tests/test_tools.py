@@ -165,10 +165,10 @@ class TestNflTeamStats:
         assert "situational" in result
         assert len(result["situational"]) > 0
 
-    def test_invalid_team_returns_empty(self):
+    def test_invalid_team_returns_error(self):
         result = nfl_team_stats(team="ZZZ", season=2024)
-        assert "error" not in result
-        assert len(result["offense"]) == 0
+        assert result["code"] == "UNKNOWN_TEAM"  # group H: an unknown code is an error
+        assert "offense" not in result
 
 
 @pytest.mark.integration
@@ -295,10 +295,10 @@ class TestNflRoster:
         for field in ("full_name", "position", "team", "season"):
             assert field in row
 
-    def test_unknown_team_returns_empty(self):
+    def test_unknown_team_returns_error(self):
         result = nfl_roster(team="ZZZ", season=2024)
-        assert "error" not in result
-        assert result["count"] == 0
+        assert result["code"] == "UNKNOWN_TEAM"  # group H: an unknown code is an error
+        assert "players" not in result
 
 
 @pytest.mark.integration

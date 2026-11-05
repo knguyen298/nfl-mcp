@@ -44,6 +44,8 @@ def test_search_plays_uses_parameterized_filters(monkeypatch):
     captured = {}
 
     def fake_execute(sql, params=None):
+        if sql.startswith("SELECT MIN("):  # empty-result range lookup, not the tool's query
+            return []
         captured["sql"] = sql
         captured["params"] = params
         return []
@@ -64,6 +66,8 @@ def test_team_stats_uses_parameterized_team_and_season(monkeypatch):
     calls = []
 
     def fake_execute(sql, params=None):
+        if sql.startswith("SELECT MIN("):  # empty-result range lookup, not the tool's query
+            return []
         calls.append((sql, params))
         return []
 
@@ -145,7 +149,9 @@ def test_compare_player_path_resolves_both_entities_to_ids(monkeypatch):
 
     calls = []
     monkeypatch.setattr(tools, "_resolve_player", fake_resolve)
-    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: calls.append(params) or [])
+    monkeypatch.setattr(
+        tools, "_execute",
+        lambda sql, params=None: [] if sql.startswith("SELECT MIN(") else calls.append(params) or [])
     result = tools.nfl_compare(
         entity1="P.Mahomes",
         entity2="00-0034857",
@@ -167,11 +173,12 @@ def test_compare_team_does_not_interpolate_user_input(monkeypatch):
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
-    tools.nfl_compare(entity1="KC'; DROP TABLE plays; --", entity2="BAL", compare_type="team", season=2024)
+    result = tools.nfl_compare(
+        entity1="KC'; DROP TABLE plays; --", entity2="BAL", compare_type="team", season=2024)
 
-    assert len(calls) == 4
-    assert all("DROP TABLE" not in sql for sql, _ in calls)
-    assert calls[0][1][0] == "KC'; DROP TABLE PLAYS; --"
+    # Group H: an unknown team code is rejected before any SQL runs, so nothing is interpolated.
+    assert result["code"] == "UNKNOWN_TEAM"
+    assert calls == []
 
 
 def test_schema_table_returns_columns(monkeypatch):
@@ -385,6 +392,8 @@ def test_search_plays_applies_all_numeric_and_boolean_filters(monkeypatch):
     captured = {}
 
     def fake_execute(sql, params=None):
+        if sql.startswith("SELECT MIN("):  # empty-result range lookup, not the tool's query
+            return []
         captured["sql"] = sql
         captured["params"] = params
         return []
@@ -453,6 +462,8 @@ def test_compare_team_applies_season_range_filters(monkeypatch):
     calls = []
 
     def fake_execute(sql, params=None):
+        if sql.startswith("SELECT MIN("):  # empty-result range lookup, not the tool's query
+            return []
         calls.append((sql, params))
         return []
 
@@ -612,6 +623,8 @@ def test_snap_counts_player_id_maps_through_pfr_id(monkeypatch):
     calls = []
 
     def fake_execute(sql, params=None):
+        if sql.startswith("SELECT MIN("):  # empty-result range lookup, not the tool's query
+            return []
         calls.append((sql, params))
         if "FROM players" in sql:
             return [{"gsis_id": "00-0030506", "display_name": "Travis Kelce", "short_name": "T.Kelce",
@@ -742,7 +755,8 @@ def test_ftn_charting_exact_season_filter(monkeypatch):
     captured = {}
     monkeypatch.setattr(
         tools, "_execute",
-        lambda sql, params=None: captured.update(sql=sql, params=params) or [{"total_plays": 0}],
+        lambda sql, params=None: ([] if sql.startswith("SELECT MIN(")
+                                  else captured.update(sql=sql, params=params) or [{"total_plays": 0}]),
     )
     result = tools.nfl_ftn_charting(season=2024)
     assert "p.season = ?" in captured["sql"]
