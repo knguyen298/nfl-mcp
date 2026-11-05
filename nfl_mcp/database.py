@@ -3,14 +3,33 @@ DuckDB connection management for NFL MCP Server.
 """
 
 import os
+import re
 import duckdb
 from contextlib import contextmanager
 
 from .config import get_duckdb_path
 
+_MEMORY_RE = re.compile(r"\d+(\.\d+)?\s*(KB|MB|GB|TB|KiB|MiB|GiB|TiB)", re.IGNORECASE)
 
-def _apply_runtime_pragmas(conn: duckdb.DuckDBPyConnection) -> None:
-    """Bound DuckDB resource usage for the serve process.
+
+def connection_config_problem() -> str | None:
+    """Return a message naming the first invalid NFL_MCP_DUCKDB_* env var, or None.
+
+    Valid memory limit: a number plus a DuckDB unit, e.g. '512MB' or '2GiB'.
+    Valid threads: a positive integer. The temp dir is any non-empty path.
+    """
+    mem = os.getenv("NFL_MCP_DUCKDB_MEMORY_LIMIT")
+    if mem and not _MEMORY_RE.fullmatch(mem.strip()):
+        return (f"NFL_MCP_DUCKDB_MEMORY_LIMIT={mem!r} is not valid: "
+                "use a number and a unit such as '512MB' or '2GiB'")
+    threads = os.getenv("NFL_MCP_DUCKDB_THREADS")
+    if threads and not (threads.strip().isascii() and threads.strip().isdigit() and int(threads) > 0):
+        return f"NFL_MCP_DUCKDB_THREADS={threads!r} is not valid: use a positive whole number"
+    return None
+
+
+def _connection_config() -> dict:
+    """Build the duckdb.connect config: locked down, with env caps for the serve process.
 
     In memory-constrained containers a heavy query can exceed the cgroup limit
     and OOM-kill the server (DuckDB otherwise sizes itself to host RAM). These
@@ -18,31 +37,43 @@ def _apply_runtime_pragmas(conn: duckdb.DuckDBPyConnection) -> None:
       NFL_MCP_DUCKDB_MEMORY_LIMIT  e.g. '512MB'
       NFL_MCP_DUCKDB_THREADS       e.g. '1'
       NFL_MCP_DUCKDB_TEMP_DIR      writable spill dir, e.g. '/tmp/.duckdb_spill'
-    Unset vars leave DuckDB's defaults (local/dev use).
+    Unset vars leave DuckDB's defaults (local/dev use). Values go in the config
+    dict, never into SQL. lock_configuration stops later SET statements.
     """
+    problem = connection_config_problem()
+    if problem:
+        raise ValueError(problem)
+    config = {
+        "enable_external_access": False,
+        "autoinstall_known_extensions": False,
+        "autoload_known_extensions": False,
+    }
     mem = os.getenv("NFL_MCP_DUCKDB_MEMORY_LIMIT")
     if mem:
-        conn.execute(f"SET memory_limit='{mem}'")
+        config["memory_limit"] = mem.strip()
     threads = os.getenv("NFL_MCP_DUCKDB_THREADS")
     if threads:
-        conn.execute(f"SET threads={int(threads)}")
+        config["threads"] = int(threads)
     spill = os.getenv("NFL_MCP_DUCKDB_TEMP_DIR")
     if spill:
-        conn.execute(f"SET temp_directory='{spill}'")
+        config["temp_directory"] = spill
+    config["lock_configuration"] = True
+    return config
 
 
 @contextmanager
 def get_db_connection():
-    """Context manager yielding a fresh read-only DuckDB connection.
+    """Context manager yielding a fresh read-only, locked-down DuckDB connection.
 
     Each call opens a new connection so callers (including threaded timeouts)
-    never share a connection across threads.
+    never share a connection across threads. Never creates the file or its
+    directory; a missing file raises FileNotFoundError with the path.
     """
     db_path = get_duckdb_path()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(str(db_path), read_only=True)
+    if not db_path.is_file():
+        raise FileNotFoundError(f"DuckDB file not found at {db_path}")
+    conn = duckdb.connect(str(db_path), read_only=True, config=_connection_config())
     try:
-        _apply_runtime_pragmas(conn)
         yield conn
     finally:
         conn.close()

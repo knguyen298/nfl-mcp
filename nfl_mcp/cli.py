@@ -43,6 +43,12 @@ def main():
               help="Port to listen on.")
 def serve(host, port):
     """Start the MCP server over Streamable HTTP."""
+    from .database import connection_config_problem
+
+    problem = connection_config_problem()
+    if problem:
+        click.secho(f"✗ {problem}", fg="red", err=True)
+        sys.exit(1)
     display_host = "localhost" if host == "0.0.0.0" else host
     click.echo(f"🏈 NFL MCP server listening on http://{display_host}:{port}/mcp")
     if host == "0.0.0.0":
@@ -337,6 +343,7 @@ def _configure_claude_code(config: dict):
 @main.command()
 def doctor():
     """Check that everything is configured and working."""
+    from . import database
     from .config import load_config, config_exists, get_duckdb_path
 
     click.echo()
@@ -358,13 +365,11 @@ def doctor():
     if db_path.exists():
         click.secho(f"  ✓ DuckDB file exists ({db_path})", fg="green")
         try:
-            import duckdb
-            conn = duckdb.connect(str(db_path), read_only=True)
-            count = conn.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
-            seasons = conn.execute(
-                "SELECT MIN(season), MAX(season) FROM plays"
-            ).fetchone()
-            conn.close()
+            with database.get_db_connection() as conn:
+                count = conn.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
+                seasons = conn.execute(
+                    "SELECT MIN(season), MAX(season) FROM plays"
+                ).fetchone()
             click.secho(f"  ✓ {count:,} plays loaded (seasons {seasons[0]}–{seasons[1]})", fg="green")
         except Exception as e:
             click.secho(f"  ✗ Database error: {e}", fg="red")

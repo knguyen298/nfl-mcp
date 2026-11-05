@@ -3,7 +3,7 @@
 import duckdb
 import pytest
 
-from nfl_mcp.database import _apply_runtime_pragmas, get_db_connection
+from nfl_mcp.database import connection_config_problem, get_db_connection
 
 
 @pytest.fixture
@@ -16,32 +16,33 @@ def db_file(tmp_path):
     return path
 
 
-class TestApplyRuntimePragmas:
-    def test_applies_all_env_caps(self, tmp_path, monkeypatch):
+class TestConnectionConfig:
+    def test_applies_all_env_caps(self, db_file, tmp_path, monkeypatch):
+        monkeypatch.setenv("NFL_MCP_DB_PATH", str(db_file))
         monkeypatch.setenv("NFL_MCP_DUCKDB_MEMORY_LIMIT", "256MB")
         monkeypatch.setenv("NFL_MCP_DUCKDB_THREADS", "1")
         monkeypatch.setenv("NFL_MCP_DUCKDB_TEMP_DIR", str(tmp_path / "spill"))
-        conn = duckdb.connect(":memory:")
-        _apply_runtime_pragmas(conn)
-        assert conn.execute("SELECT current_setting('threads')").fetchone()[0] == 1
-        mem = conn.execute("SELECT current_setting('memory_limit')").fetchone()[0]
-        assert "MiB" in mem or "MB" in mem
-        spill = conn.execute("SELECT current_setting('temp_directory')").fetchone()[0]
-        assert spill.endswith("spill")
-        conn.close()
+        with get_db_connection() as conn:
+            assert conn.execute("SELECT current_setting('threads')").fetchone()[0] == 1
+            mem = conn.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+            assert "MiB" in mem or "MB" in mem
+            spill = conn.execute("SELECT current_setting('temp_directory')").fetchone()[0]
+            assert spill.endswith("spill")
 
-    def test_noop_when_env_unset(self, monkeypatch):
+    def test_defaults_when_env_unset(self, db_file, monkeypatch):
+        monkeypatch.setenv("NFL_MCP_DB_PATH", str(db_file))
         for var in (
             "NFL_MCP_DUCKDB_MEMORY_LIMIT",
             "NFL_MCP_DUCKDB_THREADS",
             "NFL_MCP_DUCKDB_TEMP_DIR",
         ):
             monkeypatch.delenv(var, raising=False)
-        conn = duckdb.connect(":memory:")
-        default_threads = conn.execute("SELECT current_setting('threads')").fetchone()[0]
-        _apply_runtime_pragmas(conn)
-        assert conn.execute("SELECT current_setting('threads')").fetchone()[0] == default_threads
-        conn.close()
+        assert connection_config_problem() is None
+        with get_db_connection() as conn:
+            default_threads = conn.execute("SELECT current_setting('threads')").fetchone()[0]
+            assert default_threads == duckdb.connect(":memory:").execute(
+                "SELECT current_setting('threads')"
+            ).fetchone()[0]
 
 
 class TestGetDbConnection:

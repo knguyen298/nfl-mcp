@@ -53,10 +53,6 @@ REPO = Path(__file__).resolve().parents[2]
 REAL_DB = Path("/tmp/grpE_v3.duckdb")
 
 
-def xfail(item: str):
-    return pytest.mark.xfail(strict=True, reason=f"group a: {item}")
-
-
 # ── fixtures ───────────────────────────────────────────────────────────────────
 
 @pytest.fixture(autouse=True)
@@ -124,7 +120,6 @@ READS = [
 ]
 
 
-@xfail("locked config blocks file/network reads")
 @pytest.mark.parametrize("template", READS)
 def test_file_read_blocked_with_permission_error(synth_db, tmp_path, template):
     with pytest.raises(duckdb.PermissionException):
@@ -132,10 +127,10 @@ def test_file_read_blocked_with_permission_error(synth_db, tmp_path, template):
 
 
 @pytest.mark.parametrize("name,expected", [
-    pytest.param("enable_external_access", False, marks=xfail("enable_external_access=false")),
-    pytest.param("lock_configuration", True, marks=xfail("lock_configuration=true")),
-    pytest.param("autoinstall_known_extensions", False, marks=xfail("autoinstall off")),
-    pytest.param("autoload_known_extensions", False, marks=xfail("autoload off")),
+    pytest.param("enable_external_access", False),
+    pytest.param("lock_configuration", True),
+    pytest.param("autoinstall_known_extensions", False),
+    pytest.param("autoload_known_extensions", False),
 ])
 def test_connection_setting_locked_value(synth_db, name, expected):
     assert _is(_setting(name), expected)
@@ -143,7 +138,6 @@ def test_connection_setting_locked_value(synth_db, name, expected):
 
 # ── 2. writes, extensions, secrets and config changes are blocked ─────────────
 
-@xfail("COPY TO blocked")
 @pytest.mark.parametrize("fmt", ["csv", "parquet"])
 def test_copy_to_file_blocked_and_no_file_written(synth_db, tmp_path, fmt):
     out = tmp_path / f"out.{fmt}"
@@ -152,7 +146,6 @@ def test_copy_to_file_blocked_and_no_file_written(synth_db, tmp_path, fmt):
     assert not out.exists()
 
 
-@xfail("EXPORT DATABASE blocked")
 def test_export_database_blocked_and_nothing_written(synth_db, tmp_path):
     out = tmp_path / "exp"
     with pytest.raises(duckdb.PermissionException):
@@ -161,12 +154,12 @@ def test_export_database_blocked_and_nothing_written(synth_db, tmp_path):
 
 
 BLOCKED = [
-    pytest.param("INSTALL httpfs", duckdb.PermissionException, marks=xfail("INSTALL blocked")),
-    pytest.param("LOAD httpfs", duckdb.PermissionException, marks=xfail("LOAD blocked")),
-    pytest.param("CREATE SECRET s (TYPE S3)", duckdb.PermissionException, marks=xfail("CREATE SECRET blocked")),
-    pytest.param("SET memory_limit='1GB'", duckdb.Error, marks=xfail("SET locked")),
-    pytest.param("SET threads=3", duckdb.Error, marks=xfail("SET locked")),
-    pytest.param("ATTACH '{tmp}/other.duckdb' AS o", duckdb.Error, marks=xfail("ATTACH existing file blocked")),
+    pytest.param("INSTALL httpfs", duckdb.PermissionException),
+    pytest.param("LOAD httpfs", duckdb.PermissionException),
+    pytest.param("CREATE SECRET s (TYPE S3)", duckdb.PermissionException),
+    pytest.param("SET memory_limit='1GB'", duckdb.Error),
+    pytest.param("SET threads=3", duckdb.Error),
+    pytest.param("ATTACH '{tmp}/other.duckdb' AS o", duckdb.Error),
     # Already blocked by DuckDB on a plain read_only connection (verified): no xfail.
     pytest.param("SET enable_external_access=true", duckdb.Error),
     pytest.param("CREATE TABLE t AS SELECT 1", duckdb.Error),
@@ -182,7 +175,6 @@ def test_statement_blocked_on_served_connection(synth_db, tmp_path, template, ex
         _run(template.format(tmp=tmp_path))
 
 
-@xfail("SET locked: setting unchanged after attempt")
 @pytest.mark.parametrize("sql,name,forbidden", [
     ("SET threads=3", "threads", 3),
     ("SET memory_limit='1GB'", "memory_limit", "953.6 MiB"),
@@ -241,7 +233,6 @@ def test_missing_db_raises_with_path_in_message(tmp_path, monkeypatch, parts):
     assert str(path) in str(exc.value)
 
 
-@xfail("no mkdir in serve path")
 @pytest.mark.parametrize("parts", [("missing", "sub", "x.duckdb"), ("missing", "x.duckdb")])
 def test_missing_db_creates_no_directory(tmp_path, monkeypatch, parts):
     path = tmp_path.joinpath(*parts)
@@ -273,7 +264,6 @@ def test_env_settings_reported_on_connection(synth_db, tmp_path, monkeypatch, me
     assert got == (mem_text, int(threads), str(tmp_path / "spill"))
 
 
-@xfail("settings passed via config so they coexist with lock_configuration")
 @pytest.mark.parametrize("threads", ["1", "2"])
 def test_env_settings_applied_and_config_locked(synth_db, monkeypatch, threads):
     monkeypatch.setenv("NFL_MCP_DUCKDB_THREADS", threads)
@@ -283,7 +273,6 @@ def test_env_settings_applied_and_config_locked(synth_db, monkeypatch, threads):
     assert got[0] == int(threads) and _is(got[1], True)
 
 
-@xfail("env values not interpolated into SQL")
 @pytest.mark.parametrize("var", ["NFL_MCP_DUCKDB_MEMORY_LIMIT", "NFL_MCP_DUCKDB_TEMP_DIR"])
 def test_env_value_not_interpolated_into_sql(synth_db, monkeypatch, var):
     value = "1GB'; SET threads=7; SELECT '" if "MEMORY" in var else "/tmp/x'; SET threads=7; SELECT '"
@@ -301,7 +290,6 @@ def _problem_fn():
     return fn
 
 
-@xfail("connection_config_problem() exists")
 @pytest.mark.parametrize("env", [
     {},
     {"NFL_MCP_DUCKDB_THREADS": "2", "NFL_MCP_DUCKDB_MEMORY_LIMIT": "512MB"},
@@ -313,7 +301,6 @@ def test_config_problem_none_for_valid_env(monkeypatch, env):
     assert _problem_fn()() is None
 
 
-@xfail("connection_config_problem() rejects bad values")
 @pytest.mark.parametrize("var,value", [
     ("NFL_MCP_DUCKDB_THREADS", "abc"),
     ("NFL_MCP_DUCKDB_THREADS", "0"),
@@ -342,7 +329,6 @@ def _output(result) -> str:
     return text
 
 
-@xfail("serve validates NFL_MCP_DUCKDB_* at startup")
 @pytest.mark.parametrize("var,value", [
     ("NFL_MCP_DUCKDB_THREADS", "abc"),
     ("NFL_MCP_DUCKDB_THREADS", "0"),
@@ -383,7 +369,6 @@ def test_doctor_reports_synthetic_counts(synth_db, monkeypatch):
     assert "3 plays loaded (seasons 2024–2025)" in result.output, result.output
 
 
-@xfail("doctor uses get_db_connection")
 def test_doctor_calls_get_db_connection(synth_db, monkeypatch):
     original = database.get_db_connection
     calls = []
@@ -399,7 +384,6 @@ def test_doctor_calls_get_db_connection(synth_db, monkeypatch):
     assert calls, "doctor never called nfl_mcp.database.get_db_connection"
 
 
-@xfail("doctor output comes from get_db_connection")
 def test_doctor_counts_come_from_get_db_connection(synth_db, tmp_path, monkeypatch):
     # A second DB with 4 plays in 2019-2020; if doctor prints these, it used the patched function.
     alt = _build_db(tmp_path / "alt.duckdb", [(2019, 1, "MIN", 1), (2019, 2, "MIN", 2),
@@ -418,7 +402,6 @@ def test_doctor_counts_come_from_get_db_connection(synth_db, tmp_path, monkeypat
     assert "4 plays loaded (seasons 2019–2020)" in result.output, result.output
 
 
-@xfail("doctor's connection is locked")
 def test_doctor_connection_has_external_access_disabled(synth_db, monkeypatch):
     original = database.get_db_connection
     seen = []
@@ -436,14 +419,12 @@ def test_doctor_connection_has_external_access_disabled(synth_db, monkeypatch):
 
 # ── 7. pytz: TIMESTAMP WITH TIME ZONE round-trips ─────────────────────────────
 
-@xfail("pytz dependency: TIMESTAMPTZ via nfl_query")
 def test_nfl_query_select_star_with_timestamptz(synth_db):
     result = nfl_query("SELECT * FROM tz_events ORDER BY id")
     assert "error" not in result, result
     assert [r["id"] for r in result["rows"]] == [1, 2]  # 2 hand-written rows
 
 
-@xfail("pytz dependency: TIMESTAMPTZ value is the right instant")
 @pytest.mark.parametrize("row_id,expected", [
     (1, dt.datetime(2024, 9, 8, 17, 0, tzinfo=dt.timezone.utc)),
     (2, dt.datetime(2025, 1, 5, 21, 25, tzinfo=dt.timezone.utc)),
@@ -455,7 +436,6 @@ def test_nfl_query_timestamptz_value(synth_db, row_id, expected):
     assert isinstance(got, dt.datetime) and got.tzinfo is not None and got == expected
 
 
-@xfail("pytz declared in pyproject dependencies")
 def test_pyproject_declares_pytz():
     tomllib = pytest.importorskip("tomllib")  # stdlib from 3.11; project supports 3.10
     deps = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["dependencies"]
@@ -484,7 +464,6 @@ def real_db(monkeypatch):
 
 
 @pytest.mark.integration
-@xfail("pytz dependency: SELECT * on real TIMESTAMPTZ tables")
 # injuries.date_modified is NULL for every 2025 and 2026 row in this DB, and a NULL
 # TIMESTAMPTZ does not need pytz, so each query filters to a non-NULL value.
 @pytest.mark.parametrize("table,tz_col,season", [
