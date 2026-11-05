@@ -48,6 +48,7 @@ Interface contract (beyond the shared brief)
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -55,8 +56,9 @@ import duckdb
 import pytest
 
 from nfl_mcp import ingest, tools
+from nfl_mcp.database import get_db_connection
 
-REAL_DB = Path("/tmp/grpE_v3.duckdb")
+REAL_DB = Path(os.environ.get("NFL_MCP_DB_PATH", "/tmp/grpE_v3.duckdb"))
 XF = "group f: "
 
 DERIVED = [
@@ -333,7 +335,6 @@ def one(conn, table, team, season_type, **where):
 
 # ── 1. grain ─────────────────────────────────────────────────────────────────
 
-@pytest.mark.xfail(strict=True, reason=XF + "season_type on team tables")
 @pytest.mark.parametrize("table", ["team_offense_stats", "team_defense_stats"])
 def test_team_tables_split_reg_and_post_kc(db, table):
     keys = rows(db, f"SELECT season_year, season_type FROM {table} WHERE team='KC' ORDER BY 2 DESC")
@@ -341,7 +342,6 @@ def test_team_tables_split_reg_and_post_kc(db, table):
     assert [(r["season_year"], r["season_type"]) for r in keys] == [(2024, "REG"), (2024, "POST")]
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "season_type on team tables")
 @pytest.mark.parametrize("table", ["team_offense_stats", "team_defense_stats", "situational_stats"])
 def test_team_tables_one_row_per_key(db, table):
     key = "team, season_year, season_type" + (", situation" if table == "situational_stats" else "")
@@ -352,7 +352,6 @@ def test_team_tables_one_row_per_key(db, table):
 
 # ── 2-7. team_offense_stats definitions ──────────────────────────────────────
 
-@pytest.mark.xfail(strict=True, reason=XF + "scrimmage plays only")
 @pytest.mark.parametrize("season_type, expected", [
     # REG pass/run non-2pt rows: 1-7, 9-11, 13-14, 16-21, 24-27, 29-31, 33-38, 40-41 = 33
     ("REG", 33),
@@ -362,7 +361,6 @@ def test_total_plays_counts_scrimmage_only(db, season_type, expected):
     assert one(db, "team_offense_stats", "KC", season_type)["total_plays"] == expected
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "sacks/spikes/2pt out of pass attempts")
 @pytest.mark.parametrize("col, expected", [
     ("pass_plays", 15),     # pass, sack=0, non-2pt: 1,2,4,5,7,11,13,16,18,20,21,25,31,35,36
     ("pass_attempts", 16),  # 15 + spike 42 (official nflverse attempt)
@@ -388,7 +386,6 @@ def test_rush_counts_kneels_and_scrambles(db, col, expected):
     assert got == expected + (0 if split else {"rush_plays": 1, "rush_yards": 5}[col])
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "two-point runs out of carries")
 def test_rush_plays_exclude_two_point_run(tmp_path):
     conn = build_db(tmp_path / "f.duckdb", extra_plays=[
         play(45, "run", None, None, 2, 2, qtr=4, time="05:00", two_point_attempt=1)])
@@ -396,24 +393,20 @@ def test_rush_plays_exclude_two_point_run(tmp_path):
     assert one(conn, "team_offense_stats", "KC", "REG")["rush_plays"] == 17  # unchanged by the 2-pt run
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "scrambles column")
 def test_scrambles_reported_separately(db):
     assert one(db, "team_offense_stats", "KC", "REG")["scrambles"] == 2  # rows 10, 41
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "offensive TDs only")
 @pytest.mark.parametrize("season_type, expected", [("REG", 2), ("POST", 1)])  # REG 21, 38 (not 25); POST 204
 def test_offense_touchdowns_exclude_pick_six(db, season_type, expected):
     assert one(db, "team_offense_stats", "KC", season_type)["touchdowns"] == expected
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "def_touchdowns column")
 @pytest.mark.parametrize("team, expected", [("CLE", 1), ("KC", 0)])  # CLE returned row 25; KC none
 def test_defense_touchdowns_credit_pick_six(db, team, expected):
     assert one(db, "team_defense_stats", team, "REG")["def_touchdowns"] == expected
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "muffed punt to receiving team")
 @pytest.mark.parametrize("table, team, col, expected", [
     ("team_offense_stats", "KC", "turnovers", 1),        # INT 25 only; CLE's muff (28) is not KC's
     ("team_offense_stats", "CLE", "turnovers", 2),       # INT 103 + muff 28
@@ -423,7 +416,6 @@ def test_muffed_punt_charged_to_receiving_team(db, table, team, col, expected):
     assert one(db, table, team, "REG")[col] == expected
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "third down definition")
 @pytest.mark.parametrize("season_type, expected", [
     # REG third downs (scrimmage): 3,7,16,21,27,31,35,41 = 8; first_down=1 on 3,16,21,41 -> 50.0
     ("REG", 50.0),
@@ -433,7 +425,6 @@ def test_third_down_pct_first_down_over_scrimmage(db, season_type, expected):
     assert one(db, "team_offense_stats", "KC", season_type)["third_down_pct"] == expected
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "season_type on team tables")
 @pytest.mark.parametrize("col, expected", [("sacks", 1), ("interceptions", 1)])  # rows 102, 103
 def test_defense_sacks_and_ints_kc_reg(db, col, expected):
     assert one(db, "team_defense_stats", "KC", "REG")[col] == expected
@@ -441,7 +432,6 @@ def test_defense_sacks_and_ints_kc_reg(db, col, expected):
 
 # ── 8. situational_stats ─────────────────────────────────────────────────────
 
-@pytest.mark.xfail(strict=True, reason=XF + "situational play_type filter")
 @pytest.mark.parametrize("situation, plays, conv", [
     ("4th Down", 2, 50.0),          # 36 (converted), 37; punts 8, 28 and FG 32 excluded
     ("3rd & Long", 3, 33.3),        # 7, 16 (converted), 27; no_play 15 excluded
@@ -454,7 +444,6 @@ def test_situational_buckets_kc_reg(db, situation, plays, conv):
         assert r["conversion_pct"] == conv
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "documented conversion rule")
 def test_situational_every_bucket_has_conversion_rule(db):
     missing = db.execute("SELECT situation FROM situational_stats WHERE conversion_rule IS NULL "
                          "OR TRIM(conversion_rule) = ''").fetchall()
@@ -471,8 +460,8 @@ def test_situational_third_and_short_bucket_exists(db):
 # ── 9-11. player tables ──────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("season, apy", [
-    pytest.param(2022, 5.0, marks=pytest.mark.xfail(strict=True, reason=XF + "contract in force")),
-    pytest.param(2024, 10.0, marks=pytest.mark.xfail(strict=True, reason=XF + "contract in force")),
+    pytest.param(2022, 5.0),
+    pytest.param(2024, 10.0),
     (2025, 20.0),  # active contract signed 2025 is also the one in force
 ])
 def test_contract_value_uses_contract_in_force(db, season, apy):
@@ -481,7 +470,7 @@ def test_contract_value_uses_contract_in_force(db, season, apy):
 
 
 @pytest.mark.parametrize("player_id, pcts", [
-    pytest.param("00-OBJ", [50.0, 70.0], marks=pytest.mark.xfail(strict=True, reason=XF + "pfr_id join")),
+    pytest.param("00-OBJ", [50.0, 70.0]),
     ("00-WR1", [60.0, 65.0]),  # names agree: holds today
 ])
 def test_role_trend_snap_pct_joined_by_pfr_id(db, player_id, pcts):
@@ -492,8 +481,7 @@ def test_role_trend_snap_pct_joined_by_pfr_id(db, player_id, pcts):
 
 @pytest.mark.parametrize("injury, curve", [
     # OBJ out wks 4-5, baseline 0.8 (wks 1-3), back at 0.4 then 0.8 -> 50%, 100%
-    pytest.param("hamstring", [(1, 50.0), (2, 100.0)],
-                 marks=pytest.mark.xfail(strict=True, reason=XF + "pfr_id join")),
+    pytest.param("hamstring", [(1, 50.0), (2, 100.0)]),
     ("ankle", [(1, 50.0)]),  # Wade out wk 4, baseline 0.9, back at 0.45; names agree
 ])
 def test_injury_return_curve_joined_by_pfr_id(db, injury, curve):
@@ -502,7 +490,6 @@ def test_injury_return_curve_joined_by_pfr_id(db, injury, curve):
     assert [(r["week_post_return"], r["avg_snap_pct_recovery"]) for r in got] == curve
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "season_type split")
 @pytest.mark.parametrize("season_type, rush_td", [("REG", 2.0), ("POST", 1.0)])  # wks 15+16 / wk 20
 def test_td_luck_splits_reg_post(db, season_type, rush_td):
     got = rows(db, "SELECT rush_td FROM player_td_luck WHERE player_id='00-RB1' AND season=2024 "
@@ -510,7 +497,6 @@ def test_td_luck_splits_reg_post(db, season_type, rush_td):
     assert [r["rush_td"] for r in got] == [rush_td]
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "season_type split")
 @pytest.mark.parametrize("season_type, targets, drops, pct", [
     ("REG", 4, 1, 25.0),   # plays 1, 2 (drop), 4, 11
     ("POST", 2, 1, 50.0),  # plays 201, 203 (drop)
@@ -530,7 +516,6 @@ def _formation_db(tmp_path):
     return conn
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "formation_effectiveness excludes 2-pt")
 def test_formation_effectiveness_excludes_two_point_tries(tmp_path):
     conn = _formation_db(tmp_path)
     # the only NO HUDDLE pass plays are the five 2-pt tries -> no such group after the fix
@@ -539,7 +524,6 @@ def test_formation_effectiveness_excludes_two_point_tries(tmp_path):
     assert got == 0
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "season_type split")
 def test_formation_effectiveness_splits_reg_post(tmp_path):
     conn = _formation_db(tmp_path)
     r = one(conn, "formation_effectiveness", "KC", "POST", formation="SHOTGUN", play_type="pass")
@@ -561,7 +545,7 @@ def test_rebuild_function_exists():
 
 
 @pytest.mark.parametrize("table", [
-    pytest.param(t, marks=pytest.mark.xfail(strict=True, reason=XF + "aggregate tables in metadata"))
+    pytest.param(t)
     if t in DERIVED[:4] else t for t in DERIVED])
 def test_metadata_one_row_per_derived_table(db, table):
     got = rows(db, "SELECT table_name, season, loader_fn FROM _ingest_metadata WHERE dataset_id=?", [table])
@@ -606,7 +590,6 @@ def _snapshot(conn):
     return {t: sorted(map(repr, conn.execute(f"SELECT * FROM {t}").fetchall())) for t in DERIVED}
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "rebuild in one transaction")
 @pytest.mark.parametrize("target", ["situational_stats", "player_contract_value"])
 def test_failed_rebuild_keeps_previous_tables(db, target):
     fn = getattr(ingest, "rebuild_derived_tables", None)
@@ -631,14 +614,12 @@ def tool_db(tmp_path, monkeypatch):
     return path
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "nfl_team_stats season_type")
 @pytest.mark.parametrize("season_type, touchdowns", [("REG", 2), ("POST", 1)])
 def test_team_stats_tool_filters_season_type_synthetic(tool_db, season_type, touchdowns):
     res = tools.nfl_team_stats("KC", 2024, side="offense", season_type=season_type)
     assert [(r["season_type"], r["touchdowns"]) for r in res["offense"]] == [(season_type, touchdowns)]
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "nfl_compare team season_type")
 def test_compare_team_post_empty_for_non_playoff_team_synthetic(tool_db):
     res = tools.nfl_compare("KC", "CLE", compare_type="team", season=2024, season_type="POST")
     assert [r["season_type"] for r in res["KC"]["offense"]] == ["POST"]
@@ -652,9 +633,9 @@ def real(monkeypatch):
     if not REAL_DB.exists():
         pytest.skip(f"{REAL_DB} missing")
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(REAL_DB))
-    conn = duckdb.connect(str(REAL_DB), read_only=True)
-    yield conn
-    conn.close()
+    # Same opener as the tools, so the open oracle connection never clashes with theirs.
+    with get_db_connection() as conn:
+        yield conn
 
 
 def _official(conn, team, season_type="REG"):
@@ -668,7 +649,6 @@ def _official(conn, team, season_type="REG"):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason=XF + "REG row matches team_stats_raw")
 @pytest.mark.parametrize("team", ["KC", "DET", "BUF"])
 @pytest.mark.parametrize("col", ["pass_attempts", "completions", "rush_plays", "rush_yards",
                                  "touchdowns", "interceptions"])
@@ -679,7 +659,6 @@ def test_offense_reg_matches_team_stats_raw(real, team, col):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason=XF + "REG row matches team_stats_raw")
 @pytest.mark.parametrize("team", ["KC", "DET", "BUF"])
 @pytest.mark.parametrize("col, official, tol", [
     # team_stats_raw rounds half-sacks per player, so BUF 2024 REG reads 37 vs 39 sack plays; allow 2
@@ -693,7 +672,6 @@ def test_defense_reg_matches_team_stats_raw(real, team, col, official, tol):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason=XF + "nfl_team_stats season_type")
 @pytest.mark.parametrize("team", ["KC", "DET"])
 def test_team_stats_tool_one_reg_row_per_season(real, team):
     res = tools.nfl_team_stats(team, side="offense", season_type="REG")
@@ -705,7 +683,6 @@ def test_team_stats_tool_one_reg_row_per_season(real, team):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason=XF + "nfl_team_stats season_type")
 def test_team_stats_tool_post_row_separate_kc_2024(real):
     res = tools.nfl_team_stats("KC", 2024, side="offense", season_type="POST")
     assert [r["season_type"] for r in res["offense"]] == ["POST"]
@@ -722,7 +699,6 @@ def _no_playoff_team_2024(conn):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason=XF + "nfl_compare team season_type")
 def test_compare_team_post_differs_from_reg_kc(real):
     reg = tools.nfl_compare("KC", "DET", compare_type="team", season=2024, season_type="REG")
     post = tools.nfl_compare("KC", "DET", compare_type="team", season=2024, season_type="POST")
@@ -731,9 +707,39 @@ def test_compare_team_post_differs_from_reg_kc(real):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason=XF + "nfl_compare team season_type")
 def test_compare_team_post_empty_with_reason_for_non_playoff_team(real):
     other = _no_playoff_team_2024(real)  # derived from schedules, not from the tool
     res = tools.nfl_compare("KC", other, compare_type="team", season=2024, season_type="POST")
     assert res["KC"]["offense"]
     assert res[other]["offense"] == [] and res[other].get("reason")
+
+
+# ── stale (not yet rebuilt) team tables: no season_type column ───────────────
+
+@pytest.fixture
+def stale_db(tmp_path, monkeypatch):
+    path = tmp_path / "stale.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE team_offense_stats (team VARCHAR, season_year INTEGER, touchdowns INTEGER)")
+    conn.execute("CREATE TABLE team_defense_stats (team VARCHAR, season_year INTEGER, sacks INTEGER)")
+    conn.execute("CREATE TABLE situational_stats (team VARCHAR, season_year INTEGER, situation VARCHAR)")
+    conn.execute("INSERT INTO team_offense_stats VALUES ('KC', 2024, 50)")
+    conn.execute("INSERT INTO team_defense_stats VALUES ('KC', 2024, 40)")
+    conn.close()
+    monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))
+
+
+def test_stale_tables_default_reg_returns_rows_with_warning(stale_db):
+    res = tools.nfl_team_stats("KC", 2024, side="offense")
+    assert [r["touchdowns"] for r in res["offense"]] == [50]
+    assert "nfl-mcp rebuild" in res["warning"]
+    cmp = tools.nfl_compare("KC", "KC", compare_type="team", season=2024)
+    assert cmp["KC"]["offense"] and "nfl-mcp rebuild" in cmp["KC"]["warning"]
+
+
+def test_stale_tables_explicit_post_returns_error_with_code(stale_db):
+    expected = {"error": "Derived team tables are stale; run `nfl-mcp rebuild`",
+                "code": "STALE_DERIVED_TABLES"}
+    assert tools.nfl_team_stats("KC", 2024, season_type="POST") == expected
+    assert tools.nfl_compare("KC", "BUF", compare_type="team", season=2024,
+                             season_type="POST") == expected

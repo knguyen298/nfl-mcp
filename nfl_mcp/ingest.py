@@ -530,64 +530,166 @@ _FORMATION_EXPR = """
     END
 """.strip()
 
+# What conversion_pct means in each _SITUATION_EXPR bucket, stored on every situational row.
+_CONVERSION_RULE_EXPR = """
+    CASE situation_label
+        WHEN '4th Down'
+            THEN 'Share of 4th-down pass/run plays with first_down = 1'
+        WHEN '3rd & Long'
+            THEN 'Share of 3rd-and-7-or-more pass/run plays with first_down = 1'
+        WHEN '3rd & Short'
+            THEN 'Share of 3rd-and-3-or-less pass/run plays with first_down = 1'
+        WHEN 'Red Zone'
+            THEN 'Share of pass/run plays inside the 20 not in the down buckets above that are offensive touchdowns'
+        WHEN 'Two Minute Drill'
+            THEN 'First-down rate: share of 4th-quarter pass/run plays inside 2:00 with first_down = 1'
+        ELSE 'First-down rate: share of pass/run plays not in the buckets above with first_down = 1'
+    END
+""".strip()
+
+# Flag columns the definitions below read. A plays table without one of them (a partial
+# frame in a unit test) is padded with NULL so the SQL still binds; nflverse always has them.
+_PLAYS_COLUMNS: dict[str, str] = {
+    "season_type": "VARCHAR", "td_team": "VARCHAR", "fumbled_1_team": "VARCHAR",
+    **{c: "DOUBLE" for c in (
+        "two_point_attempt", "pass_attempt", "rush_attempt", "complete_pass", "sack",
+        "interception", "fumble_lost", "qb_dropback", "qb_scramble", "first_down", "touchdown",
+        "passing_yards", "rushing_yards")},
+}
+
+# Play definitions shared by every derived team table. A two-point try carries
+# pass_attempt=1 or rush_attempt=1 (and pass tries carry qb_dropback=1), and some no_play
+# rows carry qb_dropback=1 or qb_scramble=1, so each flag-based definition excludes both.
+_NOT_2PT = "COALESCE(two_point_attempt, 0) = 0"
+_NOT_NO_PLAY = "play_type IS DISTINCT FROM 'no_play'"
+_SCRIMMAGE = f"(play_type IN ('pass', 'run') AND {_NOT_2PT})"
+_PASS_PLAY = f"(play_type = 'pass' AND pass_attempt = 1 AND COALESCE(sack, 0) = 0 AND {_NOT_2PT})"
+_PASS_ATTEMPT = f"(pass_attempt = 1 AND COALESCE(sack, 0) = 0 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
+_RUSH_PLAY = f"(rush_attempt = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
+_SACK = f"(sack = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
+_INTERCEPTION = f"(interception = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
+
+
+def _plays_source(conn: duckdb.DuckDBPyConnection) -> str:
+    """FROM-clause source for plays, padding any missing flag column with NULL."""
+    have = {r[0] for r in conn.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'plays'"
+    ).fetchall()}
+    padded = [c for c in _PLAYS_COLUMNS if c not in have]
+    if padded:
+        print(f"    WARNING: plays lacks column(s) {', '.join(padded)}; derived tables use NULL for them")
+    pads = [f"CAST(NULL AS {_PLAYS_COLUMNS[c]}) AS {c}" for c in padded]
+    return f"(SELECT *, {', '.join(pads)} FROM plays)" if pads else "plays"
+
 
 def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
+    """Build the pbp-derived team tables, one row per team, season and season_type (REG/POST)."""
     print("\n  Creating aggregate tables…")
+    _ensure_metadata_table(conn)
+    src = _plays_source(conn)
 
     for table in ["team_offense_stats", "team_defense_stats",
                   "situational_stats", "formation_effectiveness"]:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
 
-    conn.execute("""
+    # total_plays is pass/run plays only (sacks and scrambles in; kneels, spikes, special
+    # teams, no_play and two-point tries out). pass_plays excludes spikes; pass_attempts is
+    # the official nflverse count (spikes in). A turnover is an interception thrown or a
+    # fumble lost by the team, so a muffed punt is charged to the receiving team.
+    conn.execute(f"""
         CREATE TABLE team_offense_stats AS
+        WITH oagg AS (
+            SELECT
+                posteam AS team, season AS season_year, season_type,
+                COUNT(*) FILTER (WHERE {_SCRIMMAGE}) AS total_plays,
+                COALESCE(SUM(COALESCE(yards_gained, 0)) FILTER (WHERE {_SCRIMMAGE}), 0) AS total_yards,
+                ROUND(AVG(yards_gained) FILTER (WHERE {_SCRIMMAGE}), 2) AS yards_per_play,
+                COUNT(*) FILTER (WHERE {_RUSH_PLAY}) AS rush_plays,
+                COUNT(*) FILTER (WHERE {_PASS_PLAY}) AS pass_plays,
+                COUNT(*) FILTER (WHERE {_PASS_ATTEMPT}) AS pass_attempts,
+                COUNT(*) FILTER (WHERE complete_pass = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY}) AS completions,
+                COUNT(*) FILTER (WHERE {_INTERCEPTION}) AS interceptions,
+                COUNT(*) FILTER (WHERE {_SACK}) AS sacks,
+                COUNT(*) FILTER (WHERE qb_dropback = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY}) AS dropbacks,
+                COUNT(*) FILTER (WHERE qb_scramble = 1 AND {_RUSH_PLAY}) AS scrambles,
+                COALESCE(SUM(COALESCE(rushing_yards, 0)) FILTER (WHERE {_RUSH_PLAY}), 0) AS rush_yards,
+                COALESCE(SUM(COALESCE(passing_yards, 0)) FILTER (WHERE {_PASS_ATTEMPT}), 0) AS pass_yards,
+                COUNT(*) FILTER (WHERE {_SCRIMMAGE} AND touchdown = 1 AND td_team = posteam) AS touchdowns,
+                COUNT(*) FILTER (WHERE {_SCRIMMAGE} AND down = 3 AND first_down = 1) AS third_down_conversions,
+                COUNT(*) FILTER (WHERE {_SCRIMMAGE} AND down = 3) AS third_downs,
+                COUNT(*) FILTER (WHERE {_SCRIMMAGE} AND yardline_100 <= 20
+                                 AND touchdown = 1 AND td_team = posteam) AS red_zone_tds,
+                COUNT(*) FILTER (WHERE {_SCRIMMAGE} AND yardline_100 <= 20) AS red_zone_plays,
+                COUNT(*) FILTER (WHERE ({_PASS_PLAY} AND yards_gained >= 20)
+                                    OR ({_SCRIMMAGE} AND play_type = 'run' AND yards_gained >= 10)) AS explosive_plays,
+                ROUND(AVG(epa) FILTER (WHERE {_SCRIMMAGE}), 3) AS avg_epa,
+                ROUND(AVG(epa) FILTER (WHERE {_SCRIMMAGE} AND play_type = 'pass'), 3) AS pass_epa,
+                ROUND(AVG(epa) FILTER (WHERE {_SCRIMMAGE} AND play_type = 'run'), 3) AS rush_epa
+            FROM {src}
+            WHERE posteam IS NOT NULL
+            GROUP BY posteam, season, season_type
+        ),
+        fum AS (
+            SELECT fumbled_1_team AS team, season AS season_year, season_type, COUNT(*) AS fumbles_lost
+            FROM {src}
+            WHERE fumble_lost = 1 AND fumbled_1_team IS NOT NULL AND {_NOT_NO_PLAY}
+            GROUP BY fumbled_1_team, season, season_type
+        )
         SELECT
-            posteam AS team, season AS season_year,
-            COUNT(*) AS total_plays,
-            SUM(COALESCE(yards_gained,0)) AS total_yards,
-            ROUND(AVG(yards_gained), 2) AS yards_per_play,
-            SUM(CASE WHEN rush_attempt=1 THEN 1 ELSE 0 END) AS rush_plays,
-            SUM(CASE WHEN pass_attempt=1 THEN 1 ELSE 0 END) AS pass_plays,
-            SUM(CASE WHEN rush_attempt=1 THEN COALESCE(yards_gained,0) ELSE 0 END) AS rush_yards,
-            SUM(CASE WHEN pass_attempt=1 THEN COALESCE(yards_gained,0) ELSE 0 END) AS pass_yards,
-            ROUND(AVG(CASE WHEN rush_attempt=1 THEN yards_gained END), 2) AS yards_per_rush,
-            ROUND(AVG(CASE WHEN pass_attempt=1 THEN yards_gained END), 2) AS yards_per_pass,
-            SUM(CASE WHEN touchdown=1 THEN 1 ELSE 0 END) AS touchdowns,
-            SUM(CASE WHEN interception=1 OR fumble_lost=1 THEN 1 ELSE 0 END) AS turnovers,
-            ROUND(100.0*SUM(CASE WHEN down=3 AND yards_gained>=ydstogo THEN 1 ELSE 0 END)
-                /NULLIF(SUM(CASE WHEN down=3 THEN 1 ELSE 0 END),0), 1) AS third_down_pct,
-            ROUND(100.0*SUM(CASE WHEN yardline_100<=20 AND touchdown=1 THEN 1 ELSE 0 END)
-                /NULLIF(SUM(CASE WHEN yardline_100<=20 THEN 1 ELSE 0 END),0), 1) AS red_zone_td_pct,
-            SUM(CASE WHEN (pass_attempt=1 AND yards_gained>=20)
-                       OR (rush_attempt=1  AND yards_gained>=10) THEN 1 ELSE 0 END) AS explosive_plays,
-            ROUND(AVG(epa), 3) AS avg_epa,
-            ROUND(AVG(CASE WHEN pass_attempt=1 THEN epa END), 3) AS pass_epa,
-            ROUND(AVG(CASE WHEN rush_attempt=1  THEN epa END), 3) AS rush_epa
-        FROM plays
-        WHERE posteam IS NOT NULL
-          AND play_type IN ('pass','run','field_goal','extra_point',
-                            'punt','kickoff','qb_spike','qb_kneel','no_play')
-        GROUP BY posteam, season
+            oagg.team, oagg.season_year, oagg.season_type,
+            oagg.total_plays, oagg.total_yards, oagg.yards_per_play,
+            oagg.rush_plays, oagg.pass_plays, oagg.pass_attempts, oagg.completions,
+            oagg.interceptions, oagg.sacks, oagg.dropbacks, oagg.scrambles,
+            oagg.rush_yards, oagg.pass_yards,
+            ROUND(oagg.rush_yards / NULLIF(oagg.rush_plays, 0), 2) AS yards_per_rush,
+            ROUND(oagg.pass_yards / NULLIF(oagg.pass_attempts, 0), 2) AS yards_per_pass,
+            oagg.touchdowns,
+            oagg.interceptions + COALESCE(fum.fumbles_lost, 0) AS turnovers,
+            ROUND(100.0 * oagg.third_down_conversions / NULLIF(oagg.third_downs, 0), 1) AS third_down_pct,
+            ROUND(100.0 * oagg.red_zone_tds / NULLIF(oagg.red_zone_plays, 0), 1) AS red_zone_td_pct,
+            oagg.explosive_plays, oagg.avg_epa, oagg.pass_epa, oagg.rush_epa
+        FROM oagg
+        LEFT JOIN fum USING (team, season_year, season_type)
     """)
     print("    team_offense_stats ✓")
 
-    conn.execute("""
+    # turnovers_forced counts an interception against the team plus an opponent fumble the
+    # team recovered, so the receiving team's own muffed punt is not credited to it.
+    conn.execute(f"""
         CREATE TABLE team_defense_stats AS
+        WITH dagg AS (
+            SELECT
+                defteam AS team, season AS season_year, season_type,
+                COUNT(*) FILTER (WHERE {_SCRIMMAGE}) AS plays_against,
+                COALESCE(SUM(COALESCE(yards_gained, 0)) FILTER (WHERE {_SCRIMMAGE}), 0) AS yards_allowed,
+                ROUND(AVG(yards_gained) FILTER (WHERE {_SCRIMMAGE}), 2) AS yards_per_play_allowed,
+                COUNT(*) FILTER (WHERE {_SACK}) AS sacks,
+                COUNT(*) FILTER (WHERE {_INTERCEPTION}) AS interceptions,
+                COUNT(*) FILTER (WHERE {_SCRIMMAGE} AND touchdown = 1 AND td_team = defteam) AS def_touchdowns,
+                COUNT(*) FILTER (WHERE {_SCRIMMAGE} AND down = 3 AND COALESCE(first_down, 0) <> 1) AS third_down_stops,
+                COUNT(*) FILTER (WHERE {_SCRIMMAGE} AND down = 3) AS third_downs,
+                ROUND(AVG(epa) FILTER (WHERE {_SCRIMMAGE}), 3) AS avg_epa_allowed
+            FROM {src}
+            WHERE defteam IS NOT NULL
+            GROUP BY defteam, season, season_type
+        ),
+        recovered AS (
+            SELECT CASE WHEN fumbled_1_team = posteam THEN defteam ELSE posteam END AS team,
+                   season AS season_year, season_type, COUNT(*) AS fumbles_recovered
+            FROM {src}
+            WHERE fumble_lost = 1 AND fumbled_1_team IN (posteam, defteam) AND {_NOT_NO_PLAY}
+            GROUP BY 1, season, season_type
+        )
         SELECT
-            defteam AS team, season AS season_year,
-            COUNT(*) AS plays_against,
-            SUM(COALESCE(yards_gained,0)) AS yards_allowed,
-            ROUND(AVG(yards_gained), 2) AS yards_per_play_allowed,
-            SUM(CASE WHEN sack=1         THEN 1 ELSE 0 END) AS sacks,
-            SUM(CASE WHEN interception=1 THEN 1 ELSE 0 END) AS interceptions,
-            SUM(CASE WHEN interception=1 OR fumble_lost=1 THEN 1 ELSE 0 END) AS turnovers_forced,
-            ROUND(100.0*SUM(CASE WHEN down=3 AND yards_gained<ydstogo THEN 1 ELSE 0 END)
-                /NULLIF(SUM(CASE WHEN down=3 THEN 1 ELSE 0 END),0), 1) AS third_down_stop_pct,
-            ROUND(AVG(epa), 3) AS avg_epa_allowed
-        FROM plays
-        WHERE defteam IS NOT NULL
-          AND play_type IN ('pass','run','field_goal','extra_point',
-                            'punt','kickoff','qb_spike','qb_kneel','no_play')
-        GROUP BY defteam, season
+            dagg.team, dagg.season_year, dagg.season_type,
+            dagg.plays_against, dagg.yards_allowed, dagg.yards_per_play_allowed,
+            dagg.sacks, dagg.interceptions,
+            dagg.interceptions + COALESCE(recovered.fumbles_recovered, 0) AS turnovers_forced,
+            dagg.def_touchdowns,
+            ROUND(100.0 * dagg.third_down_stops / NULLIF(dagg.third_downs, 0), 1) AS third_down_stop_pct,
+            dagg.avg_epa_allowed
+        FROM dagg
+        LEFT JOIN recovered USING (team, season_year, season_type)
     """)
     print("    team_defense_stats ✓")
 
@@ -595,39 +697,53 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
         CREATE TABLE situational_stats AS
         WITH base AS (
             SELECT *, {_SITUATION_EXPR} AS situation_label
-            FROM plays WHERE posteam IS NOT NULL AND down IS NOT NULL
+            FROM {src}
+            WHERE posteam IS NOT NULL AND down IS NOT NULL AND {_SCRIMMAGE}
+        ),
+        ruled AS (
+            SELECT *, {_CONVERSION_RULE_EXPR} AS conversion_rule FROM base
         )
         SELECT
-            posteam AS team, season AS season_year,
+            posteam AS team, season AS season_year, season_type,
             situation_label AS situation,
             COUNT(*) AS plays,
             ROUND(AVG(yards_gained), 2) AS avg_yards,
-            SUM(CASE WHEN touchdown=1 THEN 1 ELSE 0 END) AS touchdowns,
-            ROUND(100.0*SUM(CASE WHEN yards_gained>=ydstogo THEN 1 ELSE 0 END)
-                /NULLIF(COUNT(*),0), 1) AS conversion_pct,
+            COUNT(*) FILTER (WHERE touchdown = 1 AND td_team = posteam) AS touchdowns,
+            ROUND(100.0 * COUNT(*) FILTER (WHERE
+                    CASE WHEN situation_label = 'Red Zone'
+                         THEN touchdown = 1 AND td_team = posteam
+                         ELSE first_down = 1 END)
+                / NULLIF(COUNT(*), 0), 1) AS conversion_pct,
+            conversion_rule,
             ROUND(AVG(epa), 3) AS avg_epa
-        FROM base
-        GROUP BY posteam, season, situation_label
+        FROM ruled
+        GROUP BY posteam, season, season_type, situation_label, conversion_rule
     """)
     print("    situational_stats ✓")
 
     conn.execute(f"""
         CREATE TABLE formation_effectiveness AS
         SELECT
-            posteam AS team, season AS season_year,
+            posteam AS team, season AS season_year, season_type,
             {_FORMATION_EXPR} AS formation,
             play_type,
             COUNT(*) AS plays,
             ROUND(AVG(yards_gained), 2) AS avg_yards,
-            SUM(CASE WHEN touchdown=1 THEN 1 ELSE 0 END) AS touchdowns,
+            COUNT(*) FILTER (WHERE touchdown = 1 AND td_team = posteam) AS touchdowns,
             SUM(CASE WHEN interception=1 OR fumble_lost=1 THEN 1 ELSE 0 END) AS turnovers,
             ROUND(AVG(epa), 3) AS avg_epa
-        FROM plays
+        FROM {src}
         WHERE posteam IS NOT NULL AND play_type IN ('pass','run') AND shotgun IS NOT NULL
-        GROUP BY posteam, season, {_FORMATION_EXPR}, play_type
+          AND {_NOT_2PT}
+        GROUP BY posteam, season, season_type, {_FORMATION_EXPR}, play_type
         HAVING COUNT(*) >= 5
     """)
     print("    formation_effectiveness ✓")
+
+    for table in ["team_offense_stats", "team_defense_stats",
+                  "situational_stats", "formation_effectiveness"]:
+        row_count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        _record_loaded(conn, table, table, "derived", row_count, season=None)
 
     print("  Aggregate tables done")
 
@@ -645,7 +761,8 @@ def _table_exists(conn: duckdb.DuckDBPyConnection, name: str) -> bool:
 # Each fantasy derived table: (table_name, [required source tables], CREATE-AS SELECT body).
 # All are built at ingest time so the MCP tools never compute at query time.
 _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
-    # 1. TD luck — actual vs expected touchdowns per player-season (most "unlucky" first).
+    # 1. TD luck — actual vs expected touchdowns per player-season and season_type
+    #    (most "unlucky" first). {ff_typed} is ff_opportunity plus a REG/POST season_type.
     ("player_td_luck", ["ff_opportunity"], """
         SELECT
             player_id,
@@ -653,6 +770,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
             ANY_VALUE(position)             AS position,
             ANY_VALUE(posteam)              AS team,
             CAST(season AS INTEGER)         AS season,
+            season_type,
             SUM(rec_touchdown)              AS rec_td,
             SUM(rec_touchdown_exp)          AS rec_td_exp,
             SUM(rec_touchdown_diff)         AS rec_td_luck,
@@ -660,14 +778,15 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
             SUM(rush_touchdown_exp)         AS rush_td_exp,
             SUM(rush_touchdown_diff)        AS rush_td_luck,
             ROUND(SUM(rec_touchdown_diff) + SUM(rush_touchdown_diff), 3) AS total_td_luck_score
-        FROM ff_opportunity
+        FROM {ff_typed}
         WHERE player_id IS NOT NULL
-        GROUP BY player_id, CAST(season AS INTEGER)
+        GROUP BY player_id, CAST(season AS INTEGER), season_type
     """),
 
     # 2. Rolling 3-week role trend — snap / target / carry / air-yards share with
     #    a trailing 3-week average and the current-week delta vs that average.
-    ("player_role_trend", ["ff_opportunity", "snap_counts"], """
+    #    Snap counts join through players.gsis_id -> players.pfr_id -> snap_counts.pfr_player_id.
+    ("player_role_trend", ["ff_opportunity", "snap_counts", "players"], """
         WITH base AS (
             SELECT
                 o.player_id,
@@ -681,9 +800,14 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
                 ROUND(100.0 * o.rush_attempt / NULLIF(o.rush_attempt_team, 0), 2)  AS carry_share_pct,
                 ROUND(100.0 * o.rec_air_yards / NULLIF(o.rec_air_yards_team, 0), 2) AS air_yards_share_pct
             FROM ff_opportunity o
+            LEFT JOIN (
+                SELECT gsis_id, MAX(pfr_id) AS pfr_id
+                FROM players
+                WHERE gsis_id IS NOT NULL AND pfr_id IS NOT NULL
+                GROUP BY gsis_id
+            ) pl ON pl.gsis_id = o.player_id
             LEFT JOIN snap_counts s
-              ON s.player  = o.full_name
-             AND s.team    = o.posteam
+              ON s.pfr_player_id = pl.pfr_id
              AND s.season  = CAST(o.season AS INTEGER)
              AND s.week    = CAST(o.week AS INTEGER)
             WHERE o.player_id IS NOT NULL
@@ -754,6 +878,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
             ANY_VALUE(p.receiver_player_name)   AS player,
             p.posteam                           AS team,
             p.season                            AS season,
+            p.season_type                       AS season_type,
             COUNT(*)                            AS catchable_targets,
             SUM(CASE WHEN f.is_drop THEN 1 ELSE 0 END)              AS drops,
             ROUND(100.0 * SUM(CASE WHEN f.is_drop THEN 1 ELSE 0 END)
@@ -766,24 +891,14 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
          AND f.nflverse_play_id = p.play_id
         WHERE f.is_catchable_ball = TRUE
           AND p.receiver_player_id IS NOT NULL
-        GROUP BY p.receiver_player_id, p.posteam, p.season
+        GROUP BY p.receiver_player_id, p.posteam, p.season, p.season_type
     """),
 
     # 5. Contract value efficiency — fantasy points per $M of average per year (APY),
-    #    using each player's active contract joined to seasonal fantasy production.
+    #    using the contract in force that season: the latest year_signed <= season,
+    #    ties broken by the larger APY.
     ("player_contract_value", ["contracts", "ff_opportunity"], """
-        WITH active AS (
-            SELECT
-                gsis_id,
-                ANY_VALUE(position)   AS position,
-                ANY_VALUE(team)       AS team,
-                MAX(apy)              AS apy,
-                MAX(apy_cap_pct)      AS cap_pct
-            FROM contracts
-            WHERE is_active = TRUE AND gsis_id IS NOT NULL
-            GROUP BY gsis_id
-        ),
-        opp AS (
+        WITH opp AS (
             SELECT
                 player_id,
                 ANY_VALUE(full_name)   AS full_name,
@@ -795,25 +910,41 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
             FROM ff_opportunity
             WHERE player_id IS NOT NULL
             GROUP BY player_id, CAST(season AS INTEGER)
+        ),
+        ranked AS (
+            SELECT
+                opp.*,
+                c.position     AS contract_position,
+                c.apy          AS apy,
+                c.apy_cap_pct  AS cap_pct,
+                ROW_NUMBER() OVER (
+                    PARTITION BY opp.player_id, opp.season
+                    ORDER BY c.year_signed DESC, c.apy DESC NULLS LAST, c.apy_cap_pct DESC NULLS LAST
+                ) AS rn
+            FROM opp
+            JOIN contracts c
+              ON c.gsis_id = opp.player_id
+             AND c.year_signed <= opp.season
         )
         SELECT
-            opp.player_id,
-            opp.full_name,
-            COALESCE(opp.position, active.position) AS position,
-            opp.team,
-            opp.season,
-            ROUND(active.apy, 4)       AS apy,
-            ROUND(active.cap_pct, 4)   AS cap_pct,
-            ROUND(opp.total_fp, 2)     AS total_fp,
-            ROUND(opp.total_fp_exp, 2) AS total_fp_exp,
-            ROUND(opp.total_fp / NULLIF(active.apy, 0), 2) AS fp_per_million
-        FROM opp
-        JOIN active ON active.gsis_id = opp.player_id
+            player_id,
+            full_name,
+            COALESCE(position, contract_position) AS position,
+            team,
+            season,
+            ROUND(apy, 4)       AS apy,
+            ROUND(cap_pct, 4)   AS cap_pct,
+            ROUND(total_fp, 2)     AS total_fp,
+            ROUND(total_fp_exp, 2) AS total_fp_exp,
+            ROUND(total_fp / NULLIF(apy, 0), 2) AS fp_per_million
+        FROM ranked
+        WHERE rn = 1
     """),
 
     # 6. Injury return curve — post-return snap-share recovery (as % of pre-injury
     #    baseline) at +1..+8 weeks, bucketed by normalized injury type and position.
-    ("injury_return_curve", ["injuries", "snap_counts"], """
+    #    Snap counts join through players.gsis_id -> players.pfr_id -> snap_counts.pfr_player_id.
+    ("injury_return_curve", ["injuries", "snap_counts", "players"], """
         WITH outs AS (
             SELECT
                 gsis_id,
@@ -873,15 +1004,21 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
         ),
         baseline AS (
             SELECT
-                sp.gsis_id, sp.full_name, sp.position, sp.season,
+                sp.gsis_id, pl.pfr_id, sp.position, sp.season,
                 sp.injury_type, sp.first_out_week, sp.last_out_week,
                 AVG(sn.offense_pct) AS baseline_pct
             FROM spells sp
+            JOIN (
+                SELECT gsis_id, MAX(pfr_id) AS pfr_id
+                FROM players
+                WHERE gsis_id IS NOT NULL AND pfr_id IS NOT NULL
+                GROUP BY gsis_id
+            ) pl ON pl.gsis_id = sp.gsis_id
             JOIN snap_counts sn
-              ON sn.player = sp.full_name
+              ON sn.pfr_player_id = pl.pfr_id
              AND sn.season = sp.season
              AND sn.week   < sp.first_out_week
-            GROUP BY sp.gsis_id, sp.full_name, sp.position, sp.season,
+            GROUP BY sp.gsis_id, pl.pfr_id, sp.position, sp.season,
                      sp.injury_type, sp.first_out_week, sp.last_out_week
         ),
         curve AS (
@@ -892,7 +1029,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
                 100.0 * sn.offense_pct / NULLIF(b.baseline_pct, 0) AS recovery_pct
             FROM baseline b
             JOIN snap_counts sn
-              ON sn.player = b.full_name
+              ON sn.pfr_player_id = b.pfr_id
              AND sn.season = b.season
              AND sn.week   > b.last_out_week
              AND sn.week  <= b.last_out_week + 8
@@ -911,6 +1048,25 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
 ]
 
 
+def _ff_opportunity_typed(conn: duckdb.DuckDBPyConnection) -> str:
+    """ff_opportunity with a season_type (REG/POST) column, which the table does not carry.
+
+    POST comes from schedules.game_type through game_id (anything but REG); without a
+    schedules row the week decides (week > 18).
+    """
+    by_week = "CASE WHEN o.week > 18 THEN 'POST' ELSE 'REG' END"
+    if not _table_exists(conn, "schedules"):
+        return f"(SELECT o.*, {by_week} AS season_type FROM ff_opportunity o)"
+    return f"""(
+        SELECT o.*,
+               CASE WHEN s.game_type IS NULL THEN {by_week}
+                    WHEN s.game_type = 'REG' THEN 'REG' ELSE 'POST' END AS season_type
+        FROM ff_opportunity o
+        LEFT JOIN (SELECT game_id, ANY_VALUE(game_type) AS game_type FROM schedules GROUP BY game_id) s
+          ON s.game_id = o.game_id
+    )"""
+
+
 def _create_fantasy_tables(conn: duckdb.DuckDBPyConnection):
     """Build the fantasy-analytics derived tables from already-ingested source data.
 
@@ -919,13 +1075,14 @@ def _create_fantasy_tables(conn: duckdb.DuckDBPyConnection):
     Tables whose source data isn't present yet are skipped gracefully.
     """
     print("\n  Creating fantasy derived tables…")
+    ff_typed = _ff_opportunity_typed(conn)
     for table_name, sources, body in _FANTASY_TABLES:
         missing = [s for s in sources if not _table_exists(conn, s)]
         if missing:
             print(f"    {table_name} — skipped (missing sources: {', '.join(missing)})")
             continue
         conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-        conn.execute(f"CREATE TABLE {table_name} AS {body}")
+        conn.execute(f"CREATE TABLE {table_name} AS {body.replace('{ff_typed}', ff_typed)}")
         row_count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
         _record_loaded(conn, table_name, table_name, "derived", row_count, season=None)
         print(f"    {table_name} ✓ ({row_count:,} rows)")
@@ -983,6 +1140,26 @@ def _create_team_records(conn: duckdb.DuckDBPyConnection):
     row_count = conn.execute("SELECT COUNT(*) FROM team_records").fetchone()[0]
     _record_loaded(conn, "team_records", "team_records", "derived", row_count, season=None)
     print(f"    team_records ✓ ({row_count:,} rows)")
+
+
+def rebuild_derived_tables(conn: duckdb.DuckDBPyConnection) -> None:
+    """Rebuild every derived table from the loaded source data in one transaction.
+
+    On any failure the transaction is rolled back, so the previous tables stay intact,
+    and the error is re-raised. All SQL goes through conn.execute.
+    """
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        _create_aggregate_tables(conn)
+        _create_fantasy_tables(conn)
+        _create_team_records(conn)
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except duckdb.Error as rollback_error:
+            print(f"    Rollback after the failed rebuild also failed: {rollback_error}")
+        raise
 
 
 def _create_indexes(conn: duckdb.DuckDBPyConnection):

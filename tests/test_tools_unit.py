@@ -359,7 +359,7 @@ def test_team_stats_offense_only_without_season_clause(monkeypatch):
     assert "offense" in result
     assert "defense" not in result
     assert "season_year = ?" not in calls[0][0]
-    assert calls[0][1] == ["KC"]
+    assert calls[0][1] == ["KC", "REG"]  # season_type defaults to REG
 
 
 def test_team_stats_returns_error_on_timeout(monkeypatch):
@@ -461,7 +461,7 @@ def test_compare_team_applies_season_range_filters(monkeypatch):
     assert len(calls) == 4
     assert "season_year >= ?" in calls[0][0]
     assert "season_year <= ?" in calls[0][0]
-    assert calls[0][1] == ["KC", 2020, 2021]
+    assert calls[0][1] == ["KC", 2020, 2021, "REG"]  # team mode defaults to REG
 
 
 def test_compare_returns_error_on_timeout(monkeypatch):
