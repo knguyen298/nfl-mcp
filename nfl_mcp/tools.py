@@ -98,6 +98,7 @@ def _find_players(
     name: str | None = None,
     *,
     gsis_id: str | None = None,
+    gsis_ids: list[str] | None = None,
     team: str | None = None,
     season: int | None = None,
     season_from: int | None = None,
@@ -116,6 +117,9 @@ def _find_players(
     if gsis_id is not None:
         where.append("p.gsis_id = ?")
         params.append(gsis_id)
+    if gsis_ids:
+        where.append(f"p.gsis_id IN ({', '.join('?' for _ in gsis_ids)})")
+        params.extend(gsis_ids)
     if name is not None:
         q = _fold(name, strip_suffix=True)
         if not q:
@@ -208,8 +212,9 @@ def _resolve_player(
     player_id wins over player_name, and a name shaped like a gsis id counts as an id.
     A name matching one player gives (player, None). Several give an ambiguous response and
     an unknown id gives an error; both are returned as early_response. No match gives
-    (None, None). When team or season leave nobody, a name that matches exactly one player
-    overall is still used, so a player with no roster row in that season resolves.
+    (None, None). When team or season leave nobody, the name is matched again without them:
+    one player overall is used (so a player with no roster row in that season resolves) and
+    several are returned as ambiguous.
     """
     name = None if player_name is None else str(player_name).strip()
     if not player_id and name and _GSIS_ID.fullmatch(name):
@@ -225,9 +230,7 @@ def _resolve_player(
     filters = {"team": team, "season": season, "season_from": season_from, "season_to": season_to}
     candidates, truncated = _find_players(name, **filters)
     if not candidates and any(v is not None for v in filters.values()):
-        wide, _ = _find_players(name)
-        if len(wide) == 1:
-            candidates = wide
+        candidates, truncated = _find_players(name)
     if len(candidates) == 1:
         return candidates[0], None
     if candidates:
@@ -257,9 +260,27 @@ def nfl_player_lookup(
     return result
 
 
+def _like_pattern(text: str) -> str:
+    """Substring pattern for LIKE ... ESCAPE '\\' with % and _ taken literally."""
+    escaped = text.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _table_players(table: str, name_col: str, text: str, season: int | None) -> list[dict]:
+    """Distinct (player_id, name) pairs in a derived table whose name contains text."""
+    sql = (f"SELECT DISTINCT player_id, {name_col} AS name FROM {table} "
+           f"WHERE player_id IS NOT NULL AND {name_col} ILIKE ? ESCAPE '\\'")
+    params: list[Any] = [_like_pattern(text)]
+    if season is not None:
+        sql += " AND season = ?"
+        params.append(int(season))
+    return _execute(sql + " ORDER BY player_id LIMIT 26", params)
+
+
 def _player_filter(
     player: str | None,
     player_id: str | None,
+    table: str,
     name_col: str,
     *,
     team: str | None = None,
@@ -268,20 +289,32 @@ def _player_filter(
     """Player condition for a derived table that has a player_id column.
 
     Returns (condition, params, player, early_response). A name resolves through players:
-    one match filters on player_id, several give the ambiguous response as early_response,
-    none falls back to a substring match on name_col (the table's own name column).
+    one match filters on player_id and several give the ambiguous response as early_response.
+    With no match in players (a partial name such as "Alle"), the ids in the table whose
+    name_col contains the text decide: one id filters on it, several are ambiguous.
     """
     if not player and not player_id:
         return None, [], None, None
     try:
         found, early = _resolve_player(player, player_id, team=team, season=season)
+        if early is None and found is None:
+            pairs = _table_players(table, name_col, str(player), season)
+            ids = [p["player_id"] for p in pairs[:25]]
+            if len(pairs) == 1:
+                found = {"gsis_id": ids[0], "display_name": pairs[0]["name"]}
+            elif pairs:
+                known, _ = _find_players(gsis_ids=ids, limit=25)
+                seen = {c["gsis_id"] for c in known}
+                known += [{"gsis_id": p["player_id"], "display_name": p["name"]}
+                          for p in pairs[:25] if p["player_id"] not in seen]
+                early = _ambiguous(known, len(pairs) > 25)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.exception("Tool error")
         return None, [], None, {"error": str(e)}
     if early is not None:
         return None, [], None, early
     if found is None:
-        return f"{name_col} ILIKE ?", [f"%{player}%"], None, None
+        return f"{name_col} ILIKE ? ESCAPE '\\'", [_like_pattern(str(player))], None, None
     return "player_id = ?", [found["gsis_id"]], found, None
 
 
@@ -812,15 +845,24 @@ _SACKED = f"passer_player_id = me.id AND sack = 1 AND {_NOT_TWO_POINT} AND {_NOT
 _DROPBACK = (f"qb_dropback = 1 AND {_NOT_TWO_POINT} AND {_NOT_NO_PLAY} "
              "AND (passer_player_id = me.id OR (rusher_player_id = me.id AND qb_scramble = 1))")
 _CARRY = f"rusher_player_id = me.id AND rush_attempt = 1 AND {_NOT_TWO_POINT}"
-_TARGET = (f"receiver_player_id = me.id AND pass_attempt = 1 AND {_NOT_SACK} "
-           f"AND {_NOT_TWO_POINT}")
+_PASS_TO_RECEIVER = f"pass_attempt = 1 AND {_NOT_SACK} AND {_NOT_TWO_POINT}"
+_TARGET = f"receiver_player_id = me.id AND {_PASS_TO_RECEIVER}"
+# A lateral after the catch: the second player gets the yards and the touchdown.
+_LATERAL_RECEIVER = f"lateral_receiver_player_id = me.id AND {_PASS_TO_RECEIVER}"
+_LATERAL_RUSHER = f"lateral_rusher_player_id = me.id AND rush_attempt = 1 AND {_NOT_TWO_POINT}"
+# td_player_id names the scorer; it is NULL on rows without a touchdown (and on test rows).
+_RECEIVING_TD = (f"({_TARGET} OR {_LATERAL_RECEIVER}) AND pass_touchdown = 1 "
+                 "AND COALESCE(td_player_id, receiver_player_id) = me.id")
 
 _STAT_DEFINITIONS = {
     "attempts": "pass_attempt=1 AND sack=0 AND two_point_attempt=0 AND play_type<>'no_play', "
-                "passer_player_id = the player. Spikes count as attempts.",
+                "passer_player_id = the player. Spikes count as attempts. A play coded no_play "
+                "with pass_attempt=1 (for example a reversed sack ruled intentional grounding) "
+                "is excluded, so attempts can be one below the official count.",
     "completions": "attempts with complete_pass=1.",
-    "yards": "passing: passing_yards on attempts; rushing: rushing_yards on carries; "
-             "receiving: receiving_yards on targets.",
+    "yards": "passing: passing_yards on attempts; rushing: rushing_yards on carries plus "
+             "lateral_rushing_yards when the player took a lateral; receiving: receiving_yards "
+             "on targets plus lateral_receiving_yards when the player took a lateral.",
     "sacks": "sack=1 with the player as passer_player_id, excluding two_point_attempt=1 and no_play.",
     "dropbacks": "qb_dropback=1 AND two_point_attempt=0 AND play_type<>'no_play', where the player is "
                  "passer_player_id or is rusher_player_id on a qb_scramble=1 play "
@@ -834,7 +876,8 @@ _STAT_DEFINITIONS = {
     "targets": "pass_attempt=1 AND sack=0 AND two_point_attempt=0, receiver_player_id = the player.",
     "receptions": "targets with complete_pass=1.",
     "touchdowns": "passing: pass_touchdown=1 on attempts; rushing: rush_touchdown=1 on carries; "
-                  "receiving: pass_touchdown=1 on targets.",
+                  "receiving: pass_touchdown=1 on targets or lateral receptions, credited to the "
+                  "scorer (td_player_id), so a receiver who lateraled to the scorer gets none.",
 }
 
 
@@ -865,7 +908,8 @@ _PLAYER_STATS_SQL = f"""
         {_sql_avg('cpoe', _ATTEMPT)} AS avg_cpoe,
         {_sql_sum('air_yards', _ATTEMPT)} AS pass_air_yards,
         {_sql_count(_CARRY)} AS carries,
-        {_sql_sum('rushing_yards', _CARRY)} AS rush_yards,
+        COALESCE({_sql_sum('rushing_yards', _CARRY)}, 0)
+            + COALESCE({_sql_sum('lateral_rushing_yards', _LATERAL_RUSHER)}, 0) AS rush_yards,
         {_sql_count(_CARRY, 'rush_touchdown = 1')} AS rush_tds,
         {_sql_count(_CARRY, 'qb_scramble = 1')} AS scrambles,
         {_sql_count(_CARRY, 'fumble_lost = 1')} AS fumbles_lost,
@@ -873,13 +917,15 @@ _PLAYER_STATS_SQL = f"""
         {_sql_avg('epa', _CARRY)} AS epa_per_carry,
         {_sql_count(_TARGET)} AS targets,
         {_sql_count(_TARGET, 'complete_pass = 1')} AS receptions,
-        {_sql_sum('receiving_yards', _TARGET)} AS rec_yards,
-        {_sql_count(_TARGET, 'pass_touchdown = 1')} AS rec_tds,
+        COALESCE({_sql_sum('receiving_yards', _TARGET)}, 0)
+            + COALESCE({_sql_sum('lateral_receiving_yards', _LATERAL_RECEIVER)}, 0) AS rec_yards,
+        {_sql_count(_RECEIVING_TD)} AS rec_tds,
         {_sql_avg('yards_after_catch', _TARGET, 1)} AS avg_yac,
         {_sql_count(_TARGET, 'yards_gained >= 20')} AS explosive_plays,
         {_sql_avg('epa', _TARGET)} AS epa_per_target
     FROM plays, (SELECT CAST(? AS VARCHAR) AS id) AS me
-    WHERE me.id IN (passer_player_id, rusher_player_id, receiver_player_id)
+    WHERE me.id IN (passer_player_id, rusher_player_id, receiver_player_id,
+                    lateral_receiver_player_id, lateral_rusher_player_id)
 """
 
 
@@ -950,7 +996,8 @@ def _player_seasons(
     if season_type:
         sql += " AND season_type = ?"
         params.append(str(season_type).upper())
-    sql += " GROUP BY season, season_type ORDER BY season, season_type"
+    sql += (" GROUP BY season, season_type"
+            " ORDER BY season, CASE season_type WHEN 'REG' THEN 0 ELSE 1 END, season_type")
     return [_season_row(row) for row in _execute(sql, params)]
 
 
@@ -1441,7 +1488,7 @@ def nfl_fantasy_opportunity(
     """
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
-        player, player_id, "full_name", team=team, season=season)
+        player, player_id, "ff_opportunity", "full_name", team=team, season=season)
     if early is not None:
         return early
     if cond:
@@ -1685,7 +1732,7 @@ def nfl_td_luck(
 
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
-        player, player_id, "full_name", team=team, season=season)
+        player, player_id, "player_td_luck", "full_name", team=team, season=season)
     if early is not None:
         return early
     if cond:
@@ -1743,7 +1790,7 @@ def nfl_role_trend(
 
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
-        player, player_id, "full_name", team=team, season=season)
+        player, player_id, "player_role_trend", "full_name", team=team, season=season)
     if early is not None:
         return early
     if cond:
@@ -1811,7 +1858,7 @@ def nfl_separation_opportunity(
 
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
-        player, player_id, "full_name", team=team, season=season)
+        player, player_id, "player_separation_opportunity", "full_name", team=team, season=season)
     if early is not None:
         return early
     if cond:
@@ -1875,7 +1922,7 @@ def nfl_drop_rate(
 
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
-        player, player_id, "player", team=team, season=season)
+        player, player_id, "player_drop_rate", "player", team=team, season=season)
     if early is not None:
         return early
     if cond:
@@ -1932,7 +1979,7 @@ def nfl_contract_value(
 
     conditions, params = [], []
     cond, cparams, resolved, early = _player_filter(
-        player, player_id, "full_name", team=team, season=season)
+        player, player_id, "player_contract_value", "full_name", team=team, season=season)
     if early is not None:
         return early
     if cond:

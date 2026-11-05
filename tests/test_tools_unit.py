@@ -14,6 +14,7 @@ import nfl_mcp.tools as tools
 def no_player_match(monkeypatch):
     """Names resolve to nobody, so a tool falls back to a substring match on its own name column."""
     monkeypatch.setattr(tools, "_find_players", lambda *a, **k: ([], False))
+    monkeypatch.setattr(tools, "_table_players", lambda *a, **k: [])
 
 
 MAHOMES = {"gsis_id": "00-0033873", "display_name": "Patrick Mahomes"}

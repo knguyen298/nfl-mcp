@@ -151,7 +151,9 @@ PLAY_COLS = {c: "DOUBLE" for c in (
     "touchdown fumble_lost epa qb_epa cpoe").split()}
 PLAY_COLS.update({c: "VARCHAR" for c in (
     "game_id season_type posteam defteam play_type passer_player_id passer_player_name "
-    "rusher_player_id rusher_player_name receiver_player_id receiver_player_name").split()})
+    "rusher_player_id rusher_player_name receiver_player_id receiver_player_name "
+    "lateral_receiver_player_id lateral_rusher_player_id td_player_id").split()})
+PLAY_COLS.update(lateral_receiving_yards="DOUBLE", lateral_rushing_yards="DOUBLE")
 PLAY_COLS.update(season="INTEGER", week="INTEGER")
 _NAME = {JA: "J.Allen", BA: "B.Allen", KA: "K.Allen", KY: "K.Allen", JV: "J.Williams",
          JM: "J.Williams", OB: "O.Beckham", CH: "J.Chase", AE: "A.Estime", TK: "T.Kelce",
@@ -207,7 +209,16 @@ O1 = _pass(PM, OB, complete=1, yds=7, team="KC")
 E1 = _run(AE, yds=3, team="PIT")
 S1 = _run(SB, yds=10, td=1, team="PHI")
 T1 = _pass(PM, TK, complete=1, yds=11, team="KC")
-PLAYS = [P1, P2, P3, P4, P5, P6, P7, P8, R1, R2, R3, R4, P9, B1, K1, W1, W2, W3, O1, E1, S1, T1]
+# Laterals, in their own game (week 4) and on players no other test counts.
+# L1: Mahomes -> Beckham, 4 yds, lateral to Kelce for 30 more, Kelce scores.
+L1 = _pass(PM, OB, complete=1, yds=34, td=1, epa=1.0, week=4, team="KC")
+L1.update(receiving_yards=4, lateral_receiver_player_id=TK, lateral_receiving_yards=30,
+          td_player_id=TK)
+# L2: Barkley runs 3 yds, laterals to Estime who gains 7 more.
+L2 = _run(SB, yds=3, week=4, team="PHI")
+L2.update(lateral_rusher_player_id=AE, lateral_rushing_yards=7)
+PLAYS = [P1, P2, P3, P4, P5, P6, P7, P8, R1, R2, R3, R4, P9, B1, K1, W1, W2, W3, O1, E1, S1, T1,
+         L1, L2]
 FTN_PLAYS = [(P1, True), (P2, False), (P3, False), (P4, False), (P5, False), (R1, True),
              (R2, False), (P9, False), (B1, False), (K1, True)]  # (play, is_play_action)
 
@@ -467,6 +478,73 @@ def test_definitions_block_names_each_rule(syn):
     for key in ("attempts", "dropbacks", "carries", "scrambles", "targets"):
         assert key in defs and isinstance(defs[key], str) and defs[key]
     assert "sack" in defs["attempts"] and "two_point" in defs["attempts"]
+
+
+@pytest.mark.parametrize("gid, block, expected", [
+    # O1 (7 yds) + L1 (4 yds caught; the 30 after the lateral belong to Kelce, so is the TD)
+    (OB, "receiving", dict(targets=2, receptions=2, yards=11, touchdowns=0)),
+    # T1 (target, 11 yds) + 30 lateral yards and the TD from L1; L1 is not his target
+    (TK, "receiving", dict(targets=1, receptions=1, yards=41, touchdowns=1)),
+    # O1 + T1 + L1 are attempts; yards 7 + 11 + 34; one TD (L1)
+    (PM, "passing", dict(attempts=3, completions=3, yards=52, touchdowns=1)),
+    # S1 (10 yds, TD) + L2 (3 yds before the lateral); 2 carries
+    (SB, "rushing", dict(carries=2, yards=13, touchdowns=1)),
+    # E1 (3 yds) + 7 lateral yards from L2; the lateral is not a carry for him
+    (AE, "rushing", dict(carries=1, yards=10, touchdowns=0)),
+])
+def test_lateral_yards_and_touchdowns_go_to_the_player_who_got_them(syn, gid, block, expected):
+    res = call("nfl_player_stats", player_id=gid, season=2024, season_type="REG")
+    got = _entry(res)[block]
+    assert {k: got[k] for k in expected} == expected
+
+
+def test_player_stats_lists_reg_before_post(syn):
+    res = call("nfl_player_stats", player_id=JA, season=2024)
+    assert [s["season_type"] for s in res["seasons"]] == ["REG", "POST"]
+
+
+def test_definitions_note_the_reversed_no_play_pass(syn):
+    defs = call("nfl_player_stats", player_id=JA, season=2024)["definitions"]
+    assert "no_play" in defs["attempts"] and "one below" in defs["attempts"]
+    assert "lateral" in defs["yards"] and "td_player_id" in defs["touchdowns"]
+
+
+# ── name resolution when the filter leaves nobody ────────────────────────────
+
+@pytest.mark.parametrize("name, ids", [("Allen", ALLENS), ("J.Williams", {JV, JM})])
+def test_player_stats_season_without_roster_rows_is_still_ambiguous(syn, name, ids):
+    res = call("nfl_player_stats", player_name=name, season=2019)  # rosters start in 2023 here
+    _assert_ambiguous(res, ids=ids)
+
+
+def test_player_stats_season_without_roster_rows_uses_a_lone_match(syn):
+    res = call("nfl_player_stats", player_name="Patrick Mahomes", season=2019)
+    assert res["player_id"] == PM and res["seasons"] == []
+
+
+def test_compare_season_without_roster_rows_is_ambiguous(syn):
+    res = call("nfl_compare", entity1="Allen", entity2="Patrick Mahomes", compare_type="player",
+               season=2019)
+    _assert_ambiguous(res, ids=ALLENS)
+
+
+# ── partial names on derived tools ───────────────────────────────────────────
+
+def test_derived_tool_partial_name_matching_several_ids_is_ambiguous(syn):
+    res = call("nfl_td_luck", player="Alle", season=2024)  # "Alle" is no player's name
+    _assert_ambiguous(res, ids={JA, KA, BA})
+    assert not res.get("td_luck")
+
+
+def test_derived_tool_partial_name_matching_one_id_filters_on_it(syn):
+    res = call("nfl_td_luck", player="Chas", season=2024)
+    assert {r["player_id"] for r in res["td_luck"]} == {CH}
+    assert res["player_id"] == CH
+
+
+@pytest.mark.parametrize("text", ["%", "_", "A_len"])
+def test_derived_tool_partial_name_wildcards_are_literal(syn, text):
+    assert call("nfl_td_luck", player=text)["td_luck"] == []
 
 
 # ── 4. nfl_compare player mode ───────────────────────────────────────────────
