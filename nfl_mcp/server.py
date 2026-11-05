@@ -1,6 +1,6 @@
 """
 NFL MCP Server
-Tools: nfl_schema, nfl_status, nfl_query, nfl_search_plays, nfl_team_stats, nfl_player_stats, nfl_compare,
+Tools: nfl_schema, nfl_status, nfl_query, nfl_search_plays, nfl_team_stats, nfl_player_stats, nfl_player_lookup, nfl_compare,
        nfl_catalog, nfl_roster, nfl_injuries, nfl_schedule, nfl_snap_counts, nfl_team_records
 """
 
@@ -32,7 +32,7 @@ from starlette.routing import Route
 from .database import get_db_connection
 from .tools import (
     nfl_schema, nfl_status, nfl_query, nfl_search_plays,
-    nfl_team_stats, nfl_player_stats, nfl_compare,
+    nfl_team_stats, nfl_player_stats, nfl_player_lookup, nfl_compare,
     nfl_catalog, nfl_roster, nfl_injuries, nfl_schedule, nfl_snap_counts,
     nfl_fantasy_opportunity, nfl_fantasy_rankings, nfl_ftn_charting,
     nfl_td_luck, nfl_role_trend, nfl_separation_opportunity,
@@ -353,18 +353,67 @@ TOOLS = [
         },
     ),
     Tool(
+        name="nfl_player_lookup",
+        description=(
+            "Find a player by name and get the gsis_id that the other player tools take as "
+            "player_id. Use it when a name could match several players (e.g. 'Allen', 'Josh "
+            "Allen', 'J.Williams'). Ignores case, accents, punctuation and Jr/II suffixes. "
+            "Returns candidates with position, teams, first and last season, and pfr_id. "
+            "Zero matches is count 0, not an error."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Full name, surname, or short name (e.g. 'Josh Allen', 'Allen', "
+                        "'K.Allen', \"Ja'Marr Chase\")"
+                    ),
+                },
+                "team": {
+                    "type": "string",
+                    "description": "Keep players with a roster row for this team (in `season` when given).",
+                },
+                "season": {
+                    "type": "integer",
+                    "description": "Keep players with a roster row in this season (rosters cover 2024 on).",
+                },
+                "position": {
+                    "type": "string",
+                    "description": "Position filter (e.g. QB, WR).",
+                },
+            },
+            "required": ["name"],
+        },
+    ),
+    Tool(
         name="nfl_player_stats",
         description=(
-            "PREFERRED for any player stats question. Returns season-by-season "
-            "aggregates for passing, rushing, or receiving. Always use this instead "
-            "of nfl_query for questions about a player's performance, stats, or trends."
+            "PREFERRED for any player stats question. Returns season-by-season passing, "
+            "rushing and receiving stats for one player, split by season type, with the "
+            "definitions used (attempts exclude sacks and two-point tries; targets exclude "
+            "two-point tries). Always use this instead of nfl_query for questions about a "
+            "player's performance, stats, or trends. If the name matches several players the "
+            "result is {ambiguous: true, candidates: [...]}: call again with player_id."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "player_name": {
                     "type": "string",
-                    "description": "Player name (partial match, e.g. 'Mahomes', 'D.Henry', 'J.Jefferson')",
+                    "description": (
+                        "Player name, e.g. 'Patrick Mahomes' or 'Mahomes', or a gsis_id such as "
+                        "'00-0034857'. With `season` set, only players on a roster that season "
+                        "are considered. Ignored when player_id is given."
+                    ),
+                },
+                "player_id": {
+                    "type": "string",
+                    "description": (
+                        "Player gsis_id, e.g. '00-0034857' (from nfl_player_lookup). "
+                        "Takes precedence over player_name."
+                    ),
                 },
                 "season": {
                     "type": "integer",
@@ -381,13 +430,12 @@ TOOLS = [
                 "season_type": {
                     "type": "string",
                     "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs)",
+                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Omit for one row per type.",
                 },
                 "stat_type": {
                     "type": "string",
                     "enum": ["passing", "rushing", "receiving"],
-                    "description": "Type of stats to return (default: passing)",
-                    "default": "passing",
+                    "description": "Return only this block (default: all three).",
                 },
             },
             "required": ["player_name"],
@@ -553,7 +601,14 @@ TOOLS = [
             "properties": {
                 "player": {
                     "type": "string",
-                    "description": "Player name (partial match, e.g. 'Kelce')",
+                    "description": "Player name as stored in snap counts: full name or surname, e.g. 'Travis Kelce' or 'Kelce' (not 'T.Kelce')",
+                },
+                "player_id": {
+                    "type": "string",
+                    "description": (
+                        "Player gsis_id, e.g. '00-0034857'. Takes precedence over a name. "
+                        "Get it from nfl_player_lookup."
+                    ),
                 },
                 "team": {
                     "type": "string",
@@ -587,7 +642,14 @@ TOOLS = [
             "properties": {
                 "player": {
                     "type": "string",
-                    "description": "Player name (partial match, e.g. 'Jefferson')",
+                    "description": "Player name, e.g. 'Justin Jefferson'. A name that matches several players returns ambiguous candidates; then pass player_id.",
+                },
+                "player_id": {
+                    "type": "string",
+                    "description": (
+                        "Player gsis_id, e.g. '00-0034857'. Takes precedence over a name. "
+                        "Get it from nfl_player_lookup."
+                    ),
                 },
                 "team": {
                     "type": "string",
@@ -675,7 +737,14 @@ TOOLS = [
                 },
                 "player": {
                     "type": "string",
-                    "description": "Player name (partial match) — matches passer, rusher, or receiver.",
+                    "description": "Player name for one player (passer, rusher or receiver). A name that matches several players returns ambiguous candidates; then pass player_id.",
+                },
+                "player_id": {
+                    "type": "string",
+                    "description": (
+                        "Player gsis_id, e.g. '00-0034857'. Takes precedence over a name. "
+                        "Get it from nfl_player_lookup."
+                    ),
                 },
                 "season": {
                     "type": "integer",
@@ -714,7 +783,8 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "player": {"type": "string", "description": "Player full name (partial match)."},
+                "player": {"type": "string", "description": "Player name, e.g. 'Justin Jefferson'. A name that matches several players returns ambiguous candidates; then pass player_id."},
+                "player_id": {"type": "string", "description": "Player gsis_id (from nfl_player_lookup). Takes precedence over a name."},
                 "position": {"type": "string", "description": "Position filter (e.g. WR, RB, TE)."},
                 "team": {"type": "string", "description": "Team abbreviation (e.g. KC)."},
                 "season": {"type": "integer", "description": "Exact season year."},
@@ -734,7 +804,8 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "player": {"type": "string", "description": "Player full name (partial match)."},
+                "player": {"type": "string", "description": "Player name, e.g. 'Justin Jefferson'. A name that matches several players returns ambiguous candidates; then pass player_id."},
+                "player_id": {"type": "string", "description": "Player gsis_id (from nfl_player_lookup). Takes precedence over a name."},
                 "position": {"type": "string", "description": "Position filter (e.g. WR, RB)."},
                 "team": {"type": "string", "description": "Team abbreviation."},
                 "season": {"type": "integer", "description": "Exact season year."},
@@ -756,7 +827,8 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "player": {"type": "string", "description": "Player full name (partial match)."},
+                "player": {"type": "string", "description": "Player name, e.g. 'Justin Jefferson'. A name that matches several players returns ambiguous candidates; then pass player_id."},
+                "player_id": {"type": "string", "description": "Player gsis_id (from nfl_player_lookup). Takes precedence over a name."},
                 "position": {"type": "string", "description": "Position filter (e.g. WR, TE)."},
                 "team": {"type": "string", "description": "Team abbreviation."},
                 "season": {"type": "integer", "description": "Exact season year (2016+)."},
@@ -774,13 +846,14 @@ TOOLS = [
             "PREFERRED for drops / catchable-target reliability questions (2022–present). "
             "Returns share of catchable targets dropped per receiver-season from FTN charting, "
             "plus contested targets and created receptions. Use for 'who drops the most passes' "
-            "or 'what is player X's drop rate'. Player names are short form ('J.Jefferson'). "
+            "or 'what is player X's drop rate'. Full names work. "
             "Default sort is highest drop rate first."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "player": {"type": "string", "description": "Player name (partial match, short form)."},
+                "player": {"type": "string", "description": "Player name, e.g. 'Justin Jefferson'. A name that matches several players returns ambiguous candidates; then pass player_id."},
+                "player_id": {"type": "string", "description": "Player gsis_id (from nfl_player_lookup). Takes precedence over a name."},
                 "team": {"type": "string", "description": "Team abbreviation."},
                 "season": {"type": "integer", "description": "Exact season year (2022+)."},
                 "min_targets": {"type": "integer", "description": "Minimum catchable targets to qualify."},
@@ -800,7 +873,8 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "player": {"type": "string", "description": "Player full name (partial match)."},
+                "player": {"type": "string", "description": "Player name, e.g. 'Justin Jefferson'. A name that matches several players returns ambiguous candidates; then pass player_id."},
+                "player_id": {"type": "string", "description": "Player gsis_id (from nfl_player_lookup). Takes precedence over a name."},
                 "position": {"type": "string", "description": "Position filter (e.g. RB, WR)."},
                 "team": {"type": "string", "description": "Team abbreviation."},
                 "season": {"type": "integer", "description": "Exact season year."},
@@ -892,6 +966,7 @@ async def call_tool(name: str, arguments: Any) -> CallToolResult:
         "nfl_search_plays": nfl_search_plays,
         "nfl_team_stats":   nfl_team_stats,
         "nfl_player_stats": nfl_player_stats,
+        "nfl_player_lookup": nfl_player_lookup,
         "nfl_compare":      nfl_compare,
         "nfl_catalog":      nfl_catalog,
         "nfl_roster":       nfl_roster,

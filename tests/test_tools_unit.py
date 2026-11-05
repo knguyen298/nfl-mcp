@@ -1,12 +1,35 @@
 """DB-independent unit tests for query construction and validation."""
 
 import time
+from collections import defaultdict
 from contextlib import contextmanager
 
 import duckdb
 import pytest
 
 import nfl_mcp.tools as tools
+
+
+@pytest.fixture
+def no_player_match(monkeypatch):
+    """Names resolve to nobody, so a tool falls back to a substring match on its own name column."""
+    monkeypatch.setattr(tools, "_find_players", lambda *a, **k: ([], False))
+
+
+MAHOMES = {"gsis_id": "00-0033873", "display_name": "Patrick Mahomes"}
+
+
+@pytest.fixture
+def resolves_to_mahomes(monkeypatch):
+    """Record the names handed to the resolver and resolve every one of them to Mahomes."""
+    seen = []
+
+    def fake_resolve(player_name, player_id, **kwargs):
+        seen.append((player_name, player_id, kwargs))
+        return dict(MAHOMES), None
+
+    monkeypatch.setattr(tools, "_resolve_player", fake_resolve)
+    return seen
 
 
 def test_normalize_player_name_handles_full_short_and_last_name_inputs():
@@ -52,7 +75,7 @@ def test_team_stats_uses_parameterized_team_and_season(monkeypatch):
     assert all(2024 in params for _, params in calls)
 
 
-def test_player_stats_uses_parameterized_player_name(monkeypatch):
+def test_player_stats_uses_parameterized_player_id(monkeypatch, resolves_to_mahomes):
     captured = {}
 
     def fake_execute(sql, params=None):
@@ -61,26 +84,78 @@ def test_player_stats_uses_parameterized_player_name(monkeypatch):
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
-    tools.nfl_player_stats(player_name="P.Mahomes", stat_type="passing", season_type="REG")
+    result = tools.nfl_player_stats(player_name="P.Mahomes", season_type="reg")
 
-    assert "ILIKE ?" in captured["sql"]
-    assert captured["params"][0] == "%P.Mahomes%"
-    assert captured["params"][1] == "pass"
-    assert captured["params"][-1] == "REG"
+    assert "me.id" in captured["sql"]
+    assert captured["params"] == [MAHOMES["gsis_id"], "REG"]
+    assert result["player_id"] == MAHOMES["gsis_id"]
+    assert result["seasons"] == []
 
 
-def test_player_stats_normalizes_full_player_name(monkeypatch):
+def test_player_stats_passes_full_name_to_resolver_unchanged(monkeypatch, resolves_to_mahomes):
+    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [])
+    tools.nfl_player_stats(player_name="Justin Jefferson")
+
+    assert resolves_to_mahomes[0][0] == "Justin Jefferson"
+
+
+@pytest.mark.parametrize("stat_type", ["passing", "rushing", "receiving"])
+def test_player_stats_stat_type_keeps_one_block(monkeypatch, resolves_to_mahomes, stat_type):
     captured = {}
+    row = defaultdict(lambda: None, season=2024, season_type="REG")  # every other stat is NULL
 
     def fake_execute(sql, params=None):
         captured["sql"] = sql
         captured["params"] = params
-        return []
+        return [row]
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
-    tools.nfl_player_stats(player_name="Justin Jefferson", stat_type="passing")
+    result = tools.nfl_player_stats(
+        player_name="P.Mahomes",
+        stat_type=stat_type,
+        season_from=2020,
+        season_to=2024,
+    )
+    (season,) = result["seasons"]
+    assert set(season) == {"season", "season_type", stat_type}
+    assert "season >=" in captured["sql"]
+    assert "season <=" in captured["sql"]
+    assert captured["params"] == [MAHOMES["gsis_id"], 2020, 2024]
 
-    assert captured["params"][0] == "%J.Jefferson%"
+
+def test_player_stats_rejects_unknown_stat_type():
+    result = tools.nfl_player_stats(player_name="P.Mahomes", stat_type="kicking")
+    assert "Unknown stat_type" in result["error"]
+
+
+def test_player_stats_returns_error_on_timeout(monkeypatch):
+    monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("timeout")))
+    result = tools.nfl_player_stats(player_name="P.Mahomes", stat_type="passing")
+    assert "error" in result
+
+
+def test_compare_player_path_resolves_both_entities_to_ids(monkeypatch):
+    seen = []
+    ids = {"P.Mahomes": "00-0033873", "00-0034857": "00-0034857"}
+
+    def fake_resolve(player_name, player_id, **kwargs):
+        seen.append((player_name, kwargs))
+        return {"gsis_id": ids[player_name], "display_name": player_name}, None
+
+    calls = []
+    monkeypatch.setattr(tools, "_resolve_player", fake_resolve)
+    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: calls.append(params) or [])
+    result = tools.nfl_compare(
+        entity1="P.Mahomes",
+        entity2="00-0034857",
+        compare_type="player",
+        season_from=2020,
+        season_to=2024,
+        season_type="REG",
+    )
+    assert [p["player_id"] for p in result["players"]] == ["00-0033873", "00-0034857"]
+    assert [s[0] for s in seen] == ["P.Mahomes", "00-0034857"]
+    assert calls == [["00-0033873", 2020, 2024, "REG"], ["00-0034857", 2020, 2024, "REG"]]
 
 
 def test_compare_team_does_not_interpolate_user_input(monkeypatch):
@@ -368,75 +443,6 @@ def test_team_stats_returns_error_on_timeout(monkeypatch):
     assert "error" in result
 
 
-@pytest.mark.parametrize(
-    "stat_type,expected_play_type",
-    [("rushing", "run"), ("receiving", "pass")],
-)
-def test_player_stats_other_stat_types(monkeypatch, stat_type, expected_play_type):
-    captured = {}
-
-    def fake_execute(sql, params=None):
-        captured["sql"] = sql
-        captured["params"] = params
-        return [{"season": 2024, "season_type": "REG"}]
-
-    monkeypatch.setattr(tools, "_execute", fake_execute)
-    result = tools.nfl_player_stats(
-        player_name="P.Mahomes",
-        stat_type=stat_type,
-        season_from=2020,
-        season_to=2024,
-    )
-    assert result["stat_type"] == stat_type
-    assert captured["params"][1] == expected_play_type
-    assert "season >=" in captured["sql"]
-    assert "season <=" in captured["sql"]
-
-
-def test_player_stats_rejects_unknown_stat_type():
-    result = tools.nfl_player_stats(player_name="P.Mahomes", stat_type="kicking")
-    assert "Unknown stat_type" in result["error"]
-
-
-def test_player_stats_returns_error_on_timeout(monkeypatch):
-    monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("timeout")))
-    result = tools.nfl_player_stats(player_name="P.Mahomes", stat_type="passing")
-    assert "error" in result
-
-
-def test_compare_player_path_only_includes_stats_with_attempts(monkeypatch):
-    calls = []
-
-    def fake_execute(sql, params=None):
-        calls.append((sql, params))
-        if "COUNT(*) AS n" in sql and "passer_player_name" in sql:
-            return [{"n": 1}]
-        if "COUNT(*) AS n" in sql and "receiver_player_name" in sql:
-            return [{"n": 1}]
-        if "COUNT(*) AS n" in sql and "rusher_player_name" in sql:
-            return [{"n": 0}]
-        return []
-
-    monkeypatch.setattr(tools, "_execute", fake_execute)
-    monkeypatch.setattr(
-        tools,
-        "nfl_player_stats",
-        lambda player_name, **kwargs: {"seasons": [{"player": player_name, **kwargs}]},
-    )
-    result = tools.nfl_compare(
-        entity1="P.Mahomes",
-        entity2="J.Allen",
-        compare_type="player",
-        season_from=2020,
-        season_to=2024,
-        season_type="REG",
-    )
-    assert "passing" in result["P.Mahomes"]
-    assert "receiving" in result["P.Mahomes"]
-    assert "rushing" not in result["P.Mahomes"]
-    assert "season_type = ?" in calls[0][0]
-
-
 def test_compare_rejects_unknown_type():
     result = tools.nfl_compare(entity1="KC", entity2="BAL", compare_type="invalid")
     assert "compare_type must be" in result["error"]
@@ -588,10 +594,35 @@ def test_snap_counts_builds_filters(monkeypatch):
         position="te",
     )
     assert result["count"] == 1
-    assert "player ILIKE ?" in captured["sql"]
+    assert "LIKE ?" in captured["sql"]
     assert "team = ?" in captured["sql"]
     assert "position ILIKE ?" in captured["sql"]
-    assert captured["params"] == ["%Kelce%", "KC", 2024, 1, "TE"]
+    # The name is folded (case, accents, punctuation) but not turned into a short name.
+    assert captured["params"] == ["%kelce%", "KC", 2024, 1, "TE"]
+
+
+def test_snap_counts_full_name_is_not_shortened(monkeypatch):
+    captured = _capture_execute(monkeypatch, [])
+    tools.nfl_snap_counts(player="Travis Kelce")
+    assert captured["params"] == ["%travis kelce%"]
+
+
+def test_snap_counts_player_id_maps_through_pfr_id(monkeypatch):
+    calls = []
+
+    def fake_execute(sql, params=None):
+        calls.append((sql, params))
+        if "FROM players" in sql:
+            return [{"gsis_id": "00-0030506", "display_name": "Travis Kelce", "short_name": "T.Kelce",
+                     "position": "TE", "teams": ["KC"], "latest_team": "KC", "first_season": 2013,
+                     "last_season": 2026, "pfr_id": "KelcTr00"}]
+        return []
+
+    monkeypatch.setattr(tools, "_execute", fake_execute)
+    tools.nfl_snap_counts(player_id="00-0030506", season=2024)
+    sql, params = calls[-1]
+    assert "pfr_player_id = ?" in sql
+    assert params == ["KelcTr00", 2024]
 
 
 def test_snap_counts_returns_error_on_timeout(monkeypatch):
@@ -688,17 +719,18 @@ def test_ftn_charting_builds_all_filters(monkeypatch):
         }]
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
+    monkeypatch.setattr(tools, "_resolve_player", lambda *a, **k: (dict(MAHOMES), None))
     result = tools.nfl_ftn_charting(
         team="kc", opponent="phi", player="Mahomes",
         season_from=2022, season_to=2024, week=3, season_type="reg",
     )
     sql, params = captured["sql"], captured["params"]
     assert "p.posteam = ?" in sql and "p.defteam = ?" in sql
-    assert "p.passer_player_name ILIKE ?" in sql
+    assert "p.passer_player_id = ?" in sql
     assert "p.season >= ?" in sql and "p.season <= ?" in sql
     assert "p.week = ?" in sql and "p.season_type = ?" in sql
     assert params[:2] == ["KC", "PHI"]
-    assert params[2:5] == ["%Mahomes%"] * 3
+    assert params[2:5] == [MAHOMES["gsis_id"]] * 3
     assert params[5:7] == [2022, 2024]
     assert params[-2:] == [3, "REG"]
     assert result["charting"]["play_action"]["pct"] == 40.0
@@ -759,7 +791,7 @@ def _capture_execute(monkeypatch, rows):
     return captured
 
 
-def test_td_luck_builds_filters(monkeypatch):
+def test_td_luck_builds_filters(monkeypatch, no_player_match):
     captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
     result = tools.nfl_td_luck(player="Jefferson", position="wr", team="min", season=2024, limit=10)
     assert result["count"] == 1
@@ -782,7 +814,7 @@ def test_td_luck_returns_error_on_timeout(monkeypatch):
     assert tools.nfl_td_luck()["error"] == "td timeout"
 
 
-def test_role_trend_builds_filters(monkeypatch):
+def test_role_trend_builds_filters(monkeypatch, no_player_match):
     captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
     tools.nfl_role_trend(player="Kelce", position="te", team="kc", season=2024, week=8, min_snap_pct=50)
     assert "full_name ILIKE ?" in captured["sql"]
@@ -802,7 +834,7 @@ def test_role_trend_returns_error_on_timeout(monkeypatch):
     assert tools.nfl_role_trend()["error"] == "role timeout"
 
 
-def test_separation_opportunity_builds_filters(monkeypatch):
+def test_separation_opportunity_builds_filters(monkeypatch, no_player_match):
     captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
     tools.nfl_separation_opportunity(player="Aiyuk", position="wr", team="sf", season=2024, regression_candidate=True)
     assert "regression_candidate = ?" in captured["sql"]
@@ -826,7 +858,7 @@ def test_separation_opportunity_returns_error_on_timeout(monkeypatch):
     assert tools.nfl_separation_opportunity()["error"] == "sep timeout"
 
 
-def test_drop_rate_builds_filters(monkeypatch):
+def test_drop_rate_builds_filters(monkeypatch, no_player_match):
     captured = _capture_execute(monkeypatch, [{"player": "T.Pollard"}])
     tools.nfl_drop_rate(player="Pollard", team="ten", season=2024, min_targets=30)
     assert "player ILIKE ?" in captured["sql"]
@@ -851,7 +883,7 @@ def test_drop_rate_returns_error_on_timeout(monkeypatch):
     assert tools.nfl_drop_rate()["error"] == "drop timeout"
 
 
-def test_contract_value_builds_filters(monkeypatch):
+def test_contract_value_builds_filters(monkeypatch, no_player_match):
     captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
     tools.nfl_contract_value(player="Gibbs", position="rb", team="det", season=2024, min_apy=2, max_apy=10)
     assert "apy >= ?" in captured["sql"]
@@ -891,3 +923,46 @@ def test_injury_return_invalid_limit_falls_back(monkeypatch):
 def test_injury_return_returns_error_on_timeout(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("injury timeout")))
     assert tools.nfl_injury_return()["error"] == "injury timeout"
+
+
+# ── Player identity helpers ────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("name, strip, expected", [
+    ("Ja'Marr Chase", False, "jamarr chase"),
+    ("Amon-Ra St. Brown", False, "amon ra st brown"),
+    ("Audric Estimé", False, "audric estime"),
+    ("Odell Beckham Jr.", True, "odell beckham"),
+    ("Odell Beckham Jr.", False, "odell beckham jr"),
+    ("Patrick Mahomes II", True, "patrick mahomes"),
+    ("V", True, "v"),            # a lone token is a name, not a suffix
+    ("K.Allen", False, "kallen"),
+    ("  ", False, ""),
+])
+def test_fold_player_name(name, strip, expected):
+    assert tools._fold(name, strip_suffix=strip) == expected
+
+
+def test_player_lookup_requires_a_name():
+    result = tools.nfl_player_lookup(name="  ")
+    assert result["code"] == "MISSING_NAME"
+
+
+def test_player_stats_without_player_is_an_error_with_code():
+    result = tools.nfl_player_stats(player_name=None)
+    assert result["code"] == "MISSING_PLAYER"
+
+
+def test_player_stats_returns_ambiguous_without_running_stats(monkeypatch):
+    candidates = [{"gsis_id": "a", "display_name": "X"}, {"gsis_id": "b", "display_name": "X"}]
+    monkeypatch.setattr(tools, "_find_players", lambda *a, **k: (candidates, False))
+    monkeypatch.setattr(tools, "_execute", lambda *a, **k: pytest.fail("stats query must not run"))
+    result = tools.nfl_player_stats(player_name="X", season=2024)
+    assert result["ambiguous"] is True and result["candidates"] == candidates
+    assert "error" not in result and "seasons" not in result
+
+
+def test_resolver_uses_a_lone_overall_match_when_the_season_has_none(monkeypatch):
+    only = {"gsis_id": "a", "display_name": "X"}
+    monkeypatch.setattr(
+        tools, "_find_players", lambda name=None, **k: ([], False) if k.get("season") else ([only], False))
+    assert tools._resolve_player("X", None, season=2016) == (only, None)

@@ -5,6 +5,7 @@ NFL MCP Server tools:
   nfl_query         → one read-only SELECT/EXPLAIN statement, row-capped
   nfl_search_plays  → structured play search
   nfl_team_stats    → pre-aggregated team stats
+  nfl_player_lookup → player name to gsis_id
   nfl_player_stats  → player stats by season
   nfl_compare       → side-by-side comparison
 """
@@ -16,6 +17,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
 from concurrent.futures import TimeoutError as FuturesTimeout
@@ -41,11 +43,13 @@ _MAX_ROWS = 500
 _QUERY_TIMEOUT_SECONDS = 10
 
 
-# ── Player name normalization ──────────────────────────────────────────────────
+# ── Player identity ────────────────────────────────────────────────────────────
 
 def _normalize_player_name(name: str) -> str:
     """
-    Convert full names to nflverse short format.
+    Convert full names to nflverse short format. Only nfl_search_plays still uses it,
+    because the plays name columns hold short names. Other player tools resolve names
+    through the players table (_find_players).
     'Justin Jefferson' -> 'J.Jefferson'
     'J.Jefferson'      -> 'J.Jefferson' (pass through)
     'Jefferson'        -> 'Jefferson'   (last name only, pass through)
@@ -58,6 +62,235 @@ def _normalize_player_name(name: str) -> str:
     first = parts[0]
     last = ' '.join(parts[1:])
     return f"{first[0]}.{last}"
+
+
+_GSIS_ID = re.compile(r"\d{2}-\d{7}")
+_NAME_DROP = re.compile(r"[.'’`´]")
+_NAME_SEP = re.compile(r"[^a-z0-9]+")
+_SUFFIX_END = re.compile(r" (?:jr|sr|ii|iii|iv|v)$")
+_MAX_CANDIDATES = 25
+
+
+def _fold(name: str, strip_suffix: bool = False) -> str:
+    """Lower-case, accent-free, punctuation-free form of a name.
+
+    Apostrophes and periods vanish ("Ja'Marr" -> "jamarr", "St." -> "st"); hyphens and other
+    separators become one space. strip_suffix drops a trailing Jr, Sr, II, III, IV or V.
+    """
+    text = unicodedata.normalize("NFKD", name or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch)).lower()
+    text = _NAME_SEP.sub(" ", _NAME_DROP.sub("", text)).strip()
+    return _SUFFIX_END.sub("", text) if strip_suffix else text
+
+
+def _fold_sql(col: str, strip_suffix: bool = False) -> str:
+    """SQL expression that matches _fold(col)."""
+    expr = (
+        f"trim(regexp_replace(regexp_replace(lower(strip_accents({col})), "
+        f"'[.''’`´]', '', 'g'), '[^a-z0-9]+', ' ', 'g'))"
+    )
+    if strip_suffix:
+        expr = f"regexp_replace({expr}, ' (jr|sr|ii|iii|iv|v)$', '')"
+    return expr
+
+
+def _find_players(
+    name: str | None = None,
+    *,
+    gsis_id: str | None = None,
+    team: str | None = None,
+    season: int | None = None,
+    season_from: int | None = None,
+    season_to: int | None = None,
+    position: str | None = None,
+    limit: int = _MAX_CANDIDATES,
+) -> tuple[list[dict], bool]:
+    """Players matching a name, narrowed by roster team and season. Returns (candidates, truncated).
+
+    gsis_id looks one player up by id. A name matches the full name, the last name, the short name ("K.Allen"), or the first
+    name plus last name, after folding accents, punctuation and a generational suffix.
+    Team and season mean "has a rosters row" (in that season when both are given).
+    """
+    where: list[str] = []
+    params: list[Any] = []
+    if gsis_id is not None:
+        where.append("p.gsis_id = ?")
+        params.append(gsis_id)
+    if name is not None:
+        q = _fold(name, strip_suffix=True)
+        if not q:
+            return [], False
+        first_last = "(p.first_name || ' ' || p.last_name)"
+        common_last = "(p.common_first_name || ' ' || p.last_name)"
+        where.append(
+            "(" + " OR ".join([
+                f"{_fold_sql('p.display_name', True)} = ?",
+                f"{_fold_sql('p.last_name', True)} = ?",
+                f"replace({_fold_sql('p.short_name')}, ' ', '') = ?",
+                f"{_fold_sql(first_last, True)} = ?",
+                f"{_fold_sql(common_last, True)} = ?",
+            ]) + ")"
+        )
+        params.extend([q, q, q.replace(" ", ""), q, q])
+    roster: list[str] = []
+    roster_params: list[Any] = []
+    if team:
+        roster.append("r.team = ?")
+        roster_params.append(team.upper())
+    if season is not None:
+        roster.append("r.season = ?")
+        roster_params.append(int(season))
+    if season_from is not None:
+        roster.append("r.season >= ?")
+        roster_params.append(int(season_from))
+    if season_to is not None:
+        roster.append("r.season <= ?")
+        roster_params.append(int(season_to))
+    if roster:
+        where.append(
+            "EXISTS (SELECT 1 FROM rosters r WHERE r.gsis_id = p.gsis_id AND "
+            + " AND ".join(roster) + ")"
+        )
+        params.extend(roster_params)
+    if position:
+        where.append("upper(p.position) = ?")
+        params.append(position.upper())
+    sql = f"""
+        SELECT p.gsis_id, p.display_name, p.short_name, p.position,
+               (SELECT list(t ORDER BY first_year) FROM (
+                    SELECT r.team AS t, MIN(r.season) AS first_year FROM rosters r
+                    WHERE r.gsis_id = p.gsis_id AND r.team IS NOT NULL GROUP BY r.team)
+               ) AS teams,
+               p.latest_team,
+               COALESCE(p.rookie_season, (SELECT MIN(season) FROM rosters r WHERE r.gsis_id = p.gsis_id)) AS first_season,
+               COALESCE(p.last_season, (SELECT MAX(season) FROM rosters r WHERE r.gsis_id = p.gsis_id)) AS last_season,
+               p.pfr_id
+        FROM players p
+        WHERE {' AND '.join(where) if where else '1=1'}
+        ORDER BY p.last_season DESC NULLS LAST, p.display_name, p.gsis_id
+        LIMIT {int(limit) + 1}
+    """
+    rows = _execute(sql, params)
+    truncated = len(rows) > limit
+    for row in rows[:limit]:
+        latest = row.pop("latest_team")
+        row["teams"] = row["teams"] or ([latest] if latest else [])
+    return rows[:limit], truncated
+
+
+def _ambiguous(candidates: list[dict], truncated: bool, entity: str | None = None) -> dict[str, Any]:
+    """Response for a name that matches several players. Not an error: the caller picks an id."""
+    result: dict[str, Any] = {
+        "ambiguous": True,
+        "candidates": candidates,
+        "count": len(candidates),
+        "hint": "The name matches several players. Call again with player_id set to one gsis_id.",
+    }
+    if entity is not None:
+        result["entity"] = entity
+    if truncated:
+        result["truncated"] = True
+    return result
+
+
+def _resolve_player(
+    player_name: str | None,
+    player_id: str | None,
+    *,
+    team: str | None = None,
+    season: int | None = None,
+    season_from: int | None = None,
+    season_to: int | None = None,
+    entity: str | None = None,
+) -> tuple[dict | None, dict[str, Any] | None]:
+    """Pick one player for a tool call. Returns (player, early_response).
+
+    player_id wins over player_name, and a name shaped like a gsis id counts as an id.
+    A name matching one player gives (player, None). Several give an ambiguous response and
+    an unknown id gives an error; both are returned as early_response. No match gives
+    (None, None). When team or season leave nobody, a name that matches exactly one player
+    overall is still used, so a player with no roster row in that season resolves.
+    """
+    name = None if player_name is None else str(player_name).strip()
+    if not player_id and name and _GSIS_ID.fullmatch(name):
+        player_id, name = name, None
+    if player_id:
+        pid = str(player_id).strip()
+        found, _ = _find_players(gsis_id=pid, limit=1)
+        if not found:
+            return None, {"error": f"Unknown player_id '{pid}'", "code": "UNKNOWN_PLAYER_ID"}
+        return found[0], None
+    if not name:
+        return None, {"error": "player_name or player_id is required", "code": "MISSING_PLAYER"}
+    filters = {"team": team, "season": season, "season_from": season_from, "season_to": season_to}
+    candidates, truncated = _find_players(name, **filters)
+    if not candidates and any(v is not None for v in filters.values()):
+        wide, _ = _find_players(name)
+        if len(wide) == 1:
+            candidates = wide
+    if len(candidates) == 1:
+        return candidates[0], None
+    if candidates:
+        return None, _ambiguous(candidates, truncated, entity)
+    return None, None
+
+
+def nfl_player_lookup(
+    name: str,
+    team: str | None = None,
+    season: int | None = None,
+    position: str | None = None,
+) -> dict[str, Any]:
+    """Find players by name and return their gsis_id, so other player tools can take player_id."""
+    if not name or not str(name).strip():
+        return {"error": "name is required", "code": "MISSING_NAME"}
+    try:
+        candidates, truncated = _find_players(
+            str(name), team=team, season=season, position=position, limit=50)
+    except (duckdb.Error, ValueError, TimeoutError) as e:
+        logger.exception("Tool error")
+        return {"error": str(e)}
+    result: dict[str, Any] = {"candidates": candidates, "count": len(candidates)}
+    if truncated:
+        result["truncated"] = True
+        result["hint"] = "More players match. Add team, season or position, or use a fuller name."
+    return result
+
+
+def _player_filter(
+    player: str | None,
+    player_id: str | None,
+    name_col: str,
+    *,
+    team: str | None = None,
+    season: int | None = None,
+) -> tuple[str | None, list[Any], dict | None, dict[str, Any] | None]:
+    """Player condition for a derived table that has a player_id column.
+
+    Returns (condition, params, player, early_response). A name resolves through players:
+    one match filters on player_id, several give the ambiguous response as early_response,
+    none falls back to a substring match on name_col (the table's own name column).
+    """
+    if not player and not player_id:
+        return None, [], None, None
+    try:
+        found, early = _resolve_player(player, player_id, team=team, season=season)
+    except (duckdb.Error, ValueError, TimeoutError) as e:
+        logger.exception("Tool error")
+        return None, [], None, {"error": str(e)}
+    if early is not None:
+        return None, [], None, early
+    if found is None:
+        return f"{name_col} ILIKE ?", [f"%{player}%"], None, None
+    return "player_id = ?", [found["gsis_id"]], found, None
+
+
+def _with_player(result: dict[str, Any], player: dict | None) -> dict[str, Any]:
+    """Add player_id and player_name to a response when the filter resolved to one player."""
+    if player is not None:
+        result["player_id"] = player["gsis_id"]
+        result["player_name"] = player["display_name"]
+    return result
 
 
 def nfl_schema(category: str | None = None, table: str | None = None) -> Dict[str, Any]:
@@ -569,83 +802,193 @@ def nfl_team_stats(
         return {"error": str(e)}
 
 
-def nfl_player_stats(
-    player_name: str,
-    season: int | None = None,
-    season_from: int | None = None,
-    season_to: int | None = None,
-    season_type: str | None = None,
-    stat_type: str = "passing",
-) -> Dict[str, Any]:
-    """Aggregate player stats by season."""
-    player_name = _normalize_player_name(player_name)
-    params: list[Any] = []
+_NOT_TWO_POINT = "COALESCE(two_point_attempt, 0) = 0"
+_NOT_NO_PLAY = "COALESCE(play_type, '') <> 'no_play'"
+_NOT_SACK = "COALESCE(sack, 0) = 0"
+# Row sets for one player (me.id). Each is the definition shown to users in _STAT_DEFINITIONS.
+_ATTEMPT = (f"passer_player_id = me.id AND pass_attempt = 1 AND {_NOT_SACK} "
+            f"AND {_NOT_TWO_POINT} AND {_NOT_NO_PLAY}")
+_SACKED = f"passer_player_id = me.id AND sack = 1 AND {_NOT_TWO_POINT} AND {_NOT_NO_PLAY}"
+_DROPBACK = (f"qb_dropback = 1 AND {_NOT_TWO_POINT} AND {_NOT_NO_PLAY} "
+             "AND (passer_player_id = me.id OR (rusher_player_id = me.id AND qb_scramble = 1))")
+_CARRY = f"rusher_player_id = me.id AND rush_attempt = 1 AND {_NOT_TWO_POINT}"
+_TARGET = (f"receiver_player_id = me.id AND pass_attempt = 1 AND {_NOT_SACK} "
+           f"AND {_NOT_TWO_POINT}")
 
-    if stat_type == "passing":
-        sql = """
-            SELECT season, season_type, COUNT(*) AS attempts,
-                SUM(CASE WHEN complete_pass = 1 THEN 1 ELSE 0 END) AS completions,
-                ROUND(100.0 * SUM(CASE WHEN complete_pass = 1 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS comp_pct,
-                SUM(COALESCE(passing_yards, 0)) AS yards,
-                SUM(CASE WHEN pass_touchdown = 1 THEN 1 ELSE 0 END) AS touchdowns,
-                SUM(CASE WHEN interception = 1 THEN 1 ELSE 0 END) AS interceptions,
-                ROUND(AVG(epa), 3) AS avg_epa,
-                ROUND(AVG(cpoe), 3) AS avg_cpoe,
-                SUM(COALESCE(air_yards, 0)) AS air_yards,
-                ROUND(AVG(air_yards), 1) AS avg_air_yards
-            FROM plays
-            WHERE passer_player_name ILIKE ? AND play_type = ?
-        """
-        params.extend([f"%{player_name}%", "pass"])
-    elif stat_type == "rushing":
-        sql = """
-            SELECT season, season_type, COUNT(*) AS carries,
-                SUM(COALESCE(rushing_yards, 0)) AS yards,
-                ROUND(AVG(yards_gained), 1) AS yards_per_carry,
-                SUM(CASE WHEN rush_touchdown = 1 THEN 1 ELSE 0 END) AS touchdowns,
-                SUM(CASE WHEN fumble_lost = 1 THEN 1 ELSE 0 END) AS fumbles_lost,
-                ROUND(AVG(epa), 3) AS avg_epa,
-                SUM(CASE WHEN yards_gained >= 10 THEN 1 ELSE 0 END) AS explosive_runs
-            FROM plays
-            WHERE rusher_player_name ILIKE ? AND play_type = ?
-        """
-        params.extend([f"%{player_name}%", "run"])
-    elif stat_type == "receiving":
-        sql = """
-            SELECT season, season_type, COUNT(*) AS targets,
-                SUM(CASE WHEN complete_pass = 1 THEN 1 ELSE 0 END) AS receptions,
-                SUM(COALESCE(receiving_yards, 0)) AS yards,
-                ROUND(AVG(yards_after_catch), 1) AS avg_yac,
-                SUM(CASE WHEN pass_touchdown = 1 THEN 1 ELSE 0 END) AS touchdowns,
-                ROUND(AVG(epa), 3) AS avg_epa,
-                SUM(CASE WHEN yards_gained >= 20 THEN 1 ELSE 0 END) AS explosive_plays
-            FROM plays
-            WHERE receiver_player_name ILIKE ? AND play_type = ?
-        """
-        params.extend([f"%{player_name}%", "pass"])
-    else:
-        return {"error": f"Unknown stat_type: {stat_type}. Use 'passing', 'rushing', or 'receiving'."}
+_STAT_DEFINITIONS = {
+    "attempts": "pass_attempt=1 AND sack=0 AND two_point_attempt=0 AND play_type<>'no_play', "
+                "passer_player_id = the player. Spikes count as attempts.",
+    "completions": "attempts with complete_pass=1.",
+    "yards": "passing: passing_yards on attempts; rushing: rushing_yards on carries; "
+             "receiving: receiving_yards on targets.",
+    "sacks": "sack=1 with the player as passer_player_id, excluding two_point_attempt=1 and no_play.",
+    "dropbacks": "qb_dropback=1 AND two_point_attempt=0 AND play_type<>'no_play', where the player is "
+                 "passer_player_id or is rusher_player_id on a qb_scramble=1 play "
+                 "(attempts excluding spikes, plus sacks, plus scrambles).",
+    "epa_per_attempt": "average epa over attempts.",
+    "epa_per_dropback": "average epa over dropbacks.",
+    "carries": "rush_attempt=1 AND two_point_attempt=0, rusher_player_id = the player. "
+               "Kneels and scrambles count; no_play is not excluded.",
+    "scrambles": "carries with qb_scramble=1.",
+    "yards_per_carry": "rushing yards / carries.",
+    "targets": "pass_attempt=1 AND sack=0 AND two_point_attempt=0, receiver_player_id = the player.",
+    "receptions": "targets with complete_pass=1.",
+    "touchdowns": "passing: pass_touchdown=1 on attempts; rushing: rush_touchdown=1 on carries; "
+                  "receiving: pass_touchdown=1 on targets.",
+}
 
-    if season:
+
+def _sql_count(cond: str, extra: str | None = None) -> str:
+    """SQL: number of rows in a row set (optionally narrowed by one more condition)."""
+    return f"COUNT(*) FILTER (WHERE {cond}{f' AND {extra}' if extra else ''})"
+
+
+def _sql_sum(expr: str, cond: str) -> str:
+    return f"SUM({expr}) FILTER (WHERE {cond})"
+
+
+def _sql_avg(expr: str, cond: str, digits: int = 3) -> str:
+    return f"ROUND(AVG({expr}) FILTER (WHERE {cond}), {digits})"
+
+
+_PLAYER_STATS_SQL = f"""
+    SELECT season, season_type,
+        {_sql_count(_ATTEMPT)} AS attempts,
+        {_sql_count(_ATTEMPT, 'complete_pass = 1')} AS completions,
+        {_sql_sum('passing_yards', _ATTEMPT)} AS pass_yards,
+        {_sql_count(_ATTEMPT, 'pass_touchdown = 1')} AS pass_tds,
+        {_sql_count(_ATTEMPT, 'interception = 1')} AS interceptions,
+        {_sql_count(_SACKED)} AS sacks,
+        {_sql_count(_DROPBACK)} AS dropbacks,
+        {_sql_avg('epa', _ATTEMPT)} AS epa_per_attempt,
+        {_sql_avg('epa', _DROPBACK)} AS epa_per_dropback,
+        {_sql_avg('cpoe', _ATTEMPT)} AS avg_cpoe,
+        {_sql_sum('air_yards', _ATTEMPT)} AS pass_air_yards,
+        {_sql_count(_CARRY)} AS carries,
+        {_sql_sum('rushing_yards', _CARRY)} AS rush_yards,
+        {_sql_count(_CARRY, 'rush_touchdown = 1')} AS rush_tds,
+        {_sql_count(_CARRY, 'qb_scramble = 1')} AS scrambles,
+        {_sql_count(_CARRY, 'fumble_lost = 1')} AS fumbles_lost,
+        {_sql_count(_CARRY, 'yards_gained >= 10')} AS explosive_runs,
+        {_sql_avg('epa', _CARRY)} AS epa_per_carry,
+        {_sql_count(_TARGET)} AS targets,
+        {_sql_count(_TARGET, 'complete_pass = 1')} AS receptions,
+        {_sql_sum('receiving_yards', _TARGET)} AS rec_yards,
+        {_sql_count(_TARGET, 'pass_touchdown = 1')} AS rec_tds,
+        {_sql_avg('yards_after_catch', _TARGET, 1)} AS avg_yac,
+        {_sql_count(_TARGET, 'yards_gained >= 20')} AS explosive_plays,
+        {_sql_avg('epa', _TARGET)} AS epa_per_target
+    FROM plays, (SELECT CAST(? AS VARCHAR) AS id) AS me
+    WHERE me.id IN (passer_player_id, rusher_player_id, receiver_player_id)
+"""
+
+
+def _season_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Nest one aggregate row into passing, rushing and receiving blocks."""
+    def n(key: str) -> int:
+        return int(row[key] or 0)
+
+    attempts, carries = n("attempts"), n("carries")
+    return {
+        "season": row["season"],
+        "season_type": row["season_type"],
+        "passing": {
+            "attempts": attempts,
+            "completions": n("completions"),
+            "yards": n("pass_yards"),
+            "touchdowns": n("pass_tds"),
+            "interceptions": n("interceptions"),
+            "sacks": n("sacks"),
+            "dropbacks": n("dropbacks"),
+            "epa_per_attempt": row["epa_per_attempt"],
+            "epa_per_dropback": row["epa_per_dropback"],
+            "comp_pct": round(100.0 * n("completions") / attempts, 1) if attempts else None,
+            "avg_cpoe": row["avg_cpoe"],
+            "air_yards": n("pass_air_yards"),
+        },
+        "rushing": {
+            "carries": carries,
+            "yards": n("rush_yards"),
+            "touchdowns": n("rush_tds"),
+            "scrambles": n("scrambles"),
+            "yards_per_carry": round(n("rush_yards") / carries, 2) if carries else None,
+            "fumbles_lost": n("fumbles_lost"),
+            "explosive_runs": n("explosive_runs"),
+            "epa_per_carry": row["epa_per_carry"],
+        },
+        "receiving": {
+            "targets": n("targets"),
+            "receptions": n("receptions"),
+            "yards": n("rec_yards"),
+            "touchdowns": n("rec_tds"),
+            "avg_yac": row["avg_yac"],
+            "explosive_plays": n("explosive_plays"),
+            "epa_per_target": row["epa_per_target"],
+        },
+    }
+
+
+def _player_seasons(
+    gsis_id: str,
+    season: int | None,
+    season_from: int | None,
+    season_to: int | None,
+    season_type: str | None,
+) -> list[dict[str, Any]]:
+    """Per season and season type passing, rushing and receiving stats for one gsis_id."""
+    sql = _PLAYER_STATS_SQL
+    params: list[Any] = [gsis_id]
+    if season is not None:
         sql += " AND season = ?"
         params.append(int(season))
-    if season_from:
+    if season_from is not None:
         sql += " AND season >= ?"
         params.append(int(season_from))
-    if season_to:
+    if season_to is not None:
         sql += " AND season <= ?"
         params.append(int(season_to))
     if season_type:
         sql += " AND season_type = ?"
-        params.append(season_type)
+        params.append(str(season_type).upper())
     sql += " GROUP BY season, season_type ORDER BY season, season_type"
+    return [_season_row(row) for row in _execute(sql, params)]
 
+
+_STAT_BLOCKS = ("passing", "rushing", "receiving")
+
+
+def nfl_player_stats(
+    player_name: str | None = None,
+    player_id: str | None = None,
+    season: int | None = None,
+    season_from: int | None = None,
+    season_to: int | None = None,
+    season_type: str | None = None,
+    stat_type: str | None = None,
+) -> dict[str, Any]:
+    """Passing, rushing and receiving stats per season and season type for one player.
+
+    A name that matches several players returns ambiguous candidates; pass player_id then.
+    """
+    if stat_type is not None and stat_type not in _STAT_BLOCKS:
+        return {"error": f"Unknown stat_type: {stat_type}. Use 'passing', 'rushing', or 'receiving'."}
     try:
-        rows = _execute(sql, params)
-        return {"player": player_name, "stat_type": stat_type, "seasons": rows}
+        player, early = _resolve_player(
+            player_name, player_id, season=season, season_from=season_from, season_to=season_to)
+        if early is not None:
+            return early
+        if player is None:
+            return {"player_id": None, "player_name": player_name, "seasons": [],
+                    "reason": f"No player matches '{player_name}'. Try nfl_player_lookup."}
+        seasons = _player_seasons(player["gsis_id"], season, season_from, season_to, season_type)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
+    if stat_type:
+        seasons = [{k: v for k, v in s.items() if k not in _STAT_BLOCKS or k == stat_type}
+                   for s in seasons]
+    return {"player_id": player["gsis_id"], "player_name": player["display_name"],
+            "seasons": seasons, "definitions": dict(_STAT_DEFINITIONS)}
 
 
 def _compare_teams(
@@ -682,48 +1025,25 @@ def _compare_players(
     season_to: int | None,
     season_type: str | None,
 ) -> dict[str, Any]:
-    """Player side of nfl_compare: passing, rushing and receiving rows for each player."""
-    e1, e2 = entity1, entity2
-    season_filter = ""
-    season_params: list[Any] = []
-    if season:
-        season_filter += " AND season = ?"
-        season_params.append(int(season))
-    if season_from:
-        season_filter += " AND season >= ?"
-        season_params.append(int(season_from))
-    if season_to:
-        season_filter += " AND season <= ?"
-        season_params.append(int(season_to))
-    if season_type:
-        season_filter += " AND season_type = ?"
-        season_params.append(season_type)
-
-    result = {}
-    for p, label in [(e1, entity1), (e2, entity2)]:
-        p = _normalize_player_name(p)
-        stats = {}
-        for stype, col, ptype in [
-            ("passing", "passer_player_name", "pass"),
-            ("rushing", "rusher_player_name", "run"),
-            ("receiving", "receiver_player_name", "pass"),
-        ]:
-            count_sql = (
-                f"SELECT COUNT(*) AS n FROM plays "
-                f"WHERE {col} ILIKE ? AND play_type = ?{season_filter}"
-            )
-            count_row = _execute(count_sql, [f"%{p}%", ptype, *season_params])
-            if count_row and count_row[0].get("n", 0) > 0:
-                player_result = nfl_player_stats(
-                    label, season=season, season_from=season_from,
-                    season_to=season_to, season_type=season_type,
-                    stat_type=stype,
-                )
-                if "seasons" in player_result:
-                    stats[stype] = player_result["seasons"]
-        result[label] = stats
-
-    return result
+    """Player side of nfl_compare: each entity is a name or a gsis id, resolved to one player."""
+    entries = []
+    for entity in (entity1, entity2):
+        player, early = _resolve_player(
+            entity, None, season=season, season_from=season_from, season_to=season_to,
+            entity=entity)
+        if early is not None:
+            return early
+        if player is None:
+            entries.append({"player_id": None, "player_name": entity, "seasons": [],
+                            "reason": f"No player matches '{entity}'. Try nfl_player_lookup."})
+            continue
+        entries.append({
+            "player_id": player["gsis_id"],
+            "player_name": player["display_name"],
+            "seasons": _player_seasons(
+                player["gsis_id"], season, season_from, season_to, season_type),
+        })
+    return {"players": entries, "definitions": dict(_STAT_DEFINITIONS)}
 
 
 def nfl_compare(
@@ -1052,40 +1372,54 @@ def nfl_snap_counts(
     season: int | None = None,
     week: int | None = None,
     position: str | None = None,
+    player_id: str | None = None,
 ) -> Dict[str, Any]:
     """
     Look up snap count data — how many snaps a player or team unit played.
     Returns offense, defense, and special teams snap counts and percentages.
+    player matches the full names stored in snap_counts ('Travis Kelce' or 'Kelce'),
+    ignoring case, accents and punctuation. player_id (gsis_id) maps through
+    players.pfr_id to snap_counts.pfr_player_id.
     """
     conditions, params = [], []
-    if player:
-        player = _normalize_player_name(player)
-        conditions.append("player ILIKE ?")
-        params.append(f"%{player}%")
-    if team:
-        conditions.append("team = ?")
-        params.append(team.upper())
-    if season:
-        conditions.append("season = ?")
-        params.append(int(season))
-    if week:
-        conditions.append("week = ?")
-        params.append(int(week))
-    if position:
-        conditions.append("position ILIKE ?")
-        params.append(position.upper())
-
-    where = " AND ".join(conditions) if conditions else "1=1"
-    sql = f"""
-        SELECT player, position, team, opponent, season, week, game_type,
-               offense_snaps, offense_pct, defense_snaps, defense_pct,
-               st_snaps, st_pct
-        FROM snap_counts
-        WHERE {where}
-        ORDER BY season, week, team, offense_snaps DESC NULLS LAST
-        LIMIT 500
-    """
     try:
+        if player_id:
+            found, _ = _find_players(gsis_id=str(player_id).strip(), limit=1)
+            if not found:
+                return {"error": f"Unknown player_id '{player_id}'", "code": "UNKNOWN_PLAYER_ID"}
+            if not found[0]["pfr_id"]:
+                return {"snap_counts": [], "count": 0, "player_id": found[0]["gsis_id"],
+                        "reason": f"No PFR id on file for {found[0]['display_name']}, "
+                                  "so snap counts cannot be matched by id."}
+            conditions.append("pfr_player_id = ?")
+            params.append(found[0]["pfr_id"])
+        if player:
+            query = _fold(str(player), strip_suffix=True)
+            conditions.append(f"{_fold_sql('player')} LIKE ?")
+            params.append(f"%{query}%")
+        if team:
+            conditions.append("team = ?")
+            params.append(team.upper())
+        if season:
+            conditions.append("season = ?")
+            params.append(int(season))
+        if week:
+            conditions.append("week = ?")
+            params.append(int(week))
+        if position:
+            conditions.append("position ILIKE ?")
+            params.append(position.upper())
+
+        where = " AND ".join(conditions) if conditions else "1=1"
+        sql = f"""
+            SELECT player, position, team, opponent, season, week, game_type,
+                   offense_snaps, offense_pct, defense_snaps, defense_pct,
+                   st_snaps, st_pct
+            FROM snap_counts
+            WHERE {where}
+            ORDER BY season, week, team, offense_snaps DESC NULLS LAST
+            LIMIT 500
+        """
         rows = _execute(sql, params if params else None)
         return {"snap_counts": rows, "count": len(rows)}
     except (duckdb.Error, ValueError, TimeoutError) as e:
@@ -1099,15 +1433,20 @@ def nfl_fantasy_opportunity(
     season: int | None = None,
     week: int | None = None,
     position: str | None = None,
+    player_id: str | None = None,
 ) -> Dict[str, Any]:
     """
     Look up fantasy football opportunity data — target share, air yards share,
     carry share, and opportunity scores per player per week. Available 2006–present.
     """
     conditions, params = [], []
-    if player:
-        conditions.append("full_name ILIKE ?")
-        params.append(f"%{player}%")
+    cond, cparams, resolved, early = _player_filter(
+        player, player_id, "full_name", team=team, season=season)
+    if early is not None:
+        return early
+    if cond:
+        conditions.append(cond)
+        params.extend(cparams)
     if team:
         conditions.append("posteam = ?")
         params.append(team.upper())
@@ -1136,7 +1475,7 @@ def nfl_fantasy_opportunity(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return {"fantasy_opportunity": rows, "count": len(rows)}
+        return _with_player({"fantasy_opportunity": rows, "count": len(rows)}, resolved)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1183,8 +1522,10 @@ def nfl_fantasy_rankings(
         )
 
     if player:
-        conditions.append(f"{player_col} ILIKE ?")
-        params.append(f"%{player}%")
+        # The ranking tables have no gsis id, so match on names with apostrophes, periods
+        # and accents folded away on both sides ("Ja'Marr Chase" finds "JaMarr Chase").
+        conditions.append(f"{_fold_sql(player_col)} LIKE ?")
+        params.append(f"%{_fold(str(player), strip_suffix=True)}%")
     if position:
         conditions.append("pos ILIKE ?")
         params.append(position.upper())
@@ -1220,6 +1561,7 @@ def nfl_ftn_charting(
     season_to: int | None = None,
     week: int | None = None,
     season_type: str | None = None,
+    player_id: str | None = None,
 ) -> Dict[str, Any]:
     """
     Aggregated FTN manual charting tendencies (2022–present) over offensive scrimmage
@@ -1227,6 +1569,8 @@ def nfl_ftn_charting(
     and trick-play usage rates, plus average defenders in the box (per scrimmage play)
     and pass rushers / blitzers (per dropback). Joins ftn_charting to plays for
     team/player/season context. Offensive perspective (team = posteam).
+    player (a name) or player_id (gsis_id) selects one player, matched on the passer,
+    rusher and receiver id columns; a name matching several players is ambiguous.
     """
     conditions = ["f.nflverse_game_id = p.game_id", "f.nflverse_play_id = p.play_id",
                   "p.play_type IN ('pass', 'run')"]
@@ -1237,12 +1581,23 @@ def nfl_ftn_charting(
     if opponent:
         conditions.append("p.defteam = ?")
         params.append(opponent.upper())
-    if player:
+    resolved = None
+    if player or player_id:
+        try:
+            resolved, early = _resolve_player(
+                player, player_id, team=team, season=season,
+                season_from=season_from, season_to=season_to)
+        except (duckdb.Error, ValueError, TimeoutError) as e:
+            logger.exception("Tool error")
+            return {"error": str(e)}
+        if early is not None:
+            return early
+        if resolved is None:
+            return {"charting": {}, "total_plays": 0,
+                    "reason": f"No player matches '{player}'. Try nfl_player_lookup."}
         conditions.append(
-            "(p.passer_player_name ILIKE ? OR p.rusher_player_name ILIKE ? "
-            "OR p.receiver_player_name ILIKE ?)"
-        )
-        params.extend([f"%{player}%"] * 3)
+            "(p.passer_player_id = ? OR p.rusher_player_id = ? OR p.receiver_player_id = ?)")
+        params.extend([resolved["gsis_id"]] * 3)
     if season:
         conditions.append("p.season = ?")
         params.append(int(season))
@@ -1284,7 +1639,7 @@ def nfl_ftn_charting(
     agg = rows[0] if rows else {}
     total = agg.get("total_plays") or 0
     if not total:
-        return {"charting": {}, "total_plays": 0}
+        return _with_player({"charting": {}, "total_plays": 0}, resolved)
 
     def _pct(n: Any) -> float:
         return round(100.0 * (n or 0) / total, 1)
@@ -1292,7 +1647,7 @@ def nfl_ftn_charting(
     def _avg(v: Any) -> float | None:
         return round(v, 2) if v is not None else None
 
-    return {
+    return _with_player({
         "charting": {
             "total_plays": total,
             "play_action": {"plays": agg.get("play_action") or 0, "pct": _pct(agg.get("play_action"))},
@@ -1306,7 +1661,7 @@ def nfl_ftn_charting(
             "avg_blitzers": _avg(agg.get("avg_blitzers")),
         },
         "total_plays": total,
-    }
+    }, resolved)
 
 
 def nfl_td_luck(
@@ -1315,6 +1670,7 @@ def nfl_td_luck(
     team: str | None = None,
     season: int | None = None,
     limit: int = 50,
+    player_id: str | None = None,
 ) -> Dict[str, Any]:
     """
     Touchdown luck — actual vs expected TDs per player-season from the
@@ -1328,9 +1684,13 @@ def nfl_td_luck(
         limit = 50
 
     conditions, params = [], []
-    if player:
-        conditions.append("full_name ILIKE ?")
-        params.append(f"%{player}%")
+    cond, cparams, resolved, early = _player_filter(
+        player, player_id, "full_name", team=team, season=season)
+    if early is not None:
+        return early
+    if cond:
+        conditions.append(cond)
+        params.extend(cparams)
     if position:
         conditions.append("position ILIKE ?")
         params.append(position.upper())
@@ -1354,7 +1714,7 @@ def nfl_td_luck(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return {"td_luck": rows, "count": len(rows)}
+        return _with_player({"td_luck": rows, "count": len(rows)}, resolved)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1368,6 +1728,7 @@ def nfl_role_trend(
     week: int | None = None,
     min_snap_pct: float | None = None,
     limit: int = 50,
+    player_id: str | None = None,
 ) -> Dict[str, Any]:
     """
     Rolling 3-week role trend — weekly snap %, target/carry/air-yards share with a
@@ -1381,9 +1742,13 @@ def nfl_role_trend(
         limit = 50
 
     conditions, params = [], []
-    if player:
-        conditions.append("full_name ILIKE ?")
-        params.append(f"%{player}%")
+    cond, cparams, resolved, early = _player_filter(
+        player, player_id, "full_name", team=team, season=season)
+    if early is not None:
+        return early
+    if cond:
+        conditions.append(cond)
+        params.extend(cparams)
     if position:
         conditions.append("position ILIKE ?")
         params.append(position.upper())
@@ -1413,7 +1778,7 @@ def nfl_role_trend(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return {"role_trend": rows, "count": len(rows)}
+        return _with_player({"role_trend": rows, "count": len(rows)}, resolved)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1426,6 +1791,7 @@ def nfl_separation_opportunity(
     season: int | None = None,
     regression_candidate: bool | None = None,
     limit: int = 50,
+    player_id: str | None = None,
 ) -> Dict[str, Any]:
     """
     Separation-adjusted opportunity — joins Next Gen Stats receiving separation/YAC
@@ -1444,9 +1810,13 @@ def nfl_separation_opportunity(
         return {"error": "Next Gen Stats receiving data is only available from 2016 onward"}
 
     conditions, params = [], []
-    if player:
-        conditions.append("full_name ILIKE ?")
-        params.append(f"%{player}%")
+    cond, cparams, resolved, early = _player_filter(
+        player, player_id, "full_name", team=team, season=season)
+    if early is not None:
+        return early
+    if cond:
+        conditions.append(cond)
+        params.extend(cparams)
     if position:
         conditions.append("position ILIKE ?")
         params.append(position.upper())
@@ -1474,7 +1844,7 @@ def nfl_separation_opportunity(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return {"separation_opportunity": rows, "count": len(rows)}
+        return _with_player({"separation_opportunity": rows, "count": len(rows)}, resolved)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1486,12 +1856,14 @@ def nfl_drop_rate(
     season: int | None = None,
     min_targets: int | None = None,
     limit: int = 50,
+    player_id: str | None = None,
 ) -> Dict[str, Any]:
     """
     Drop rate — share of catchable targets dropped per receiver-season from FTN
     charting (2022+) joined to plays (player_drop_rate). Also reports contested
-    targets and created receptions. Player names are nflverse short form
-    ('J.Jefferson'). Default sort is highest drop rate first (drop_rate_pct DESC).
+    targets and created receptions. The player column holds nflverse short names
+    ('J.Jefferson'); a full name in `player` resolves through players and filters by id.
+    Default sort is highest drop rate first (drop_rate_pct DESC).
     """
     try:
         limit = max(1, min(int(limit), _MAX_ROWS))
@@ -1502,9 +1874,13 @@ def nfl_drop_rate(
         return {"error": "FTN charting (drop) data is only available from 2022 onward"}
 
     conditions, params = [], []
-    if player:
-        conditions.append("player ILIKE ?")
-        params.append(f"%{player}%")
+    cond, cparams, resolved, early = _player_filter(
+        player, player_id, "player", team=team, season=season)
+    if early is not None:
+        return early
+    if cond:
+        conditions.append(cond)
+        params.extend(cparams)
     if team:
         conditions.append("team = ?")
         params.append(team.upper())
@@ -1527,7 +1903,7 @@ def nfl_drop_rate(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return {"drop_rate": rows, "count": len(rows)}
+        return _with_player({"drop_rate": rows, "count": len(rows)}, resolved)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1541,6 +1917,7 @@ def nfl_contract_value(
     min_apy: float | None = None,
     max_apy: float | None = None,
     limit: int = 50,
+    player_id: str | None = None,
 ) -> Dict[str, Any]:
     """
     Contract value efficiency — fantasy points per $M of average per year (APY),
@@ -1554,9 +1931,13 @@ def nfl_contract_value(
         limit = 50
 
     conditions, params = [], []
-    if player:
-        conditions.append("full_name ILIKE ?")
-        params.append(f"%{player}%")
+    cond, cparams, resolved, early = _player_filter(
+        player, player_id, "full_name", team=team, season=season)
+    if early is not None:
+        return early
+    if cond:
+        conditions.append(cond)
+        params.extend(cparams)
     if position:
         conditions.append("position ILIKE ?")
         params.append(position.upper())
@@ -1584,7 +1965,7 @@ def nfl_contract_value(
     """
     try:
         rows = _execute(sql, params if params else None)
-        return {"contract_value": rows, "count": len(rows)}
+        return _with_player({"contract_value": rows, "count": len(rows)}, resolved)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1638,7 +2019,7 @@ def nfl_injury_return(
 
 __all__ = [
     "nfl_schema", "nfl_status", "nfl_query",
-    "nfl_search_plays", "nfl_team_stats", "nfl_player_stats", "nfl_compare",
+    "nfl_search_plays", "nfl_team_stats", "nfl_player_stats", "nfl_player_lookup", "nfl_compare",
     "nfl_catalog", "nfl_roster", "nfl_injuries", "nfl_schedule", "nfl_snap_counts",
     "nfl_fantasy_opportunity", "nfl_fantasy_rankings", "nfl_ftn_charting",
     "nfl_td_luck", "nfl_role_trend", "nfl_separation_opportunity",
