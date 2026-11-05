@@ -120,7 +120,7 @@ def make_plays(n=200, weeks=((2025, 8), (2025, 9)), epa=0.1, posteam="KC", start
 
 def _stamp_current(con):
     """A good slot carries the current schema version (group M's schema_version check)."""
-    con.execute("CREATE TABLE _schema_version (version INTEGER, applied_at TIMESTAMP, "
+    con.execute("CREATE TABLE IF NOT EXISTS _schema_version (version INTEGER, applied_at TIMESTAMP, "
                 "nfl_mcp_version VARCHAR)")
     con.execute("INSERT INTO _schema_version VALUES (?, TIMESTAMP '2026-11-05 00:00:00', 'test')",
                 [SCHEMA_VERSION])

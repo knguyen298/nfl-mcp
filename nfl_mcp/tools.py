@@ -1866,9 +1866,9 @@ def nfl_injuries(
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
         SELECT full_name, gsis_id, position, team, season, week,
-               COALESCE(season_type, CASE game_type WHEN 'REG' THEN 'REG'
-                        WHEN 'WC' THEN 'POST' WHEN 'DIV' THEN 'POST'
-                        WHEN 'CON' THEN 'POST' WHEN 'SB' THEN 'POST' END) AS season_type,
+               CASE game_type WHEN 'REG' THEN 'REG'
+                    WHEN 'WC' THEN 'POST' WHEN 'DIV' THEN 'POST'
+                    WHEN 'CON' THEN 'POST' WHEN 'SB' THEN 'POST' END AS season_type,
                report_primary_injury, report_secondary_injury, report_status,
                practice_primary_injury, practice_secondary_injury, practice_status
         FROM injuries

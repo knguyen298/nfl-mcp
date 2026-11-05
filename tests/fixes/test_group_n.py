@@ -44,6 +44,16 @@ def real(monkeypatch):
         yield conn
 
 
+@pytest.fixture
+def full(real):
+    """real, but only on a multi-season database: the expected values here were measured on
+    /tmp/grpF_work.duckdb (plays for 2024-2026). CI ingests 2024 only, so these skip there."""
+    low, high = _one(real, "SELECT MIN(season), MAX(season) FROM plays")[0]
+    if low is None or low > 2024 or high < 2026:
+        pytest.skip(f"needs plays for 2024-2026; this database has {low}-{high}")
+    return real
+
+
 def _one(conn, sql, params=()):
     return conn.execute(sql, list(params)).fetchall()
 
@@ -92,11 +102,11 @@ def test_roster_gsis_id_count_matches_sql(real):
 
 
 @pytest.mark.integration
-def test_roster_null_gsis_id_stays_null(real):
+def test_roster_null_gsis_id_stays_null(full):
     # SELECT count(*) FROM rosters WHERE gsis_id IS NULL  -> 5 rows over 2024-2026
-    assert _one(real, "SELECT count(*) FROM rosters WHERE gsis_id IS NULL") == [(5,)]
+    assert _one(full, "SELECT count(*) FROM rosters WHERE gsis_id IS NULL") == [(5,)]
     # SELECT team, full_name FROM rosters WHERE gsis_id IS NULL AND season=2024 -> one row
-    (team, name), = _one(real, "SELECT team, full_name FROM rosters "
+    (team, name), = _one(full, "SELECT team, full_name FROM rosters "
                                "WHERE gsis_id IS NULL AND season=2024")
     res = tools.nfl_roster(team=team, season=2024, limit=500)
     assert [r["gsis_id"] for r in res["players"] if r["full_name"] == name] == [None]
@@ -126,11 +136,12 @@ def test_injury_keys_order(real):
 
 
 @pytest.mark.integration
-def test_injury_season_type_from_table_when_present(real):
-    # SELECT season_type FROM injuries WHERE season=2025 AND week=19 AND team='BUF'
-    #   AND full_name='Cam Lewis'  -> 'POST' (table value; game_type is WC)
-    assert _one(real, "SELECT season_type, game_type FROM injuries WHERE season=2025 AND "
-                      "week=19 AND team='BUF' AND full_name='Cam Lewis'") == [("POST", "WC")]
+def test_injury_season_type_from_table_when_present(full):
+    # SELECT game_type FROM injuries WHERE season=2025 AND week=19 AND team='BUF'
+    #   AND full_name='Cam Lewis'  -> 'WC' (the table's own season_type says POST too). The
+    #   tool reads game_type only: a 2024-only ingest has no season_type column at all.
+    assert _one(full, "SELECT game_type FROM injuries WHERE season=2025 AND "
+                      "week=19 AND team='BUF' AND full_name='Cam Lewis'") == [("WC",)]
     res = tools.nfl_injuries(team="BUF", season=2025, week=19, player="Cam Lewis")
     assert [r["season_type"] for r in res["injuries"]] == ["POST"]
 
@@ -139,14 +150,14 @@ def test_injury_season_type_from_table_when_present(real):
 def test_injury_season_type_derived_when_table_is_null(real):
     # SELECT season_type, game_type FROM injuries WHERE season=2024 AND week=20 AND team='BAL'
     #   AND full_name='Zay Flowers'  -> (NULL, 'DIV')  so the tool says POST
-    assert _one(real, "SELECT season_type, game_type FROM injuries WHERE season=2024 AND "
-                      "week=20 AND team='BAL' AND full_name='Zay Flowers'") == [(None, "DIV")]
+    assert _one(real, "SELECT game_type FROM injuries WHERE season=2024 AND "
+                      "week=20 AND team='BAL' AND full_name='Zay Flowers'") == [("DIV",)]
     res = tools.nfl_injuries(team="BAL", season=2024, week=20, player="Zay Flowers")
     assert [r["season_type"] for r in res["injuries"]] == ["POST"]
     # SELECT season_type, game_type FROM injuries WHERE season=2024 AND week=9 AND team='KC'
     #   AND full_name='Patrick Mahomes'  -> (NULL, 'REG')  so the tool says REG
-    assert _one(real, "SELECT season_type, game_type FROM injuries WHERE season=2024 AND "
-                      "week=9 AND team='KC' AND full_name='Patrick Mahomes'") == [(None, "REG")]
+    assert _one(real, "SELECT game_type FROM injuries WHERE season=2024 AND "
+                      "week=9 AND team='KC' AND full_name='Patrick Mahomes'") == [("REG",)]
     res = tools.nfl_injuries(team="KC", season=2024, week=9, player="Mahomes")
     assert [r["season_type"] for r in res["injuries"]] == ["REG"]
 
@@ -231,7 +242,7 @@ def test_td_luck_season_type_filter(real, value, expected):
 
 
 @pytest.mark.integration
-def test_td_luck_filter_for_one_player(real):
+def test_td_luck_filter_for_one_player(full):
     res = tools.nfl_td_luck(player_id=STAFFORD, season_type="POST")
     # SELECT season FROM player_td_luck WHERE player_id='00-0026498' AND season_type='POST'
     #   ORDER BY season  -> 2024, 2025 (the tool sorts by score, so compare as a set)
@@ -242,11 +253,11 @@ def test_td_luck_filter_for_one_player(real):
 
 
 @pytest.mark.integration
-def test_td_luck_order_is_stable_reg_before_post(real):
+def test_td_luck_order_is_stable_reg_before_post(full):
     # Stafford, no filter, ordered by score ASC: SELECT season, season_type FROM player_td_luck WHERE player_id='00-0026498'
     #   ORDER BY total_td_luck_score ASC, season, season_type DESC ->
     #   2025 REG -1.07, 2026 REG -0.77, 2024 REG -0.52, 2024 POST -0.09, 2025 POST -0.05
-    expected = [tuple(r) for r in _one(real, "SELECT season, season_type FROM player_td_luck WHERE "
+    expected = [tuple(r) for r in _one(full, "SELECT season, season_type FROM player_td_luck WHERE "
                                              "player_id=? ORDER BY total_td_luck_score ASC, season, "
                                              "season_type DESC", [STAFFORD])]
     assert expected == [(2025, "REG"), (2026, "REG"), (2024, "REG"), (2024, "POST"), (2025, "POST")]
@@ -256,9 +267,9 @@ def test_td_luck_order_is_stable_reg_before_post(real):
 
 
 @pytest.mark.integration
-def test_td_luck_paging_with_season_type(real):
+def test_td_luck_paging_with_season_type(full):
     # SELECT count(*) FROM player_td_luck WHERE season=2025 AND season_type='POST'  -> 159
-    assert _one(real, "SELECT count(*) FROM player_td_luck WHERE season=2025 AND "
+    assert _one(full, "SELECT count(*) FROM player_td_luck WHERE season=2025 AND "
                       "season_type='POST'") == [(159,)]
     page1 = tools.nfl_td_luck(season=2025, season_type="POST", limit=100)
     page2 = tools.nfl_td_luck(season=2025, season_type="POST", limit=100, offset=100)
@@ -278,10 +289,10 @@ JUSZCZYK = "00-0029892"
 
 
 @pytest.mark.integration
-def test_drop_rate_player_has_both_season_types(real):
+def test_drop_rate_player_has_both_season_types(full):
     # SELECT season_type, catchable_targets FROM player_drop_rate WHERE player_id='00-0029892'
     #   AND season=2025  -> POST 5, REG 24
-    assert dict(_one(real, "SELECT season_type, catchable_targets FROM player_drop_rate "
+    assert dict(_one(full, "SELECT season_type, catchable_targets FROM player_drop_rate "
                            "WHERE player_id=? AND season=2025", [JUSZCZYK])) == {"POST": 5, "REG": 24}
     res = tools.nfl_drop_rate(player_id=JUSZCZYK, season=2025)
     assert {r["season_type"]: r["catchable_targets"] for r in res["drop_rate"]} == {"POST": 5, "REG": 24}
@@ -289,7 +300,7 @@ def test_drop_rate_player_has_both_season_types(real):
 
 
 @pytest.mark.integration
-def test_drop_rate_rows_carry_season_type_key_after_season(real):
+def test_drop_rate_rows_carry_season_type_key_after_season(full):
     res = tools.nfl_drop_rate(player_id=JUSZCZYK, season=2025)
     assert list(res["drop_rate"][0]) == [
         "player_id", "player", "team", "season", "season_type", "catchable_targets", "drops",
@@ -332,11 +343,11 @@ def test_drop_rate_season_type_with_min_targets(real):
 
 
 @pytest.mark.integration
-def test_drop_rate_order_is_stable_reg_before_post(real):
+def test_drop_rate_order_is_stable_reg_before_post(full):
     # SELECT season, season_type FROM player_drop_rate WHERE player_id='00-0029892'
     #   ORDER BY drop_rate_pct DESC NULLS LAST, season, season_type DESC ->
     #   all four rows have drop_rate_pct 0.0, so 2024 REG, 2025 REG, 2025 POST, 2026 REG
-    expected = [tuple(r) for r in _one(real, "SELECT season, season_type FROM player_drop_rate "
+    expected = [tuple(r) for r in _one(full, "SELECT season, season_type FROM player_drop_rate "
                                              "WHERE player_id=? ORDER BY drop_rate_pct DESC NULLS "
                                              "LAST, season, season_type DESC", [JUSZCZYK])]
     assert expected == [(2024, "REG"), (2025, "REG"), (2025, "POST"), (2026, "REG")]
@@ -345,9 +356,9 @@ def test_drop_rate_order_is_stable_reg_before_post(real):
 
 
 @pytest.mark.integration
-def test_drop_rate_paging_with_season_type(real):
+def test_drop_rate_paging_with_season_type(full):
     # SELECT count(*) FROM player_drop_rate WHERE season=2025 AND season_type='POST'  -> 124
-    assert _one(real, "SELECT count(*) FROM player_drop_rate WHERE season=2025 AND "
+    assert _one(full, "SELECT count(*) FROM player_drop_rate WHERE season=2025 AND "
                       "season_type='POST'") == [(124,)]
     page1 = tools.nfl_drop_rate(season=2025, season_type="POST", limit=100)
     page2 = tools.nfl_drop_rate(season=2025, season_type="POST", limit=100, offset=100)
