@@ -70,6 +70,9 @@ INIT = {
 MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
 # ~2-3 s on this host (calibrated: range(20000)^2 took 6.7 s, so 13500^2 is about 3 s).
 SLOW_SQL = "SELECT sum((a.range * 7 + b.range) % 13) AS s FROM range(13500) a CROSS JOIN range(13500) b"
+# For the timeout tests: about 20 times SLOW_SQL, so the timeout fires first even on a fast
+# CI runner (SLOW_SQL alone finished in under 2 s on GitHub's ubuntu-latest).
+LONG_SQL = "SELECT sum((a.range * 7 + b.range) % 13) AS s FROM range(60000) a CROSS JOIN range(60000) b"
 
 
 # ── fixtures and helpers ────────────────────────────────────────────────────────
@@ -367,7 +370,7 @@ def _timed_query(sql):
 @pytest.mark.parametrize("seconds", [1, 2])
 def test_timeout_env_cuts_slow_query(seconds, monkeypatch, synth_db, clean_env):
     monkeypatch.setenv("NFL_MCP_QUERY_TIMEOUT_SECONDS", str(seconds))
-    out, elapsed = _timed_query(SLOW_SQL)
+    out, elapsed = _timed_query(LONG_SQL)
     assert "timeout" in str(out.get("error", "")).lower()
     assert seconds - 0.1 <= elapsed < seconds + 1.5
 
@@ -386,7 +389,7 @@ def test_no_query_thread_left_after_timeout(monkeypatch, synth_db, clean_env):
     monkeypatch.setenv("NFL_MCP_QUERY_TIMEOUT_SECONDS", "1")
     monkeypatch.setattr(tools, "_QUERY_TIMEOUT_SECONDS", 1)
     before = {t.ident for t in threading.enumerate()}
-    out, _ = _timed_query(SLOW_SQL)
+    out, _ = _timed_query(LONG_SQL)
     assert "timeout" in str(out.get("error", "")).lower()
     time.sleep(2)
     leftover = [t.name for t in threading.enumerate()
