@@ -617,3 +617,17 @@ def test_auth_whitespace_only_token_means_unset_with_warning(monkeypatch, synth_
 def test_log_filter_survives_format_args_mismatch():
     record = logging.LogRecord("nfl-mcp", logging.INFO, __file__, 1, "mismatch %s %s", (1,), None)
     assert server._CutLongRecords().filter(record) is True
+
+
+@pytest.mark.parametrize("value", [" ", "  \t\n"])
+def test_serve_exits_1_on_whitespace_only_auth_token(value, monkeypatch):
+    from click.testing import CliRunner
+    from nfl_mcp.cli import main
+
+    started = []
+    monkeypatch.setattr("nfl_mcp.cli.uvicorn.run", lambda *a, **k: started.append(1))
+    monkeypatch.setenv("NFL_MCP_AUTH_TOKEN", value)
+    result = CliRunner().invoke(main, ["serve"])
+    assert result.exit_code == 1
+    assert "NFL_MCP_AUTH_TOKEN" in result.output
+    assert started == []
