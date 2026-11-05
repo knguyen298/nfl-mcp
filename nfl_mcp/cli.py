@@ -5,12 +5,14 @@ NFL MCP — command-line entry point
   nfl-mcp serve               Start the MCP server (Streamable HTTP)
   nfl-mcp ingest              Load NFL play-by-play data into the database
   nfl-mcp rebuild             Rebuild the derived tables from the loaded data
+  nfl-mcp upgrade             Detect and upgrade a database made by an older nfl-mcp
   nfl-mcp validate            Check a database slot before it replaces the active one
   nfl-mcp setup-client        Configure Claude Desktop / VS Code MCP
   nfl-mcp doctor              Check that everything is working
 """
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -57,6 +59,31 @@ def _exit_on_config_problem():
         sys.exit(1)
 
 
+def _warn_if_schema_old() -> None:
+    """Log one warning when the database file needs an upgrade or is newer. Never exits."""
+    from . import database, migrate
+    from .config import get_duckdb_path
+
+    log = logging.getLogger("nfl-mcp")
+    path = get_duckdb_path()
+    if not path.is_file():
+        return
+    try:
+        with database.get_db_connection() as conn:
+            status = migrate.check(conn)
+    except Exception as e:  # noqa: BLE001 - the server starts either way
+        log.warning("Could not check the schema version of %s: %s", path, e)
+        return
+    if status.newer:
+        log.warning("Database %s has schema version %d, newer than this nfl-mcp (%d); "
+                    "update nfl-mcp", path, status.version, status.target)
+    elif status.upgrade_needed:
+        needed = [s.name for s in status.steps if s.needed]
+        log.warning("Database %s is at schema version %d, this nfl-mcp expects %d%s; "
+                    "run: nfl-mcp upgrade", path, status.version, status.target,
+                    f" (needs: {', '.join(needed)})" if needed else "")
+
+
 @main.command()
 @click.option("--host", default="127.0.0.1", show_default=True,
               help="Host to bind the HTTP server to. Use 0.0.0.0 for LAN access.")
@@ -66,6 +93,7 @@ def serve(host, port):
     """Start the MCP server over Streamable HTTP."""
     _exit_on_config_problem()
     _check_auth_token_env()
+    _warn_if_schema_old()
     display_host = "localhost" if host == "0.0.0.0" else host
     click.echo(f"🏈 NFL MCP server listening on http://{display_host}:{port}/mcp")
     if host == "0.0.0.0":
@@ -196,6 +224,101 @@ def rebuild(db_path):
     finally:
         conn.close()
     click.secho("Derived tables rebuilt.", fg="green")
+
+
+# ── upgrade ────────────────────────────────────────────────────────────────────
+
+def _step_line(step) -> str:
+    state = "ok" if not step.needed else "NEEDED (network)" if step.needs_network else "NEEDED"
+    return f"  {step.name:<22} {state}" + (f"  {step.detail}" if step.needed else "")
+
+
+@main.command()
+@click.option("--db", "db_path", default=None, type=click.Path(dir_okay=False),
+              help="Database file (default: the configured path / NFL_MCP_DB_PATH).")
+@click.option("--check", "check_only", is_flag=True,
+              help="Only report what is needed (read-only). Exit 0 current, 3 upgrade needed, "
+                   "1 error or a database newer than this nfl-mcp.")
+@click.option("--no-fetch", is_flag=True,
+              help="Skip the steps that download data; exit 3 if any are left.")
+def upgrade(db_path, check_only, no_fetch):
+    """Detect and upgrade a database made by an older nfl-mcp, without deleting it.
+
+    Runs only the steps the database needs, then records the schema version once none
+    is left. Running it again is safe. The served container slot is read-only on purpose:
+    update_db.sh upgrades a copy of it before the swap.
+    """
+    import duckdb
+
+    from . import migrate
+    from .config import get_duckdb_path
+    from .database import _connection_config
+    from .ingest import _apply_duckdb_pragmas
+
+    path = Path(db_path).expanduser() if db_path else get_duckdb_path()
+    if not path.is_file():
+        raise click.ClickException(f"Database not found at {path}. Run 'nfl-mcp ingest' first.")
+
+    if check_only:
+        try:
+            conn = duckdb.connect(str(path), read_only=True, config=_connection_config())
+            try:
+                status = migrate.check(conn)
+            finally:
+                conn.close()
+        except (duckdb.Error, ValueError) as e:
+            raise click.ClickException(f"Cannot check {path}: {e}")
+        click.echo(f"Schema version {status.version}, this nfl-mcp expects {status.target}")
+        for step in status.steps:
+            click.echo(_step_line(step))
+        if status.newer:
+            raise click.ClickException(
+                f"{path} is newer than this nfl-mcp (version {status.version} > {status.target}); "
+                "update nfl-mcp")
+        if status.upgrade_needed:
+            click.echo("Upgrade needed: run nfl-mcp upgrade")
+            sys.exit(3)
+        click.secho("Database is current.", fg="green")
+        return
+
+    # os.access is always true for root, so also look at the mode bits of the real file.
+    if not os.access(path, os.W_OK) or path.resolve().stat().st_mode & 0o222 == 0:
+        raise click.ClickException(
+            f"{path} is read-only. The active container slot is read-only on purpose; "
+            "the next update_db.sh run upgrades a copy of it.")
+    try:
+        conn = duckdb.connect(str(path))
+    except duckdb.Error as e:
+        raise click.ClickException(f"Cannot open {path} for writing: {e}")
+    try:
+        _apply_duckdb_pragmas(conn, str(path))
+        result = migrate.upgrade(conn, fetch=not no_fetch)
+    except duckdb.Error as e:
+        raise click.ClickException(f"Upgrade of {path} failed: {e}")
+    finally:
+        conn.close()
+
+    click.echo(f"Schema version {result.before.version} -> {result.after.version}, "
+               f"this nfl-mcp expects {result.after.target}")
+    for step in [] if result.before.newer else result.before.steps:
+        if step.name in result.ran:
+            state = "ran"
+        elif step.name in result.pending:
+            state = "skipped (--no-fetch)"
+        elif step.needed:
+            state = "FAILED"
+        else:
+            state = "ok (not needed)"
+        click.echo(f"  {step.name:<22} {state}")
+    for failure in result.failed:
+        click.secho(f"  FAILED {failure}", fg="red")
+    if result.failed:
+        sys.exit(1)
+    if result.stamped:
+        click.secho(f"Stamped schema version {result.after.version}.", fg="green")
+    if result.after.upgrade_needed:
+        click.echo("Not stamped: run nfl-mcp upgrade without --no-fetch to finish.")
+        sys.exit(3)
 
 
 # ── validate ───────────────────────────────────────────────────────────────────
@@ -431,6 +554,27 @@ def _configure_claude_code(config: dict):
 
 # ── doctor ─────────────────────────────────────────────────────────────────────
 
+def _doctor_schema_line() -> None:
+    """One line: the database schema version, the target and the steps still needed."""
+    from . import database, migrate
+
+    try:
+        with database.get_db_connection() as conn:
+            status = migrate.check(conn)
+    except Exception:  # noqa: BLE001 - doctor reports, it does not stop
+        click.secho("  – Schema version unknown (could not check)", fg="bright_black")
+        return
+    needed = [s.name for s in status.steps if s.needed]
+    head = f"Schema version {status.version}, this nfl-mcp expects {status.target}"
+    if status.newer:
+        click.secho(f"  ⚠ {head}: the database is newer, update nfl-mcp", fg="yellow")
+    elif status.upgrade_needed:
+        click.secho(f"  ⚠ {head}: needs {', '.join(needed) or 'a version stamp'}; "
+                    "run 'nfl-mcp upgrade'", fg="yellow")
+    else:
+        click.secho(f"  ✓ {head} (current)", fg="green")
+
+
 @main.command()
 def doctor():
     """Check that everything is configured and working."""
@@ -465,6 +609,7 @@ def doctor():
         except Exception as e:
             click.secho(f"  ✗ Database error: {e}", fg="red")
             all_ok = False
+        _doctor_schema_line()
     else:
         click.secho(f"  ✗ DuckDB file not found at {db_path}", fg="red")
         click.echo("    Run 'nfl-mcp ingest' to load data.")

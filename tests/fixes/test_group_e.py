@@ -55,6 +55,7 @@ import pytest
 from click.testing import CliRunner
 
 from nfl_mcp.cli import main
+from nfl_mcp.migrate import SCHEMA_VERSION
 
 ROOT = Path(__file__).resolve().parents[2]
 REAL_DB = Path(os.environ.get("NFL_MCP_DB_PATH", "/tmp/grpE_v3.duckdb"))
@@ -117,6 +118,14 @@ def make_plays(n=200, weeks=((2025, 8), (2025, 9)), epa=0.1, posteam="KC", start
     return rows
 
 
+def _stamp_current(con):
+    """A good slot carries the current schema version (group M's schema_version check)."""
+    con.execute("CREATE TABLE _schema_version (version INTEGER, applied_at TIMESTAMP, "
+                "nfl_mcp_version VARCHAR)")
+    con.execute("INSERT INTO _schema_version VALUES (?, TIMESTAMP '2026-11-05 00:00:00', 'test')",
+                [SCHEMA_VERSION])
+
+
 def build_slot(path, plays, *, drop_tables=(), drop_columns=None, row_counts=None):
     """Write a DuckDB slot. Non-plays tables get row_counts.get(table, 3) rows stamped with
     the newest (season, week) in plays so every table agrees on recency."""
@@ -142,6 +151,7 @@ def build_slot(path, plays, *, drop_tables=(), drop_columns=None, row_counts=Non
             if rows:
                 marks = ", ".join("?" for _ in cols)
                 con.executemany(f'INSERT INTO "{table}" VALUES ({marks})', rows)
+        _stamp_current(con)
     finally:
         con.close()
     return path
@@ -287,6 +297,12 @@ def real_copy(tmp_path_factory):
         pytest.skip(f"No DuckDB database at {REAL_DB}")
     dest = tmp_path_factory.mktemp("real") / "real_copy.duckdb"
     shutil.copyfile(REAL_DB, dest)
+    # The shared file is unstamped (never upgraded); the copy stands for an upgraded slot.
+    con = duckdb.connect(str(dest))
+    try:
+        _stamp_current(con)
+    finally:
+        con.close()
     dest.chmod(0o444)
     return dest
 

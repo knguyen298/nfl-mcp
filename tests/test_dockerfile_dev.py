@@ -334,6 +334,24 @@ class TestContainerLifecycle:
         assert result.returncode != 0
         assert "is not a symlink" in result.stdout
 
+    def test_second_update_skips_while_another_holds_the_lock(self, tmp_path):
+        # A cron run that overlaps the boot-time update must not touch the idle slot.
+        import fcntl
+
+        entrypoint, updater, data, bin_dir = _sim(tmp_path)
+        _run(entrypoint, bin_dir)
+        with open(data / ".update.lock", "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            out = _run(updater, bin_dir)   # exits 0, like a run with nothing to do
+
+            assert "Another update is already running" in out
+            assert "[stub nfl-mcp" not in out
+            assert not (data / "nflread_b.duckdb").exists()
+            assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
+        # Lock released: the next run proceeds.
+        _run(updater, bin_dir)
+        assert os.readlink(data / "nflread.duckdb") == "nflread_b.duckdb"
+
 
 class TestRootStartDropsPrivileges:
     """entrypoint.sh started as root chowns a foreign-owned /data, then re-runs as nflmcp.

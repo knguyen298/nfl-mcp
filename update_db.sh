@@ -9,6 +9,14 @@ if [ ! -L "$SYMLINK" ]; then
     exit 1
 fi
 
+# One update at a time: a cron run that starts while the boot-time update is still working
+# would pick the same idle slot and delete the file the first run has open.
+exec 9>"$DB_DIR/.update.lock"
+if ! flock -n 9; then
+    echo "[$(date -u)] Another update is already running; skipping this run."
+    exit 0
+fi
+
 CURRENT=$(readlink "$SYMLINK")
 
 if [ "$CURRENT" = "nflread_a.duckdb" ]; then
@@ -43,6 +51,15 @@ chmod u+w "$TARGET"
 # snapshot tables (rankings, players, contracts) are re-fetched every run.
 echo "[$(date -u)] Running incremental ingest..."
 NFL_MCP_DB_PATH="$TARGET" nfl-mcp ingest
+
+# Bring a slot copied from an older database up to the current schema (derived tables,
+# depth_charts season, missing raw columns) and record the version. Exit 3 means a step
+# is still pending, which validate would only catch later, so any non-zero stops here.
+echo "[$(date -u)] Upgrading $(basename "$TARGET") to the current schema..."
+if ! NFL_MCP_DB_PATH="$TARGET" nfl-mcp upgrade --db "$TARGET"; then
+    echo "[$(date -u)] ERROR: schema upgrade failed or is incomplete. Keeping $CURRENT active."
+    exit 1
+fi
 
 # Refuse to publish a bad slot: missing tables or columns, fewer rows or an older newest
 # week than the active slot, duplicate plays, or empty key columns. On failure the active
