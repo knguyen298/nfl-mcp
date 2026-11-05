@@ -272,6 +272,34 @@ class TestDepthChartsLegacyRestamp:
         assert _meta(conn, "depth_charts", 2026) == [2]
         assert any(f.startswith("depth_charts 2025") for f in ing._FAILURES), ing._FAILURES
 
+    def test_failed_restamp_writes_nothing_for_a_requested_legacy_season(self, conn, monkeypatch):
+        frames = self._frames()
+        self._legacy_db(conn, frames)
+        ing._FAILURES.clear()
+
+        def fail():
+            raise ConnectionError("simulated outage")
+        self._run(conn, monkeypatch, {**frames, 2025: fail}, [2026])   # 2026 is current
+        assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE season = 2026") == 0
+        assert self._by_season(conn) == {2024: 3, None: 6}
+        assert _meta(conn, "depth_charts", 2026) == [2]
+        assert any(f.startswith("depth_charts 2025") for f in ing._FAILURES), ing._FAILURES
+
+    def test_legacy_rows_without_metadata_are_kept_and_reported(self, conn, monkeypatch):
+        frames = self._frames()
+        ing._write_df_to_table(conn, "depth_charts", frames[2024])
+        ing._record_loaded(conn, "depth_charts", "depth_charts", "load_depth_charts", 3, season=2024)
+        ing._write_df_to_table(conn, "depth_charts", frames[2025])   # NULL season, no metadata
+        ing._FAILURES.clear()
+        fetched = []
+        loader = _loader_from(frames)
+        _fake_nfl(monkeypatch, load_depth_charts=lambda s, **k: fetched.append(s[0]) or loader(s, **k))
+        monkeypatch.setattr(ing, "current_season", lambda: 2026)
+        ing._ingest_generic_dataset(conn, self.defn, [2024], fresh=False)
+        assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL") == 4
+        assert fetched == []
+        assert len(ing._FAILURES) == 1 and "--fresh" in ing._FAILURES[0], ing._FAILURES
+
     def test_successful_restamp_fetches_everything_before_deleting(self, conn, monkeypatch):
         frames = self._frames()
         self._legacy_db(conn, frames)

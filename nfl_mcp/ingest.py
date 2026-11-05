@@ -540,10 +540,21 @@ def _ingest_generic_dataset(
                 print(f"    Failed to prepare {table}: {e}")
                 _note_failure(dataset_def.dataset_id, None, e)
                 return 0
-            if has_legacy:
+            if has_legacy and not legacy_seasons:
+                # Nothing says which seasons these rows belong to, so nothing can be
+                # re-fetched to replace them; deleting them would only lose data.
+                n_null = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE season IS NULL").fetchone()[0]
+                print(f"    WARNING: {table} has {n_null:,} rows with no season and no metadata "
+                      f"saying which seasons to re-fetch; leaving them in place")
+                _note_failure(dataset_def.dataset_id, None, RuntimeError(
+                    f"{n_null} rows in {table} have no season and cannot be restamped; "
+                    f"run with --fresh for dataset {dataset_def.dataset_id}"))
+            elif has_legacy:
                 restamped = _restamp_legacy_seasons(conn, dataset_def, loader, legacy_seasons)
                 total_rows += sum(restamped.values())
-                season_list = [s for s in season_list if s not in restamped]
+                # Restamp is all or nothing. If it did not complete, write nothing for
+                # these seasons now: a stamped copy would sit next to the NULL-season rows.
+                season_list = [s for s in season_list if s not in legacy_seasons]
         for season in season_list:
             already = _is_loaded(conn, dataset_def.dataset_id, season)
             if already and not fresh and season not in _refresh_seasons():
