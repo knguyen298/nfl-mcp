@@ -605,8 +605,7 @@ def test_query_description_drops_last_resort():
     assert "LAST RESORT" not in _desc("nfl_query").upper()
 
 
-@XF(strict=True, reason="group j: nfl_query description")
-def test_query_description_mentions_cte():
+def test_query_description_mentions_cte():  # satisfied by group B's description rewrite
     assert re.search(r"\bCTE\b|\bWITH\b", _desc("nfl_query"))
 
 
