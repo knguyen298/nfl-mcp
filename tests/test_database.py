@@ -40,9 +40,13 @@ class TestConnectionConfig:
         assert connection_config_problem() is None
         with get_db_connection() as conn:
             default_threads = conn.execute("SELECT current_setting('threads')").fetchone()[0]
-            assert default_threads == duckdb.connect(":memory:").execute(
-                "SELECT current_setting('threads')"
-            ).fetchone()[0]
+            ref = duckdb.connect(":memory:")
+            try:
+                assert default_threads == ref.execute(
+                    "SELECT current_setting('threads')"
+                ).fetchone()[0]
+            finally:
+                ref.close()
 
 
 class TestGetDbConnection:

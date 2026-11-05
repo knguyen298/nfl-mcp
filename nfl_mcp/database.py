@@ -9,7 +9,7 @@ from contextlib import contextmanager
 
 from .config import get_duckdb_path
 
-_MEMORY_RE = re.compile(r"\d+(\.\d+)?\s*(KB|MB|GB|TB|KiB|MiB|GiB|TiB)", re.IGNORECASE)
+_MEMORY_RE = re.compile(r"\d+(\.\d+)?\s*(KB|MB|GB|TB|KiB|MiB|GiB|TiB)", re.IGNORECASE | re.ASCII)
 
 
 def connection_config_problem() -> str | None:
@@ -22,6 +22,18 @@ def connection_config_problem() -> str | None:
     if mem and not _MEMORY_RE.fullmatch(mem.strip()):
         return (f"NFL_MCP_DUCKDB_MEMORY_LIMIT={mem!r} is not valid: "
                 "use a number and a unit such as '512MB' or '2GiB'")
+    if mem:
+        # Let DuckDB reject values that parse but are unusable, such as '0MB'.
+        probe = None
+        try:
+            probe = duckdb.connect(":memory:", config={"memory_limit": mem.strip()})
+            # DuckDB accepts the value at connect and fails on the first real query.
+            probe.execute("SELECT current_setting('memory_limit')")
+        except duckdb.Error as e:
+            return f"NFL_MCP_DUCKDB_MEMORY_LIMIT={mem!r} is not valid: {e}"
+        finally:
+            if probe is not None:
+                probe.close()
     threads = os.getenv("NFL_MCP_DUCKDB_THREADS")
     if threads and not (threads.strip().isascii() and threads.strip().isdigit() and int(threads) > 0):
         return f"NFL_MCP_DUCKDB_THREADS={threads!r} is not valid: use a positive whole number"
@@ -67,11 +79,11 @@ def get_db_connection():
 
     Each call opens a new connection so callers (including threaded timeouts)
     never share a connection across threads. Never creates the file or its
-    directory; a missing file raises FileNotFoundError with the path.
+    directory; a missing file raises duckdb.IOException with the path.
     """
     db_path = get_duckdb_path()
     if not db_path.is_file():
-        raise FileNotFoundError(f"DuckDB file not found at {db_path}")
+        raise duckdb.IOException(f"DuckDB file not found at {db_path}")
     conn = duckdb.connect(str(db_path), read_only=True, config=_connection_config())
     try:
         yield conn

@@ -36,6 +36,16 @@ def main():
 
 # ── serve ──────────────────────────────────────────────────────────────────────
 
+def _exit_on_config_problem():
+    """Exit non-zero, naming the env var, if NFL_MCP_DUCKDB_* is invalid."""
+    from .database import connection_config_problem
+
+    problem = connection_config_problem()
+    if problem:
+        click.secho(f"✗ {problem}", fg="red", err=True)
+        sys.exit(1)
+
+
 @main.command()
 @click.option("--host", default="127.0.0.1", show_default=True,
               help="Host to bind the HTTP server to. Use 0.0.0.0 for LAN access.")
@@ -43,12 +53,7 @@ def main():
               help="Port to listen on.")
 def serve(host, port):
     """Start the MCP server over Streamable HTTP."""
-    from .database import connection_config_problem
-
-    problem = connection_config_problem()
-    if problem:
-        click.secho(f"✗ {problem}", fg="red", err=True)
-        sys.exit(1)
+    _exit_on_config_problem()
     display_host = "localhost" if host == "0.0.0.0" else host
     click.echo(f"🏈 NFL MCP server listening on http://{display_host}:{port}/mcp")
     if host == "0.0.0.0":
@@ -209,6 +214,7 @@ def init(start, end, skip_ingest):
     click.echo("   You can start it any time with:  nfl-mcp serve")
     click.echo()
     if click.confirm("  Start the server now?", default=True):
+        _exit_on_config_problem()
         click.secho("   Starting server on http://localhost:8000/mcp  (Ctrl-C to stop)", fg="cyan")
         click.echo()
         uvicorn.run(create_app(), host="127.0.0.1", port=8000)
