@@ -257,6 +257,41 @@ class TestDepthChartsLegacyRestamp:
         assert fetched == [2026]                       # only the current season, no 2025
         assert self._by_season(conn) == {2024: 3, 2025: 4, 2026: 2}
 
+    def test_failed_restamp_fetch_keeps_legacy_rows_and_metadata(self, conn, monkeypatch):
+        frames = self._frames()
+        self._legacy_db(conn, frames)
+        ing._FAILURES.clear()
+
+        def fail():
+            raise ConnectionError("simulated outage")
+        # 2025 and 2026 are both legacy seasons; the 2025 fetch fails, so nothing is deleted
+        self._run(conn, monkeypatch, {**frames, 2025: fail}, [2024])
+        assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL") == 6  # 4 + 2
+        assert self._by_season(conn) == {2024: 3, None: 6}
+        assert _meta(conn, "depth_charts", 2025) == [4]
+        assert _meta(conn, "depth_charts", 2026) == [2]
+        assert any(f.startswith("depth_charts 2025") for f in ing._FAILURES), ing._FAILURES
+
+    def test_successful_restamp_fetches_everything_before_deleting(self, conn, monkeypatch):
+        frames = self._frames()
+        self._legacy_db(conn, frames)
+        legacy_seen = []
+        loader = _loader_from(frames)
+
+        def spy(seasons, **kwargs):
+            legacy_seen.append(_count(conn, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL"))
+            return loader(seasons, **kwargs)
+        _fake_nfl(monkeypatch, load_depth_charts=spy)
+        monkeypatch.setattr(ing, "current_season", lambda: 2026)
+        ing._FAILURES.clear()
+        assert ing._ingest_generic_dataset(conn, self.defn, [2026], fresh=False) == 6  # 4 + 2
+        assert legacy_seen == [6, 6]        # both fetches saw the untouched legacy rows
+        assert ing._FAILURES == []
+        assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL") == 0
+        assert self._by_season(conn) == {2024: 3, 2025: 4, 2026: 2}
+        assert _meta(conn, "depth_charts", 2025) == [4]
+        assert _meta(conn, "depth_charts", 2026) == [2]
+
     def test_clean_db_is_not_refetched(self, conn, monkeypatch):
         frames = self._frames()
         self._run(conn, monkeypatch, frames, [2024, 2025, 2026])

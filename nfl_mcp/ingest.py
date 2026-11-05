@@ -389,39 +389,71 @@ def _stamp_season(df: pl.DataFrame, season: int) -> pl.DataFrame:
     return df.with_columns(pl.lit(season, dtype=pl.Int64).alias("season"))
 
 
-def _restamp_legacy_rows(conn: duckdb.DuckDBPyConnection, dataset_def) -> list[int]:
-    """Make rows loaded before season stamping re-fetchable. Returns the seasons to re-fetch.
+def _legacy_restamp_plan(conn: duckdb.DuckDBPyConnection, dataset_def) -> tuple[bool, list[int]]:
+    """Find rows loaded before season stamping. Returns (has_legacy_rows, seasons to re-fetch).
 
     Old loads left season NULL (depth_charts 2025+ files have none) and nothing in those
     rows says which season they belong to: dt does not split cleanly (the real 2025 file
-    runs through 2026-03-14, the 2026 file starts 2026-03-22). So drop every NULL-season
-    row and the metadata of the seasons that had no stamped rows, and let the caller
-    re-fetch those seasons in this run. Once stamped there are no NULL rows, so a second
-    run does nothing.
+    runs through 2026-03-14, the 2026 file starts 2026-03-22). The seasons are the ones in
+    metadata that have no stamped rows. Adds the season column if the table has none;
+    deletes nothing (see _restamp_legacy_seasons).
     """
     table = dataset_def.table_name
     if not _table_exists(conn, table):
-        return []
-    with _transaction(conn):
-        if "season" not in _table_columns(conn, table):
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN season BIGINT")
-        if not conn.execute(f"SELECT COUNT(*) FROM {table} WHERE season IS NULL").fetchone()[0]:
-            return []
-        seasons = sorted(r[0] for r in conn.execute(
-            "SELECT DISTINCT season FROM _ingest_metadata WHERE dataset_id = ? "
-            f"AND season IS NOT NULL AND season NOT IN "
-            f"(SELECT DISTINCT season FROM {table} WHERE season IS NOT NULL)",
-            [dataset_def.dataset_id],
-        ).fetchall())
-        conn.execute(f"DELETE FROM {table} WHERE season IS NULL")
-        for season in seasons:
-            conn.execute(
-                "DELETE FROM _ingest_metadata WHERE dataset_id = ? AND season = ?",
-                [dataset_def.dataset_id, season],
-            )
+        return False, []
+    if "season" not in _table_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN season BIGINT")
+    if not conn.execute(f"SELECT COUNT(*) FROM {table} WHERE season IS NULL").fetchone()[0]:
+        return False, []
+    seasons = sorted(r[0] for r in conn.execute(
+        "SELECT DISTINCT season FROM _ingest_metadata WHERE dataset_id = ? "
+        f"AND season IS NOT NULL AND season NOT IN "
+        f"(SELECT DISTINCT season FROM {table} WHERE season IS NOT NULL)",
+        [dataset_def.dataset_id],
+    ).fetchall())
+    return True, seasons
+
+
+def _restamp_legacy_seasons(conn, dataset_def, loader, seasons: list[int]) -> dict[int, int]:
+    """Re-fetch every legacy season, then swap them in. Returns {season: rows}, {} if skipped.
+
+    Every fetch happens before anything is deleted. If one fails (or comes back empty) the
+    legacy rows and their metadata stay as they are and the failure is recorded. If all
+    succeed, one transaction drops the NULL-season rows and writes each season stamped.
+    A second run finds no NULL rows and does nothing.
+    """
     print(f"    INFO: {dataset_def.dataset_id}: re-fetching seasons {seasons} to stamp a season "
           f"on rows loaded before season stamping")
-    return seasons
+    frames: dict[int, pl.DataFrame] = {}
+    for season in seasons:
+        try:
+            df = loader([season], **dataset_def.extra_params)
+            if df is None or len(df) == 0:
+                raise ValueError("no data returned")
+        except Exception as e:  # noqa: BLE001 - soft failure, reported at the end of the run
+            print(f"    Failed to re-fetch {dataset_def.dataset_id} {season}: {e}; "
+                  f"keeping the existing rows, restamp skipped")
+            _note_failure(dataset_def.dataset_id, season, e)
+            return {}
+        frames[season] = _stamp_season(_safe_rename(df), season)
+    try:
+        with _transaction(conn):
+            for df in frames.values():      # new columns first: DuckDB cannot ALTER after a DELETE
+                _reconcile_schema(conn, dataset_def.table_name, df)
+            conn.execute(f"DELETE FROM {dataset_def.table_name} WHERE season IS NULL")
+            for season, df in frames.items():
+                conn.execute(
+                    "DELETE FROM _ingest_metadata WHERE dataset_id = ? AND season = ?",
+                    [dataset_def.dataset_id, season],
+                )
+                _replace_season(conn, dataset_def, df, season)
+    except Exception as e:  # noqa: BLE001 - soft failure, reported at the end of the run
+        print(f"    Failed to restamp {dataset_def.dataset_id}, kept the previous rows: {e}")
+        _note_failure(dataset_def.dataset_id, None, e)
+        return {}
+    for season, df in frames.items():
+        print(f"    {dataset_def.dataset_id} {season}: {len(df):,} rows restamped")
+    return {season: len(df) for season, df in frames.items()}
 
 
 def _replace_season(conn, dataset_def, df: pl.DataFrame, season: int) -> None:
@@ -437,6 +469,7 @@ def _replace_season(conn, dataset_def, df: pl.DataFrame, season: int) -> None:
             raise ValueError(
                 f"table {table} has no '{key}' column, cannot replace season {season}"
             )
+        _reconcile_schema(conn, table, df)          # before the DELETE, see _restamp_legacy_seasons
         if dataset_def.delete_match == "id_prefix":
             conn.execute(f'DELETE FROM {table} WHERE starts_with("{key}", ?)', [f"{season}_"])
         else:
@@ -456,7 +489,7 @@ def _ingest_generic_dataset(
     A season is replaced by the dataset's delete key (registry delete_key/delete_match).
     depth_charts keys by a season column the loader stamps on files that lack one
     (2025+), not by a dt range. Rows from before stamping (NULL season) are dropped and
-    their seasons re-fetched in the same run (_restamp_legacy_rows).
+    their seasons re-fetched in the same run, fetch first (_restamp_legacy_seasons).
     Each season's DELETE, INSERT and metadata upsert run in one transaction.
     """
     import nflreadpy
@@ -502,12 +535,15 @@ def _ingest_generic_dataset(
         season_list = _clip_to_window(ALL_SEASONS if bulk_mode else seasons, dataset_def)
         if dataset_def.stamp_season:
             try:
-                restamp = _restamp_legacy_rows(conn, dataset_def)
+                has_legacy, legacy_seasons = _legacy_restamp_plan(conn, dataset_def)
             except Exception as e:  # noqa: BLE001 - soft failure, reported at the end of the run
                 print(f"    Failed to prepare {table}: {e}")
                 _note_failure(dataset_def.dataset_id, None, e)
                 return 0
-            season_list = sorted(set(season_list) | set(restamp))
+            if has_legacy:
+                restamped = _restamp_legacy_seasons(conn, dataset_def, loader, legacy_seasons)
+                total_rows += sum(restamped.values())
+                season_list = [s for s in season_list if s not in restamped]
         for season in season_list:
             already = _is_loaded(conn, dataset_def.dataset_id, season)
             if already and not fresh and season not in _refresh_seasons():
