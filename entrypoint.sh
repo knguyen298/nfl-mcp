@@ -67,5 +67,20 @@ EOF
 supercronic /tmp/crontab &
 echo "[cron] Scheduler started."
 
+# A database made by an older release still serves, but may lack columns the tools use.
+# The active slot is read-only, so the check only reads; on exit 3 one update_db.sh run
+# upgrades a copy and swaps it in. Opt out with NFL_MCP_UPGRADE_ON_START=0. Nothing here
+# may block or fail the start.
+if [ "${NFL_MCP_UPGRADE_ON_START:-1}" != "0" ]; then
+    UPGRADE_RC=0
+    nfl-mcp upgrade --check --db "$SYMLINK" || UPGRADE_RC=$?
+    if [ "$UPGRADE_RC" -eq 3 ]; then
+        echo "[upgrade] Active DB needs a schema upgrade; starting update_db.sh in the background."
+        /update_db.sh >> /var/log/nflmcp/nfl_update.log 2>&1 &
+    elif [ "$UPGRADE_RC" -ne 0 ]; then
+        echo "[upgrade] Schema check exited $UPGRADE_RC; starting without an upgrade."
+    fi
+fi
+
 echo "[server] Starting NFL MCP server..."
 exec nfl-mcp serve --host 0.0.0.0 --port 8000

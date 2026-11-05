@@ -1525,8 +1525,12 @@ def run_ingest_datasets(
         _create_fantasy_tables(conn)
         _create_team_records(conn)
 
-    conn.close()
     failures = list(_FAILURES)
+    if not failures:
+        from .migrate import stamp_if_current
+        if stamp_if_current(conn):
+            print("\n  Schema version stamped.")
+    conn.close()
     print("\n" + "=" * 60)
     if failures:
         print(f"Ingestion finished with {len(failures)} failure(s):")
