@@ -72,7 +72,7 @@ FRANCHISES: dict[str, Franchise] = {f.key: f for f in (
     Franchise("HOU", "Houston Texans", 34, first_season=2002),
     Franchise("IND", "Indianapolis Colts", 11, first_season=1953,
               eras=((1953, "Baltimore Colts"), (1984, "Indianapolis Colts"))),
-    Franchise("JAX", "Jacksonville Jaguars", 30, first_season=1995),
+    Franchise("JAX", "Jacksonville Jaguars", 30, aliases=("JAC",), first_season=1995),
     Franchise("KC", "Kansas City Chiefs", 12, first_season=1960,
               eras=((1960, "Dallas Texans"), (1963, "Kansas City Chiefs"))),
     Franchise("LA", "Los Angeles Rams", 14, aliases=("STL", "LAR", "RAM"), first_season=1937,
@@ -122,12 +122,24 @@ def canonical_team(value: str) -> str | None:
     Returns None for anything unrecognised, so callers can surface a clean error instead
     of silently querying a team that does not exist.
     """
-    if not value:
+    if not value or not isinstance(value, str):
         return None
     code = value.strip().upper()
     if code in FRANCHISES:
         return code
     return _ALIASES.get(code)
+
+
+def team_codes(value: str) -> tuple[str, ...] | None:
+    """Every abbreviation a franchise has been stored under: the current key first, then aliases.
+
+    "OAK", "oak" and "LV" all give ("LV", "OAK"), so a filter finds a team in every era.
+    Returns None for anything unrecognised.
+    """
+    key = canonical_team(value)
+    if key is None:
+        return None
+    return (key, *FRANCHISES[key].aliases)
 
 
 def era_name(season: int, team: str) -> str | None:
