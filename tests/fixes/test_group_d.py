@@ -224,6 +224,11 @@ class TestDepthChartsLegacyRestamp:
         monkeypatch.setattr(ing, "current_season", lambda: 2026)
         return ing._ingest_generic_dataset(conn, self.defn, seasons, fresh=False)
 
+    def _run_fresh(self, conn, monkeypatch, frames, seasons):
+        _fake_nfl(monkeypatch, load_depth_charts=_loader_from(frames))
+        monkeypatch.setattr(ing, "current_season", lambda: 2026)
+        return ing._ingest_generic_dataset(conn, self.defn, seasons, fresh=True)
+
     def _by_season(self, conn):
         return dict(conn.execute(
             "SELECT season, COUNT(*) FROM depth_charts GROUP BY season").fetchall())
@@ -299,6 +304,18 @@ class TestDepthChartsLegacyRestamp:
         assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL") == 4
         assert fetched == []
         assert len(ing._FAILURES) == 1 and "--fresh" in ing._FAILURES[0], ing._FAILURES
+
+    def test_fresh_restamps_requested_seasons_when_metadata_is_missing(self, conn, monkeypatch):
+        frames = self._frames()
+        ing._write_df_to_table(conn, "depth_charts", frames[2024])
+        ing._record_loaded(conn, "depth_charts", "depth_charts", "load_depth_charts", 3, season=2024)
+        ing._write_df_to_table(conn, "depth_charts", frames[2025])   # NULL season, no metadata
+        ing._write_df_to_table(conn, "depth_charts", frames[2026])
+        ing._FAILURES.clear()
+        self._run_fresh(conn, monkeypatch, frames, [2025, 2026])
+        assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL") == 0
+        assert self._by_season(conn) == {2024: 3, 2025: 4, 2026: 2}
+        assert ing._FAILURES == []
 
     def test_successful_restamp_fetches_everything_before_deleting(self, conn, monkeypatch):
         frames = self._frames()

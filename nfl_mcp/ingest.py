@@ -540,6 +540,9 @@ def _ingest_generic_dataset(
                 print(f"    Failed to prepare {table}: {e}")
                 _note_failure(dataset_def.dataset_id, None, e)
                 return 0
+            if has_legacy and not legacy_seasons and fresh and season_list:
+                # --fresh re-fetches what was asked for, so those seasons can replace the rows.
+                legacy_seasons = list(season_list)
             if has_legacy and not legacy_seasons:
                 # Nothing says which seasons these rows belong to, so nothing can be
                 # re-fetched to replace them; deleting them would only lose data.
@@ -548,7 +551,7 @@ def _ingest_generic_dataset(
                       f"saying which seasons to re-fetch; leaving them in place")
                 _note_failure(dataset_def.dataset_id, None, RuntimeError(
                     f"{n_null} rows in {table} have no season and cannot be restamped; "
-                    f"run with --fresh for dataset {dataset_def.dataset_id}"))
+                    f"run: nfl-mcp ingest --dataset {dataset_def.dataset_id} --fresh"))
             elif has_legacy:
                 restamped = _restamp_legacy_seasons(conn, dataset_def, loader, legacy_seasons)
                 total_rows += sum(restamped.values())
