@@ -1109,20 +1109,11 @@ for _tool in TOOLS:
         _tool.description += _GRAIN_SENTENCE.get(_tool.name, "") + _PAGE_SENTENCE
 
 
-# Every tool only reads the local database. Every result is a JSON object (an error is one too).
+# Every tool only reads the local database. No tool declares an outputSchema: mcpo turns one into a
+# FastAPI response model and drops every field the schema does not list.
 _READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
-_OUTPUT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "data_as_of": {
-            "type": "string",
-            "description": "Newest load time (ISO 8601, UTC) of the tables this tool read.",
-        },
-    },
-}
 for _tool in TOOLS:
     _tool.annotations = _READ_ONLY
-    _tool.outputSchema = _OUTPUT_SCHEMA
 
 
 @_mcp_server.list_tools()

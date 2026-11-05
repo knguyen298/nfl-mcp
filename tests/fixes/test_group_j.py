@@ -27,7 +27,7 @@ Interface contract assumed by these tests (beyond the shared brief):
   table has no week column) and "last_refreshed" (ISO). plays.total_plays and
   plays.seasons stay.
 - MCP: every Tool has annotations readOnlyHint=True, destructiveHint=False,
-  idempotentHint=True, openWorldHint=False and an outputSchema with type "object".
+  idempotentHint=True, openWorldHint=False and no outputSchema (mcpo drops undeclared fields).
   tools/call returns structuredContent equal to json.loads(content[0].text). Resources
   nfl://schema, nfl://relationships, nfl://data-notes are listed by resources/list;
   resources/read on them and on nfl://schema/plays returns non-empty text.
@@ -522,9 +522,11 @@ def test_every_tool_has_annotation(hint, value):
     assert not bad, bad
 
 
-def test_every_tool_has_object_output_schema():
+def test_no_tool_declares_output_schema():
+    # mcpo builds a response model from outputSchema and drops every field it does not list. v0.6.0 and
+    # v0.6.1 declared only data_as_of, so Open WebUI got {"data_as_of": ...} and no rows.
     tools_listed = _handle(types.ListToolsRequest(method="tools/list")).tools
-    bad = [t.name for t in tools_listed if not t.outputSchema or t.outputSchema.get("type") != "object"]
+    bad = [t.name for t in tools_listed if t.outputSchema is not None]
     assert not bad, bad
 
 

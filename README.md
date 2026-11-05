@@ -438,7 +438,8 @@ SELECT season, team, wins, losses, ties FROM team_records WHERE season = 1972 AN
   swap to a new database file, or a new load into the same file, refreshes the value. Error
   responses carry it too.
 - **Structured output.** Each result is a JSON object. The MCP response sends it in
-  `structuredContent` and as text. Each tool declares an `outputSchema` of type `object`.
+  `structuredContent` and as text. No tool declares an `outputSchema`. The mcpo proxy
+  removes every result field that an `outputSchema` does not list.
 - **Resources.** Clients that read MCP resources can read `nfl://schema`,
   `nfl://relationships`, and `nfl://data-notes`. They can also read `nfl://schema/<table>`,
   for example `nfl://schema/plays`. These hold the same facts as `nfl_schema`.
