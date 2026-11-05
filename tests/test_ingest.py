@@ -927,7 +927,7 @@ class TestRunIngestOrchestration:
         )
 
         assert calls["pbp"] == [2024]
-        assert calls["record"] == [("pbp", "plays", "load_pbp", 11, 2024)]
+        assert calls["record"] == []  # pbp metadata is written inside _ingest_pbp_season (mocked here)
         assert calls["idx"] == 1
         assert calls["agg"] == 1
         assert calls.get("fantasy") == 1

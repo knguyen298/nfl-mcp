@@ -78,7 +78,10 @@ def _transaction(conn: duckdb.DuckDBPyConnection):
     try:
         yield
     except BaseException:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except Exception as rollback_err:  # noqa: BLE001 - keep the original error
+            print(f"    Rollback failed: {rollback_err}")
         raise
     conn.execute("COMMIT")
 
@@ -300,7 +303,7 @@ def _create_plays_table(conn: duckdb.DuckDBPyConnection, sample_df: pl.DataFrame
 
 
 def _ingest_pbp_season(conn: duckdb.DuckDBPyConnection, season: int) -> int:
-    """Replace one season of plays; DELETE and INSERT commit together or not at all."""
+    """Replace one season of plays; DELETE, INSERT and the metadata row commit together."""
     import nflreadpy
     print(f"\n  {season}")
     try:
@@ -338,6 +341,8 @@ def _ingest_pbp_season(conn: duckdb.DuckDBPyConnection, season: int) -> int:
             conn.execute("DELETE FROM plays WHERE season = ?", [season])
             conn.register("_ingest_df", df.to_arrow())
             conn.execute("INSERT INTO plays BY NAME SELECT * FROM _ingest_df")
+            if total:
+                _record_loaded(conn, "pbp", "plays", "load_pbp", total, season)
     except Exception as e:  # noqa: BLE001 - soft failure, reported at the end of the run
         print(f"    Failed to write, kept the previous rows: {e}")
         _note_failure("pbp", season, e)
@@ -384,20 +389,39 @@ def _stamp_season(df: pl.DataFrame, season: int) -> pl.DataFrame:
     return df.with_columns(pl.lit(season, dtype=pl.Int64).alias("season"))
 
 
-def _backfill_season_from_dt(conn: duckdb.DuckDBPyConnection, table: str) -> None:
-    """Give rows loaded before season stamping (season NULL, ISO text dt) a season.
+def _restamp_legacy_rows(conn: duckdb.DuckDBPyConnection, dataset_def) -> list[int]:
+    """Make rows loaded before season stamping re-fetchable. Returns the seasons to re-fetch.
 
-    A season runs March 1 to the last day of February: depth_charts 2025 dt runs
-    2025-08-03 to 2026-02-28 and the 2026 file starts 2026-03-14.
+    Old loads left season NULL (depth_charts 2025+ files have none) and nothing in those
+    rows says which season they belong to: dt does not split cleanly (the real 2025 file
+    runs through 2026-03-14, the 2026 file starts 2026-03-22). So drop every NULL-season
+    row and the metadata of the seasons that had no stamped rows, and let the caller
+    re-fetch those seasons in this run. Once stamped there are no NULL rows, so a second
+    run does nothing.
     """
-    cols = _table_columns(conn, table)
-    if "dt" not in cols or "season" not in cols:
-        return
-    conn.execute(
-        f"UPDATE {table} SET season = CAST(substr(CAST(dt AS VARCHAR), 1, 4) AS INTEGER) "
-        f"- CASE WHEN CAST(substr(CAST(dt AS VARCHAR), 6, 2) AS INTEGER) < 3 THEN 1 ELSE 0 END "
-        f"WHERE season IS NULL AND dt IS NOT NULL"
-    )
+    table = dataset_def.table_name
+    if not _table_exists(conn, table):
+        return []
+    with _transaction(conn):
+        if "season" not in _table_columns(conn, table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN season BIGINT")
+        if not conn.execute(f"SELECT COUNT(*) FROM {table} WHERE season IS NULL").fetchone()[0]:
+            return []
+        seasons = sorted(r[0] for r in conn.execute(
+            "SELECT DISTINCT season FROM _ingest_metadata WHERE dataset_id = ? "
+            f"AND season IS NOT NULL AND season NOT IN "
+            f"(SELECT DISTINCT season FROM {table} WHERE season IS NOT NULL)",
+            [dataset_def.dataset_id],
+        ).fetchall())
+        conn.execute(f"DELETE FROM {table} WHERE season IS NULL")
+        for season in seasons:
+            conn.execute(
+                "DELETE FROM _ingest_metadata WHERE dataset_id = ? AND season = ?",
+                [dataset_def.dataset_id, season],
+            )
+    print(f"    INFO: {dataset_def.dataset_id}: re-fetching seasons {seasons} to stamp a season "
+          f"on rows loaded before season stamping")
+    return seasons
 
 
 def _replace_season(conn, dataset_def, df: pl.DataFrame, season: int) -> None:
@@ -409,9 +433,6 @@ def _replace_season(conn, dataset_def, df: pl.DataFrame, season: int) -> None:
     table = dataset_def.table_name
     key = dataset_def.delete_key
     if _table_exists(conn, table):
-        if dataset_def.stamp_season:
-            _reconcile_schema(conn, table, df)      # adds season to a table that lacks it
-            _backfill_season_from_dt(conn, table)
         if key not in _table_columns(conn, table):
             raise ValueError(
                 f"table {table} has no '{key}' column, cannot replace season {season}"
@@ -434,7 +455,8 @@ def _ingest_generic_dataset(
 
     A season is replaced by the dataset's delete key (registry delete_key/delete_match).
     depth_charts keys by a season column the loader stamps on files that lack one
-    (2025+), not by a dt range; legacy rows with a NULL season are backfilled from dt.
+    (2025+), not by a dt range. Rows from before stamping (NULL season) are dropped and
+    their seasons re-fetched in the same run (_restamp_legacy_rows).
     Each season's DELETE, INSERT and metadata upsert run in one transaction.
     """
     import nflreadpy
@@ -478,6 +500,14 @@ def _ingest_generic_dataset(
     else:
         # Seasonal dataset — iterate per season (bulk mode uses ALL_SEASONS)
         season_list = _clip_to_window(ALL_SEASONS if bulk_mode else seasons, dataset_def)
+        if dataset_def.stamp_season:
+            try:
+                restamp = _restamp_legacy_rows(conn, dataset_def)
+            except Exception as e:  # noqa: BLE001 - soft failure, reported at the end of the run
+                print(f"    Failed to prepare {table}: {e}")
+                _note_failure(dataset_def.dataset_id, None, e)
+                return 0
+            season_list = sorted(set(season_list) | set(restamp))
         for season in season_list:
             already = _is_loaded(conn, dataset_def.dataset_id, season)
             if already and not fresh and season not in _refresh_seasons():
@@ -1206,10 +1236,7 @@ def run_ingest_datasets(
         else:
             print(f"  Will ingest: {to_ingest}")
             for season in to_ingest:
-                rows = _ingest_pbp_season(conn, season)
-                pbp_ingested += rows
-                if rows:
-                    _record_loaded(conn, "pbp", "plays", "load_pbp", rows, season)
+                pbp_ingested += _ingest_pbp_season(conn, season)
 
         _create_indexes(conn)
 
