@@ -33,14 +33,7 @@ def resolves_to_mahomes(monkeypatch):
     return seen
 
 
-def test_normalize_player_name_handles_full_short_and_last_name_inputs():
-    assert tools._normalize_player_name("Mahomes") == "Mahomes"
-    assert tools._normalize_player_name("J.Jefferson") == "J.Jefferson"
-    assert tools._normalize_player_name("Justin Jefferson") == "J.Jefferson"
-    assert tools._normalize_player_name("J. Jefferson") == "J. Jefferson"
-
-
-def test_search_plays_uses_parameterized_filters(monkeypatch):
+def test_search_plays_uses_parameterized_filters(monkeypatch, resolves_to_mahomes):
     captured = {}
 
     def fake_execute(sql, params=None):
@@ -53,12 +46,12 @@ def test_search_plays_uses_parameterized_filters(monkeypatch):
     monkeypatch.setattr(tools, "_execute", fake_execute)
     result = tools.nfl_search_plays(team="KC", player="Mahomes", season=2024, max_rows=5)
 
-    assert result["row_count"] == 0
+    assert result["row_count"] == result["count"] == 0
     assert "posteam = ?" in captured["sql"]
-    assert "ILIKE ?" in captured["sql"]
-    assert "LIMIT 5" in captured["sql"]
+    assert "passer_player_id = ?" in captured["sql"]
+    assert "LIMIT 6 OFFSET 0" in captured["sql"]  # one extra row shows whether another page exists
     assert captured["params"][0] == "KC"
-    assert "%Mahomes%" in captured["params"]
+    assert MAHOMES["gsis_id"] in captured["params"]
     assert 2024 in captured["params"]
 
 
@@ -372,7 +365,7 @@ def test_nearest_drops_the_guess_and_ranks_by_similarity():
         ("red_zone", "yardline_100 <= 20"),
         ("third_down", "down = 3"),
         ("fourth_down", "down = 4"),
-        ("two_minute", "qtr = 4 AND half_seconds_remaining <= 120"),
+        ("two_minute", "half_seconds_remaining <= 120 AND (qtr = 2 OR qtr >= 4)"),
     ],
 )
 def test_search_plays_situations(monkeypatch, situation, expected_sql):
@@ -409,7 +402,7 @@ def test_search_plays_applies_all_numeric_and_boolean_filters(monkeypatch):
         is_touchdown=True,
         is_turnover=True,
         min_yards=7,
-        max_rows=999,
+        max_rows=500,
     )
 
     assert result["row_count"] == 0
@@ -422,7 +415,7 @@ def test_search_plays_applies_all_numeric_and_boolean_filters(monkeypatch):
     assert "touchdown = 1" in captured["sql"]
     assert "(interception = 1 OR fumble_lost = 1)" in captured["sql"]
     assert "yards_gained >= ?" in captured["sql"]
-    assert "LIMIT 500" in captured["sql"]
+    assert "LIMIT 501 OFFSET 0" in captured["sql"]
     assert captured["params"] == ["BAL", 2020, 2021, 1, "REG", "pass", 7]
 
 
@@ -817,11 +810,11 @@ def test_td_luck_builds_filters(monkeypatch, no_player_match):
     assert captured["params"] == ["%Jefferson%", "WR", "MIN", 2024]
 
 
-def test_td_luck_invalid_limit_falls_back(monkeypatch):
+def test_td_luck_invalid_limit_returns_error(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
-    tools.nfl_td_luck(limit="oops")
-    assert "LIMIT 50" in captured["sql"]
-    assert captured["params"] is None
+    result = tools.nfl_td_luck(limit="oops")
+    assert result["code"] == "INVALID_ARGUMENT"
+    assert "sql" not in captured
 
 
 def test_td_luck_returns_error_on_timeout(monkeypatch):
@@ -838,10 +831,11 @@ def test_role_trend_builds_filters(monkeypatch, no_player_match):
     assert captured["params"] == ["%Kelce%", "TE", "KC", 2024, 8, 50.0]
 
 
-def test_role_trend_invalid_limit_falls_back(monkeypatch):
+def test_role_trend_invalid_limit_returns_error(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
-    tools.nfl_role_trend(limit="oops")
-    assert "LIMIT 50" in captured["sql"]
+    result = tools.nfl_role_trend(limit="oops")
+    assert result["code"] == "INVALID_ARGUMENT"
+    assert "sql" not in captured
 
 
 def test_role_trend_returns_error_on_timeout(monkeypatch):
@@ -862,10 +856,11 @@ def test_separation_opportunity_guards_pre_2016():
     assert "2016" in result["error"]
 
 
-def test_separation_opportunity_invalid_limit_falls_back(monkeypatch):
+def test_separation_opportunity_invalid_limit_returns_error(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
-    tools.nfl_separation_opportunity(limit="oops")
-    assert "LIMIT 50" in captured["sql"]
+    result = tools.nfl_separation_opportunity(limit="oops")
+    assert result["code"] == "INVALID_ARGUMENT"
+    assert "sql" not in captured
 
 
 def test_separation_opportunity_returns_error_on_timeout(monkeypatch):
@@ -887,10 +882,11 @@ def test_drop_rate_guards_pre_2022():
     assert "2022" in result["error"]
 
 
-def test_drop_rate_invalid_limit_falls_back(monkeypatch):
+def test_drop_rate_invalid_limit_returns_error(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
-    tools.nfl_drop_rate(limit="oops")
-    assert "LIMIT 50" in captured["sql"]
+    result = tools.nfl_drop_rate(limit="oops")
+    assert result["code"] == "INVALID_ARGUMENT"
+    assert "sql" not in captured
 
 
 def test_drop_rate_returns_error_on_timeout(monkeypatch):
@@ -907,10 +903,11 @@ def test_contract_value_builds_filters(monkeypatch, no_player_match):
     assert captured["params"] == ["%Gibbs%", "RB", "DET", 2024, 2.0, 10.0]
 
 
-def test_contract_value_invalid_limit_falls_back(monkeypatch):
+def test_contract_value_invalid_limit_returns_error(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
-    tools.nfl_contract_value(limit="oops")
-    assert "LIMIT 50" in captured["sql"]
+    result = tools.nfl_contract_value(limit="oops")
+    assert result["code"] == "INVALID_ARGUMENT"
+    assert "sql" not in captured
 
 
 def test_contract_value_returns_error_on_timeout(monkeypatch):
@@ -928,11 +925,11 @@ def test_injury_return_builds_filters(monkeypatch):
     assert captured["params"] == ["%hamstring%", "WR", 2]
 
 
-def test_injury_return_invalid_limit_falls_back(monkeypatch):
+def test_injury_return_invalid_limit_returns_error(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
-    tools.nfl_injury_return(limit="oops")
-    assert "LIMIT 50" in captured["sql"]
-    assert captured["params"] is None
+    result = tools.nfl_injury_return(limit="oops")
+    assert result["code"] == "INVALID_ARGUMENT"
+    assert "sql" not in captured
 
 
 def test_injury_return_returns_error_on_timeout(monkeypatch):
