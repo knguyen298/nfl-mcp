@@ -10,6 +10,7 @@ NFL MCP Server tools:
   nfl_compare       → side-by-side comparison
 """
 
+import datetime as dt
 import difflib
 import functools
 import logging
@@ -26,7 +27,9 @@ from typing import Any, Dict
 
 import duckdb
 
+from .config import get_duckdb_path
 from .database import get_db_connection
+from .discovery import DATA_NOTES, DERIVED_TABLES, relationships_for, table_info
 from .franchises import (
     RECORDS_FIRST_NFLVERSE_SEASON,
     availability,
@@ -559,7 +562,9 @@ def nfl_schema(category: str | None = None, table: str | None = None) -> Dict[st
                 [table],
             )
             if rows:
-                return {"table": table, "columns": rows}
+                grain, join_keys = table_info(table)
+                return {"table": table, "grain": grain, "join_keys": join_keys,
+                        "derived": table in DERIVED_TABLES, "columns": rows}
             available = _execute(
                 "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
             )
@@ -583,7 +588,11 @@ def nfl_schema(category: str | None = None, table: str | None = None) -> Dict[st
         return {
             "schema": _SCHEMA_SUMMARY,
             "available_tables": table_names,
-            "hint": "Pass category='<name>' for full PBP column details. Pass table='<name>' for any other table's columns.",
+            "derived_tables": [t for t in DERIVED_TABLES if t in table_names],
+            "relationships": relationships_for(set(table_names)),
+            "data_notes": list(DATA_NOTES),
+            "hint": "Pass category='<name>' for full PBP column details. Pass table='<name>' for any other table's "
+                    "columns, grain and join keys. nfl_catalog lists every table with its row count and season range.",
         }
     cat = category.lower().strip()
     if cat == "all":
@@ -594,8 +603,47 @@ def nfl_schema(category: str | None = None, table: str | None = None) -> Dict[st
     return {"error": f"Unknown category '{cat}'", "available": list(_SCHEMA_CATEGORIES.keys())}
 
 
+def _iso_utc(value: Any) -> Any:
+    """A TIMESTAMP as an ISO 8601 UTC string (fixed microseconds, so strings sort as times).
+    loaded_at is stored in UTC. Any other value comes back unchanged."""
+    if isinstance(value, dt.datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        return value.isoformat(timespec="microseconds") + "Z"
+    return value
+
+
+def _newest_seasons(tables: Sequence[str]) -> dict[str, tuple[Any, Any]]:
+    """table -> (newest season, newest week within it) for tables with a season column.
+    The week is None when the table has no week column. Best effort: {} on any failure."""
+    try:
+        cols: dict[str, set[str]] = {}
+        for r in _execute(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema = 'main' AND column_name IN ('season', 'season_year', 'week')"
+        ):
+            cols.setdefault(r["table_name"], set()).add(r["column_name"])
+        parts = []
+        for table in dict.fromkeys(tables):
+            have = cols.get(table, set())
+            season = "season" if "season" in have else "season_year" if "season_year" in have else None
+            if season is None:
+                continue
+            week = (f'(SELECT TRY_CAST(MAX(week) AS INTEGER) FROM "{table}" '
+                    f'WHERE {season} = (SELECT MAX({season}) FROM "{table}"))' if "week" in have else "NULL")
+            parts.append(f"SELECT '{table}' AS table_name, TRY_CAST(MAX({season}) AS INTEGER) AS season, "
+                         f'{week} AS week FROM "{table}"')
+        if not parts:
+            return {}
+        return {r["table_name"]: (r["season"], r["week"]) for r in _execute(" UNION ALL ".join(parts))}
+    except Exception as e:  # noqa: BLE001 - newest season is extra detail; never fail the status call for it
+        logger.warning("nfl_status could not read the newest season per table: %s", e)
+        return {}
+
+
 def nfl_status() -> Dict[str, Any]:
-    """Return database health: play counts, loaded seasons, and a summary of all ingested datasets."""
+    """Return database health: play counts, loaded seasons, and a summary of all ingested datasets,
+    with the newest season and week and the last refresh time of each."""
     try:
         total = _execute("SELECT COUNT(*) AS total_plays FROM plays")
         seasons = _execute(
@@ -608,7 +656,8 @@ def nfl_status() -> Dict[str, Any]:
             "FROM plays"
         )
         datasets = _execute(
-            "SELECT dataset_id, table_name, SUM(row_count) as total_rows "
+            "SELECT dataset_id, table_name, SUM(row_count) as total_rows, "
+            "MAX(loaded_at) AS last_refreshed "
             "FROM _ingest_metadata "
             "GROUP BY dataset_id, table_name "
             "ORDER BY dataset_id"
@@ -616,6 +665,10 @@ def nfl_status() -> Dict[str, Any]:
         last_refreshed = _execute(
             "SELECT MAX(loaded_at) as last_refreshed FROM _ingest_metadata"
         )
+        newest = _newest_seasons([d["table_name"] for d in datasets])
+        for d in datasets:
+            d["newest_season"], d["newest_week"] = newest.get(d["table_name"], (None, None))
+            d["last_refreshed"] = _iso_utc(d.get("last_refreshed"))
         return {
             "plays": {
                 "total_plays": total[0]["total_plays"] if total else 0,
@@ -624,7 +677,7 @@ def nfl_status() -> Dict[str, Any]:
             },
             "datasets": {
                 "total_loaded": len(datasets),
-                "last_refreshed": last_refreshed[0]["last_refreshed"] if last_refreshed else None,
+                "last_refreshed": _iso_utc(last_refreshed[0]["last_refreshed"]) if last_refreshed else None,
                 "loaded": datasets,
             },
         }
@@ -1566,8 +1619,72 @@ def _execute(sql: str, params: Sequence[Any] | None = None) -> list[dict]:
     return result[0]
 
 
+# ── Freshness: data_as_of ─────────────────────────────────────────────────────
+# Every tool response carries data_as_of, the newest load time of the tables the tool read.
+# The per-table times come from _ingest_metadata and are cached per database file, so only
+# the first call on a file reads the metadata. The key holds the resolved path (a symlink
+# swap changes it) plus the file's mtime and size (an in-place re-ingest changes those).
+
+_AS_OF_CACHE: dict[tuple[str, int, int], dict[str, str]] = {}
+_AS_OF_LOCK = threading.Lock()
+
+
+def _data_as_of(db_path: str) -> dict[str, str]:
+    """table_name -> ISO 8601 UTC time of that table's newest load. db_path is the cache key
+    and must be the configured database file; {} when the file or its metadata is unreadable."""
+    try:
+        resolved = os.path.realpath(db_path)
+        st = os.stat(resolved)
+    except OSError:
+        return {}
+    key = (resolved, st.st_mtime_ns, st.st_size)
+    with _AS_OF_LOCK:
+        cached = _AS_OF_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                "SELECT table_name, MAX(loaded_at) FROM _ingest_metadata GROUP BY table_name").fetchall()
+        times = {name: _iso_utc(loaded) for name, loaded in rows if loaded is not None}
+    except Exception as e:  # noqa: BLE001 - freshness is extra detail; a tool call must not fail for it
+        logger.warning("data_as_of unavailable: %s", e)
+        return {}
+    with _AS_OF_LOCK:
+        for old in [k for k in _AS_OF_CACHE if k[0] == resolved]:
+            del _AS_OF_CACHE[old]
+        _AS_OF_CACHE[key] = times
+    return times
+
+
+def _as_of(tables: Sequence[str] | None) -> str | None:
+    """Newest load time over the given tables (all tables when None). When none of them has a
+    metadata row, the newest load of the whole database."""
+    times = _data_as_of(str(get_duckdb_path()))
+    if not times:
+        return None
+    chosen = [times[t] for t in tables if t in times] if tables else []
+    return max(chosen or times.values())
+
+
+def _stamped(tables: Sequence[str] | None):
+    """Decorator for a tool: add data_as_of to the dict it returns, errors included."""
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            result = fn(*args, **kwargs)
+            if isinstance(result, dict):
+                stamp = _as_of(tables)
+                if stamp:
+                    result["data_as_of"] = stamp
+            return result
+        return wrapper
+    return decorate
+
+
 def nfl_catalog() -> Dict[str, Any]:
-    """List every loaded dataset with row counts and last-refresh timestamp."""
+    """List every table in the database: grain, row count, season range, join keys and whether
+    it is derived. Also the per-dataset load summary."""
     try:
         rows = _execute("""
             SELECT
@@ -1582,10 +1699,37 @@ def nfl_catalog() -> Dict[str, Any]:
             GROUP BY dataset_id, table_name
             ORDER BY dataset_id
         """)
-        return {"datasets": rows, "total_datasets": len(rows)}
+        tables = _catalog_tables()
+        return {"tables": tables, "total_tables": len(tables), "datasets": rows, "total_datasets": len(rows)}
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
+
+
+def _catalog_tables() -> list[dict]:
+    """One entry per table in schema 'main' except _ingest_metadata. row_count is a live
+    COUNT(*), not the metadata total. One statement reads every table."""
+    cols: dict[str, set[str]] = {}
+    for r in _execute("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'main'"):
+        cols.setdefault(r["table_name"], set()).add(r["column_name"])
+    names = sorted(t for t in cols if t != "_ingest_metadata")
+    if not names:
+        return []
+    parts = []
+    for t in names:
+        season = "season" if "season" in cols[t] else "season_year" if "season_year" in cols[t] else None
+        span = (f"TRY_CAST(MIN({season}) AS INTEGER) AS lo, TRY_CAST(MAX({season}) AS INTEGER) AS hi"
+                if season else "NULL::INTEGER AS lo, NULL::INTEGER AS hi")
+        parts.append(f"SELECT '{t}' AS t, COUNT(*) AS n, {span} FROM \"{t}\"")
+    counted = {r["t"]: (r["n"], r["lo"], r["hi"]) for r in _execute(" UNION ALL ".join(parts))}
+    loaded = _data_as_of(str(get_duckdb_path()))
+    out = []
+    for t in names:
+        n, lo, hi = counted[t]
+        grain, keys = table_info(t)
+        out.append({"table": t, "grain": grain, "row_count": n, "min_season": lo, "max_season": hi,
+                    "join_keys": keys, "derived": t in DERIVED_TABLES, "last_loaded": loaded.get(t)})
+    return out
 
 
 @_checked
@@ -2497,6 +2641,35 @@ def nfl_injury_return(
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
+
+
+# Tables each tool reads (None: every table). data_as_of is the newest load time among them.
+# A tool that resolves a player name also reads players and rosters.
+_PLAYER_TABLES = ("players", "rosters")
+_TOOL_TABLES: dict[str, Sequence[str] | None] = {
+    "nfl_schema": None, "nfl_status": None, "nfl_catalog": None, "nfl_query": None,
+    "nfl_search_plays": ("plays", *_PLAYER_TABLES),
+    "nfl_team_stats": ("team_offense_stats", "team_defense_stats", "situational_stats"),
+    "nfl_player_stats": ("plays", *_PLAYER_TABLES),
+    "nfl_player_lookup": _PLAYER_TABLES,
+    "nfl_compare": ("team_offense_stats", "team_defense_stats", "plays", *_PLAYER_TABLES),
+    "nfl_roster": ("rosters",),
+    "nfl_injuries": ("injuries",),
+    "nfl_schedule": ("schedules",),
+    "nfl_snap_counts": ("snap_counts", *_PLAYER_TABLES),
+    "nfl_fantasy_opportunity": ("ff_opportunity", *_PLAYER_TABLES),
+    "nfl_fantasy_rankings": ("ff_rankings_draft", "ff_rankings_week"),
+    "nfl_ftn_charting": ("ftn_charting", "plays", *_PLAYER_TABLES),
+    "nfl_td_luck": ("player_td_luck", *_PLAYER_TABLES),
+    "nfl_role_trend": ("player_role_trend", *_PLAYER_TABLES),
+    "nfl_separation_opportunity": ("player_separation_opportunity", *_PLAYER_TABLES),
+    "nfl_drop_rate": ("player_drop_rate", *_PLAYER_TABLES),
+    "nfl_contract_value": ("player_contract_value", *_PLAYER_TABLES),
+    "nfl_injury_return": ("injury_return_curve",),
+    "nfl_team_records": ("team_records",),
+}
+for _name, _tables in _TOOL_TABLES.items():
+    globals()[_name] = _stamped(_tables)(globals()[_name])
 
 
 __all__ = [

@@ -1,6 +1,6 @@
 _SCHEMA_SUMMARY = """
 Database: nflread (DuckDB)
-Table: plays (1999 through the current season, 372 columns)
+Table: plays (1999 through the current season, 373 columns)
 
 Key columns for common queries:
   season (INT), week (INT), season_type ('REG'|'POST'), game_id, game_date
@@ -46,7 +46,7 @@ GAME CONTEXT
   game_id          TEXT              e.g. '2024_01_KC_BAL'
   old_game_id      TEXT              legacy ESPN/NFL game ID
   nfl_api_id       TEXT              NFL API identifier
-  season           INTEGER           2013–current
+  season           INTEGER           1999–current
   week             INTEGER           1–22 (regular + post)
   season_type      TEXT              'REG' | 'POST'
   game_date        TEXT              'YYYY-MM-DD'

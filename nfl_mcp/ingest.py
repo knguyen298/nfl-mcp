@@ -9,6 +9,7 @@ Called by: nfl-mcp init / nfl-mcp ingest
 
 import contextlib
 import datetime
+import importlib.metadata
 import os
 import duckdb
 import polars as pl
@@ -129,9 +130,32 @@ def _ensure_metadata_table(conn: duckdb.DuckDBPyConnection) -> None:
             season      INTEGER,          -- NULL for static (non-seasonal) datasets
             row_count   BIGINT,
             loaded_at   TIMESTAMP NOT NULL,
-            loader_fn   VARCHAR
+            loader_fn   VARCHAR,
+            nflreadpy_version VARCHAR     -- nflreadpy that fetched the rows; NULL for derived rows
         )
     """)
+    _add_version_column(conn)
+
+
+def _has_version_column(conn: duckdb.DuckDBPyConnection) -> bool:
+    return bool(conn.execute(
+        "SELECT COUNT(*) FROM information_schema.columns "
+        "WHERE table_name = '_ingest_metadata' AND column_name = 'nflreadpy_version'"
+    ).fetchone()[0])
+
+
+def _add_version_column(conn: duckdb.DuckDBPyConnection) -> None:
+    """A database built before nflreadpy_version existed gets the column at the start of the next
+    ingest. This must run outside a transaction: DuckDB cannot commit an ALTER after row changes."""
+    if not _has_version_column(conn):
+        conn.execute("ALTER TABLE _ingest_metadata ADD COLUMN nflreadpy_version VARCHAR")
+
+
+def _nflreadpy_version() -> str | None:
+    try:
+        return importlib.metadata.version("nflreadpy")
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
 
 def _is_loaded(conn: duckdb.DuckDBPyConnection, dataset_id: str, season: int | None = None) -> bool:
@@ -160,7 +184,9 @@ def _record_loaded(
     row_count: int,
     season: int | None = None,
 ) -> None:
-    """Upsert a completion record into _ingest_metadata."""
+    """Upsert a completion record into _ingest_metadata, with the nflreadpy version that
+    fetched it (derived tables and the ESPN pull are not nflreadpy loads: NULL)."""
+    version = None if loader_fn in ("derived", "espn_records") else _nflreadpy_version()
     # Delete any prior record for this dataset+season before inserting fresh
     if season is None:
         conn.execute(
@@ -172,13 +198,19 @@ def _record_loaded(
             "DELETE FROM _ingest_metadata WHERE dataset_id = ? AND season = ?",
             [dataset_id, season],
         )
-    conn.execute(
-        """
-        INSERT INTO _ingest_metadata (dataset_id, table_name, season, row_count, loaded_at, loader_fn)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        [dataset_id, table_name, season, row_count, datetime.datetime.now(datetime.timezone.utc), loader_fn],
-    )
+    values = [dataset_id, table_name, season, row_count, datetime.datetime.now(datetime.timezone.utc), loader_fn]
+    if _has_version_column(conn):
+        conn.execute(
+            "INSERT INTO _ingest_metadata (dataset_id, table_name, season, row_count, loaded_at, loader_fn, "
+            "nflreadpy_version) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [*values, version],
+        )
+    else:  # an older database that no ingest has touched yet
+        conn.execute(
+            "INSERT INTO _ingest_metadata (dataset_id, table_name, season, row_count, loaded_at, loader_fn) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            values,
+        )
 
 
 # ── PBP-specific helpers (preserved from original) ────────────────────────────

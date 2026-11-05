@@ -155,6 +155,9 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (Claude
 nfl-mcp init               Interactive setup wizard
 nfl-mcp serve              Start the MCP server (Streamable HTTP, default port 8000)
 nfl-mcp ingest             Load NFL data into the database
+nfl-mcp rebuild            Rebuild the derived tables from the loaded data (no download)
+nfl-mcp validate           Check a database file before it replaces the active one
+nfl-mcp upgrade            Bring an older database up to the current schema
 nfl-mcp setup-client       Configure IDE MCP clients
 nfl-mcp doctor             Health check
 ```
@@ -181,6 +184,96 @@ nfl-mcp ingest --list                   # show all available dataset names
 ```
 
 Ingest is **idempotent** — re-running skips completed seasons already in the database. The current season and the static snapshot tables (rankings, players, contracts, teams) are re-fetched on every run, so run `nfl-mcp ingest` after a game week to pick up new stats. The current season is computed from today's date (the league year rolls over in March), so a new season is picked up automatically.
+
+### Upgrade an older database
+
+```bash
+nfl-mcp upgrade [--db PATH] [--check] [--no-fetch]
+```
+
+The database records a schema version. A database with no record is version 0. That is
+every database built by v0.4.0 or earlier. `nfl-mcp upgrade` finds what an older database
+lacks and fixes it. It never deletes the file. It runs three steps in this order:
+
+1. Rebuild the derived tables. This needs no network.
+2. Fill the `season` column of `depth_charts`. This downloads data.
+3. Reload any raw table that lacks a column the tools need. This downloads data.
+
+The command stamps the current version only when nothing is left to do. Running it twice is
+safe.
+
+| Option | Effect |
+|---|---|
+| `--db PATH` | Upgrade this file. The default is the configured database. |
+| `--check` | Change nothing. Print one line per step (`ok`, `NEEDED`, or `NEEDED (network)`) and the version. |
+| `--no-fetch` | Run the steps that need no network. List the others as pending. |
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | The database is up to date. |
+| 3 | An upgrade is needed. With `--no-fetch`, only steps that need the network are left. |
+| 1 | An error, a failed step, or a database newer than this version of nfl-mcp. |
+
+A missing file is an error. The command never creates one. The upgrade writes to the file.
+In the container, the active slot is read-only on purpose. Run `update_db.sh` instead. It
+upgrades the new slot before it swaps.
+
+`nfl-mcp serve` checks the database at start and logs one warning when an upgrade is
+needed. It keeps running. `nfl-mcp doctor` prints the schema version and the steps that are
+needed. `nfl-mcp validate` fails a database file whose version is not the current one.
+
+## Configuration
+
+Every setting is an environment variable. All are optional.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `NFL_MCP_DB_PATH` | `~/.nfl-mcp/nflread.duckdb` (`/data/nflread.duckdb` in the container) | Path of the DuckDB file. It overrides the path in the config file. |
+| `NFL_MCP_DUCKDB_MEMORY_LIMIT` | DuckDB default (`512MB` in the container) | Memory cap for every DuckDB connection. Use a number and a unit, such as `512MB` or `2GiB`. A bad value stops `serve` with exit code 1. |
+| `NFL_MCP_DUCKDB_THREADS` | DuckDB default (`1` in the container) | Thread cap. Use a positive whole number. A bad value stops `serve` with exit code 1. |
+| `NFL_MCP_DUCKDB_TEMP_DIR` | DuckDB default (`/tmp/.duckdb_spill` in the container) | Writable directory where DuckDB spills a large query to disk. |
+| `NFL_MCP_AUTH_TOKEN` | unset | When set, every request needs `Authorization: Bearer <token>`. See Security below. |
+| `NFL_MCP_CORS_ORIGINS` | unset (all origins) | Comma-separated list of origins allowed to call the server from a browser. |
+| `NFL_MCP_MAX_CONCURRENT_QUERIES` | `2` | How many tool calls run at once. A bad value logs a warning and the default applies. |
+| `NFL_MCP_QUERY_TIMEOUT_SECONDS` | `10` | Seconds a query may run before the server cancels it. The server reads it on every call. A bad value logs a warning and the default applies. |
+| `NFL_MCP_UPGRADE_ON_START` | on | Container only. Set to `0` to turn off the upgrade check at start. See below. |
+
+**Upgrade on start.** When the container starts, `entrypoint.sh` runs
+`nfl-mcp upgrade --check` on the active database. If an upgrade is needed, it starts one
+background `update_db.sh` run and does not wait for it. The server starts either way. The
+update builds a new, upgraded copy in the idle slot and swaps it in. Set
+`NFL_MCP_UPGRADE_ON_START=0` to skip the check.
+
+## Security
+
+The server is read-only. It binds to localhost unless you say otherwise.
+
+- **Bind address.** `nfl-mcp serve` listens on `127.0.0.1`. Pass `--host 0.0.0.0` to accept
+  other machines. The container does this on purpose.
+- **Bearer token.** Set `NFL_MCP_AUTH_TOKEN` and every request needs the header
+  `Authorization: Bearer <token>`. That includes `/healthz`. Without a token, the server has
+  no authentication, so set one before you expose it beyond localhost. A token that is only
+  whitespace stops `serve` with exit code 1.
+- **CORS.** Set `NFL_MCP_CORS_ORIGINS` to limit which browser origins can connect. When it
+  is unset, the server allows every origin and logs a warning.
+- **Container user.** The container runs the server and the updater as the non-root user
+  `nflmcp`.
+
+### Read-only guards
+
+- Each query opens a new read-only connection. Nothing in the server writes to the
+  database it serves.
+- The connection turns off file and network access, extension install, and extension
+  autoload. Functions that read files, and the statements `COPY`, `ATTACH`, `INSTALL`,
+  `LOAD`, and `SET`, all fail. The connection locks its configuration after it opens.
+- `nfl_query` takes one statement per call. The statement must be a `SELECT` (a `WITH`
+  query, `DESCRIBE`, or `SUMMARIZE` also counts) or `EXPLAIN` of a `SELECT`. The tool
+  rejects every other statement type.
+- `nfl_query` returns at most 500 rows. Every tool stops a query after the timeout above.
+- Every tool carries the MCP annotations `readOnlyHint: true`, `destructiveHint: false`,
+  `idempotentHint: true`, and `openWorldHint: false`.
 
 ## Datasets
 
@@ -239,10 +332,11 @@ family so any data a client might need is already there. The single exception is
 | `team_records` | 1970–present once both sources are loaded (derived) |
 
 > Older seasons are thinner than modern ones. Play-by-play carries `epa`, `wp`, and
-> `shotgun` from 1999, but tracking-derived data (Next Gen Stats, FTN charting), snap
-> counts, and weekly depth only exist from their respective start years above — so any
-> query that spans decades mixes eras of very different column coverage. Rosters before
-> 1966 are available with `--start 1920` and cover the pre-merger leagues.
+> `shotgun` from 1999. Next Gen Stats come from player tracking and start in 2016. FTN
+> charting is manual charting by FTN staff. It is not tracking data, and it starts in
+> 2022. Snap counts and weekly depth also start in their own years, listed above. A query
+> that spans decades mixes eras with very different column coverage. Rosters before 1966
+> are available with `--start 1920` and cover the pre-merger leagues.
 
 ```bash
 nfl-mcp ingest                 # load the full nflverse family (default)
@@ -311,8 +405,8 @@ SELECT season, team, wins, losses, ties FROM team_records WHERE season = 1972 AN
 
 | Tool | Description |
 |------|-------------|
-| `nfl_schema` | Database schema reference — compact summary by default, pass `category` for detail |
-| `nfl_status` | Database health: total plays, loaded seasons, available tables |
+| `nfl_schema` | Database schema reference. The default call gives a summary, the verified table relationships, data notes, and the derived tables. Pass `category` for column detail or `table` for one table's columns, grain, and join keys. |
+| `nfl_status` | Database health: total plays, loaded seasons, and per dataset the row count, newest season, newest week, and last refresh time |
 | `nfl_query` | Raw SQL SELECT for custom queries (500 row cap, 10s timeout) |
 | `nfl_search_plays` | Find plays by player, team, season, season type, situation, touchdowns, etc. |
 | `nfl_team_stats` | Pre-aggregated team offense, defense, and situational stats |
@@ -332,7 +426,20 @@ SELECT season, team, wins, losses, ties FROM team_records WHERE season = 1972 AN
 | `nfl_drop_rate` | Catchable-target drop rate per receiver-season from FTN charting (2022+), plus contested targets and created receptions |
 | `nfl_contract_value` | Fantasy points per $M of average per year (APY) — best value-for-money players |
 | `nfl_injury_return` | Post-return snap-share recovery (% of pre-injury baseline) at +1..+8 weeks, by normalized injury type and position |
-| `nfl_catalog` | List all loaded tables with row counts and last refresh time |
+| `nfl_catalog` | Every table with its grain (what one row is), live row count, first and last season, join keys, derived flag, and last load time |
+
+### What every response carries
+
+- **`data_as_of`.** Every tool response includes `data_as_of`, an ISO 8601 UTC time. It is
+  the newest load time of the tables that tool read. `nfl_schedule` reports the load time of
+  `schedules` only. The server reads these times once per database file and caches them. A
+  swap to a new database file, or a new load into the same file, refreshes the value. Error
+  responses carry it too.
+- **Structured output.** Each result is a JSON object. The MCP response sends it in
+  `structuredContent` and as text. Each tool declares an `outputSchema` of type `object`.
+- **Resources.** Clients that read MCP resources can read `nfl://schema`,
+  `nfl://relationships`, and `nfl://data-notes`. They can also read `nfl://schema/<table>`,
+  for example `nfl://schema/plays`. These hold the same facts as `nfl_schema`.
 
 ## Key columns in `plays`
 
@@ -357,6 +464,13 @@ pytest -m unit     # unit tests
 pytest -m integration  # integration tests (requires loaded DB)
 ```
 
+Two dependencies have an upper bound in `pyproject.toml`. `duckdb` stays below 2, because a
+new major version can change SQL behavior and the file format. `nflreadpy` stays below 0.2,
+because a 0.x minor release can rename a loader or change its arguments. Each ingest records
+the installed `nflreadpy` version in the `nflreadpy_version` column of `_ingest_metadata`.
+Derived tables and the ESPN pull have no version, so that column is empty for them. A
+database built before this column existed gets it at the next ingest.
+
 ## Troubleshooting
 
 - `nfl-mcp doctor` is the fastest way to verify config, database, and client setup.
@@ -364,6 +478,8 @@ pytest -m integration  # integration tests (requires loaded DB)
 - You can override the DB location with `NFL_MCP_DB_PATH=/path/to/nflread.duckdb`.
 - Re-running `nfl-mcp ingest` is safe — it skips completed seasons and re-fetches only the current season and static tables.
 - Stats for a game usually appear in nflverse within a few hours; play-by-play is rebuilt overnight and official stat corrections land midweek. Locally, run `nfl-mcp ingest` after that; in the container, the scheduled updater does it (log: `/var/log/nflmcp/nfl_update.log`).
+- Every tool response has `data_as_of`. `nfl_status` shows the newest season, newest week, and last refresh time of each dataset.
+- If `nfl-mcp serve` logs a warning that the database needs an upgrade, run `nfl-mcp upgrade`. Use `--check` first to see what it would do.
 - In the container, `nfl_status`'s `last_refreshed` shows which data the endpoint is serving. If it never advances, the updater is not running — check that `ENTRYPOINT` is `/entrypoint.sh` and that `/data/nflread.duckdb` is a symlink.
 
 ## License

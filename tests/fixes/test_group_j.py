@@ -56,6 +56,7 @@ from mcp import types
 
 import nfl_mcp.server as server
 from nfl_mcp import tools
+from nfl_mcp.database import get_db_connection
 from nfl_mcp.schema_pbp import _SCHEMA_CATEGORIES, _SCHEMA_SUMMARY
 
 REPO = Path(__file__).resolve().parents[2]
@@ -207,9 +208,8 @@ def real_db(monkeypatch):
     if not REAL_DB.exists():
         pytest.skip(f"real DB {REAL_DB} missing")
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(REAL_DB))
-    con = duckdb.connect(str(REAL_DB), read_only=True)
-    yield con
-    con.close()
+    with get_db_connection() as con:  # same opener as the tools, so the locked config matches
+        yield con
 
 
 def _as_utc_naive(value) -> dt.datetime:
@@ -234,12 +234,9 @@ def _count(path, sql):
         con.close()
 
 
-XF = pytest.mark.xfail
-
 
 # ── 1. nfl_catalog ────────────────────────────────────────────────────────────
 
-@XF(strict=True, reason="group j: catalog lists every table")
 def test_catalog_lists_every_table_except_metadata(synth):
     cat = _catalog(tools.nfl_catalog())
     expected = {"plays", "schedules", "players", "rosters", "snap_counts", "participation",
@@ -249,7 +246,6 @@ def test_catalog_lists_every_table_except_metadata(synth):
     assert "_ingest_metadata" not in cat
 
 
-@XF(strict=True, reason="group j: catalog entry shape")
 def test_catalog_entries_have_contract_keys(synth):
     cat = _catalog(tools.nfl_catalog())
     assert cat, "no catalog entries with a 'table' key"
@@ -260,7 +256,6 @@ def test_catalog_entries_have_contract_keys(synth):
         assert isinstance(e["join_keys"], list) and isinstance(e["derived"], bool), name
 
 
-@XF(strict=True, reason="group j: catalog live row_count")
 @pytest.mark.parametrize("table,hand", [("plays", 7), ("rosters", 4), ("team_offense_stats", 2),
                                         ("espn_team_records", 0)])
 def test_catalog_row_count_matches_count_star(synth, table, hand):
@@ -268,7 +263,6 @@ def test_catalog_row_count_matches_count_star(synth, table, hand):
     assert _catalog(tools.nfl_catalog())[table]["row_count"] == hand  # rosters metadata says 10
 
 
-@XF(strict=True, reason="group j: catalog derived flag")
 def test_catalog_derived_flag(synth):
     cat = _catalog(tools.nfl_catalog())
     for t in DERIVED:
@@ -277,7 +271,6 @@ def test_catalog_derived_flag(synth):
         assert cat[t]["derived"] is False, t
 
 
-@XF(strict=True, reason="group j: catalog season range")
 @pytest.mark.parametrize("table,col", [("plays", "season"), ("team_offense_stats", "season_year"),
                                        ("schedules", "season")])
 def test_catalog_season_range_matches_min_max(synth, table, col):
@@ -286,7 +279,6 @@ def test_catalog_season_range_matches_min_max(synth, table, col):
     assert (e["min_season"], e["max_season"]) == (lo, hi) == (2024, 2025)
 
 
-@XF(strict=True, reason="group j: catalog join keys")
 @pytest.mark.parametrize("table,keys", [("plays", {"game_id", "play_id"}), ("players", {"gsis_id"}),
                                         ("snap_counts", {"pfr_player_id"})])
 def test_catalog_join_keys(synth, table, keys):
@@ -294,7 +286,6 @@ def test_catalog_join_keys(synth, table, keys):
 
 
 @pytest.mark.integration
-@XF(strict=True, reason="group j: catalog on real DB")
 def test_catalog_real_db_tables_counts_and_flags(real_db):
     names = {r[0] for r in real_db.execute(
         "SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()}
@@ -325,7 +316,6 @@ def _rel_pairs(r):
     return set(zip(r["left_keys"], r["right_keys"]))
 
 
-@XF(strict=True, reason="group j: schema relationships")
 @pytest.mark.parametrize("lt,lk,rt,rk", REQUIRED_RELS, ids=[r[0] for r in REQUIRED_RELS])
 def test_schema_relationships_include_verified_join(synth, lt, lk, rt, rk):
     rels = tools.nfl_schema().get("relationships")
@@ -337,7 +327,6 @@ def test_schema_relationships_include_verified_join(synth, lt, lk, rt, rk):
 
 
 @pytest.mark.integration
-@XF(strict=True, reason="group j: schema relationships join on real data")
 def test_schema_relationships_really_join_on_real_db(real_db):
     rels = tools.nfl_schema().get("relationships")
     assert isinstance(rels, list) and len(rels) >= 3
@@ -354,7 +343,6 @@ def test_schema_relationships_really_join_on_real_db(real_db):
         assert n > 0 and m / n >= 0.8, (r, n, m)
 
 
-@XF(strict=True, reason="group j: data notes")
 @pytest.mark.parametrize("needles", [("ftn", "manual chart"), ("next gen stats", "2016"), ("ftn", "2022")],
                          ids=["ftn_manual", "ngs_2016", "ftn_2022"])
 def test_schema_data_notes_mention(synth, needles):
@@ -363,14 +351,12 @@ def test_schema_data_notes_mention(synth, needles):
     assert any(all(n in note.lower() for n in needles) for note in notes), notes
 
 
-@XF(strict=True, reason="group j: derived marker in nfl_schema")
 def test_schema_marks_derived_tables(synth):
     derived = tools.nfl_schema().get("derived_tables")
     assert isinstance(derived, list)
     assert set(DERIVED) <= set(derived) and "plays" not in derived and "players" not in derived
 
 
-@XF(strict=True, reason="group j: per-table grain")
 @pytest.mark.parametrize("table,col", [("team_offense_stats", "season_year"), ("participation", "nflverse_game_id"),
                                        ("rosters", "gsis_id")])
 def test_schema_table_has_columns_and_grain(synth, table, col):
@@ -379,7 +365,6 @@ def test_schema_table_has_columns_and_grain(synth, table, col):
     assert isinstance(r.get("grain"), str) and r["grain"].strip(), r
 
 
-@XF(strict=True, reason="group j: participation join keys")
 def test_schema_participation_join_keys(synth):
     r = tools.nfl_schema(table="participation")
     assert {"nflverse_game_id", "play_id"} <= set(r.get("join_keys") or [])
@@ -392,7 +377,6 @@ def test_schema_table_lookup_still_returns_columns(synth):
 
 # ── 3. data_as_of ─────────────────────────────────────────────────────────────
 
-@XF(strict=True, reason="group j: data_as_of on every response")
 @pytest.mark.parametrize("name", TOOL_NAMES)
 def test_data_as_of_present_on_synthetic(synth, name):
     resp = getattr(tools, name)(**MIN_ARGS.get(name, {}))
@@ -402,7 +386,6 @@ def test_data_as_of_present_on_synthetic(synth, name):
 
 
 @pytest.mark.integration
-@XF(strict=True, reason="group j: data_as_of on every response (real DB)")
 @pytest.mark.parametrize("name", TOOL_NAMES)
 def test_data_as_of_present_on_real_db(real_db, name):
     lo, hi = real_db.execute("SELECT MIN(loaded_at), MAX(loaded_at) FROM _ingest_metadata").fetchone()
@@ -410,7 +393,6 @@ def test_data_as_of_present_on_real_db(real_db, name):
     assert lo <= _as_utc_naive(resp.get("data_as_of")) <= hi
 
 
-@XF(strict=True, reason="group j: data_as_of value")
 @pytest.mark.parametrize("name,args,expected", [
     ("nfl_schedule", {"season": 2025}, SCHEDULES_MAX),  # schedules only: 08:00:05, not global 12:30
     ("nfl_schedule", {"team": "KC"}, SCHEDULES_MAX),
@@ -421,7 +403,6 @@ def test_data_as_of_equals_max_loaded_at_of_tables_read(synth, name, args, expec
 
 
 @pytest.mark.integration
-@XF(strict=True, reason="group j: data_as_of value (real DB)")
 def test_data_as_of_schedule_real_db(real_db):
     want = real_db.execute("SELECT MAX(loaded_at) FROM _ingest_metadata WHERE table_name='schedules'").fetchone()[0]
     assert _as_utc_naive(tools.nfl_schedule(team="KC", season=2024).get("data_as_of")) == want
@@ -449,7 +430,6 @@ class _SpyConn:
         self._c.close()
 
 
-@XF(strict=True, reason="group j: data_as_of cached per file")
 @pytest.mark.parametrize("first,second", [("nfl_schedule", "nfl_schedule"), ("nfl_schedule", "nfl_roster")])
 def test_data_as_of_cached_second_call_skips_metadata(synth, monkeypatch, first, second):
     log: list[str] = []
@@ -464,7 +444,6 @@ def test_data_as_of_cached_second_call_skips_metadata(synth, monkeypatch, first,
     assert not [s for s in log if "_ingest_metadata" in s], log
 
 
-@XF(strict=True, reason="group j: _data_as_of helper")
 def test_data_as_of_helper_returns_per_table_map(synth):
     fn = getattr(tools, "_data_as_of", None)
     assert fn is not None, "nfl_mcp.tools._data_as_of missing"
@@ -472,7 +451,6 @@ def test_data_as_of_helper_returns_per_table_map(synth):
     assert _as_utc_naive(m["schedules"]) == SCHEDULES_MAX and _as_utc_naive(m["plays"]) == PBP_MAX
 
 
-@XF(strict=True, reason="group j: data_as_of follows NFL_MCP_DB_PATH")
 def test_data_as_of_changes_with_db_path(synth, tmp_path, monkeypatch):
     other = _build_db(tmp_path / "other.duckdb", shift=dt.timedelta(days=1))
     assert _as_utc_naive(tools.nfl_status().get("data_as_of")) == GLOBAL_MAX
@@ -480,7 +458,6 @@ def test_data_as_of_changes_with_db_path(synth, tmp_path, monkeypatch):
     assert _as_utc_naive(tools.nfl_status().get("data_as_of")) == GLOBAL_MAX + dt.timedelta(days=1)
 
 
-@XF(strict=True, reason="group j: data_as_of follows symlink swap")
 def test_data_as_of_changes_after_symlink_swap(tmp_path, monkeypatch):
     a = _build_db(tmp_path / "a.duckdb")
     b = _build_db(tmp_path / "b.duckdb", shift=dt.timedelta(hours=2))
@@ -502,7 +479,6 @@ def _status_entry(resp, dataset_id):
     raise AssertionError(f"{dataset_id} missing from nfl_status")
 
 
-@XF(strict=True, reason="group j: nfl_status newest season/week")
 @pytest.mark.parametrize("dataset_id,season,week", [("pbp", 2025, 2), ("schedules", 2025, 3)])
 def test_status_newest_season_and_week_synthetic(synth, dataset_id, season, week):
     # pbp: 2025 has weeks 1-2 (2024 has week 18, which must not win); schedules 2025 weeks 1-3.
@@ -510,7 +486,6 @@ def test_status_newest_season_and_week_synthetic(synth, dataset_id, season, week
     assert (e.get("newest_season"), e.get("newest_week")) == (season, week)
 
 
-@XF(strict=True, reason="group j: nfl_status per-dataset refresh time")
 @pytest.mark.parametrize("dataset_id,expected", [("pbp", PBP_MAX), ("schedules", SCHEDULES_MAX),
                                                  ("players", STAMPS[("players", "players", None)])])
 def test_status_last_refreshed_per_dataset(synth, dataset_id, expected):
@@ -524,7 +499,6 @@ def test_status_keeps_total_plays_and_seasons(synth):
 
 
 @pytest.mark.integration
-@XF(strict=True, reason="group j: nfl_status newest season/week (real DB)")
 def test_status_newest_pbp_week_real_db(real_db):
     s = real_db.execute("SELECT MAX(season) FROM plays").fetchone()[0]
     w = real_db.execute("SELECT MAX(week) FROM plays WHERE season = ?", [s]).fetchone()[0]
@@ -540,7 +514,6 @@ def _handle(req):
     return anyio.run(go).root
 
 
-@XF(strict=True, reason="group j: tool annotations")
 @pytest.mark.parametrize("hint,value", [("readOnlyHint", True), ("destructiveHint", False),
                                         ("idempotentHint", True), ("openWorldHint", False)])
 def test_every_tool_has_annotation(hint, value):
@@ -549,14 +522,12 @@ def test_every_tool_has_annotation(hint, value):
     assert not bad, bad
 
 
-@XF(strict=True, reason="group j: outputSchema")
 def test_every_tool_has_object_output_schema():
     tools_listed = _handle(types.ListToolsRequest(method="tools/list")).tools
     bad = [t.name for t in tools_listed if not t.outputSchema or t.outputSchema.get("type") != "object"]
     assert not bad, bad
 
 
-@XF(strict=True, reason="group j: structuredContent")
 @pytest.mark.parametrize("name,args", [("nfl_status", {}), ("nfl_schedule", {"season": 2025})])
 def test_call_tool_structured_content_matches_text(synth, name, args):
     res = _handle(types.CallToolRequest(method="tools/call",
@@ -574,20 +545,17 @@ def _read_text(uri):
     return "".join(getattr(c, "text", "") for c in res.contents)
 
 
-@XF(strict=True, reason="group j: resources listed")
 def test_list_resources_contains_discovery_uris():
     assert types.ListResourcesRequest in server._mcp_server.request_handlers, "no resources/list handler"
     uris = {str(r.uri) for r in _handle(types.ListResourcesRequest(method="resources/list")).resources}
     assert {"nfl://schema", "nfl://relationships", "nfl://data-notes"} <= uris
 
 
-@XF(strict=True, reason="group j: resources readable")
 @pytest.mark.parametrize("uri", ["nfl://schema", "nfl://relationships", "nfl://data-notes"])
 def test_read_resource_returns_text(synth, uri):
     assert _read_text(uri).strip()
 
 
-@XF(strict=True, reason="group j: nfl://schema/plays")
 def test_read_resource_plays_columns(synth):
     text = _read_text("nfl://schema/plays")
     for col in ("game_id", "play_id", "posteam", "epa", "season"):
@@ -600,7 +568,6 @@ def _desc(name):
     return TOOLS_BY_NAME[name].description or ""
 
 
-@XF(strict=True, reason="group j: nfl_query description")
 def test_query_description_drops_last_resort():
     assert "LAST RESORT" not in _desc("nfl_query").upper()
 
@@ -613,20 +580,17 @@ def test_query_description_mentions_read_only():
     assert "read-only" in _desc("nfl_query").lower()
 
 
-@XF(strict=True, reason="group j: 1999 floor in nfl_search_plays")
 def test_search_plays_text_says_1999_not_2013():
     t = TOOLS_BY_NAME["nfl_search_plays"]
     text = t.description + json.dumps(t.inputSchema)
     assert "1999" in text and "2013" not in text
 
 
-@XF(strict=True, reason="group j: grain in list tool descriptions")
 @pytest.mark.parametrize("name", LIST_TOOLS)
 def test_list_tool_description_states_grain(name):
     assert "one row per" in _desc(name).lower()
 
 
-@XF(strict=True, reason="group j: id field in list tool descriptions")
 @pytest.mark.parametrize("name", [n for n in LIST_TOOLS if n not in ("nfl_team_records",)])
 def test_list_tool_description_names_id_field(name):
     assert re.search(rf"\b{ID_FIELDS[name]}\b", _desc(name)), ID_FIELDS[name]
@@ -642,12 +606,10 @@ README = (REPO / "README.md").read_text()
 PARAS = re.split(r"\n\s*\n", README)
 
 
-@XF(strict=True, reason="group j: README FTN wording")
 def test_readme_does_not_call_ftn_tracking_derived():
     assert not [p for p in PARAS if "FTN" in p and "tracking-derived" in p.lower()]
 
 
-@XF(strict=True, reason="group j: README FTN wording")
 def test_readme_says_ftn_is_manual_charting():
     assert any("FTN" in p and "manual" in p.lower() for p in PARAS)
 
@@ -657,14 +619,11 @@ ENV_VARS = ["NFL_MCP_DB_PATH", "NFL_MCP_DUCKDB_MEMORY_LIMIT", "NFL_MCP_DUCKDB_TH
             "NFL_MCP_MAX_CONCURRENT_QUERIES", "NFL_MCP_QUERY_TIMEOUT_SECONDS"]
 
 
-@pytest.mark.parametrize("var", [
-    v if v == "NFL_MCP_DB_PATH" else pytest.param(v, marks=XF(strict=True, reason="group j: README env var"))
-    for v in ENV_VARS])
+@pytest.mark.parametrize("var", ENV_VARS)
 def test_readme_documents_env_var(var):
     assert re.search(rf"\b{var}\b", README)
 
 
-@XF(strict=True, reason="group j: README documents every env var the code reads")
 def test_readme_documents_every_env_var_read_in_code():
     read = set()
     for f in (REPO / "nfl_mcp").glob("*.py"):
@@ -688,11 +647,7 @@ def _spec(pkg):
     raise AssertionError(f"{pkg} not in dependencies")
 
 
-@pytest.mark.parametrize("pkg", [
-    "mcp",
-    pytest.param("duckdb", marks=XF(strict=True, reason="group j: duckdb upper bound")),
-    pytest.param("nflreadpy", marks=XF(strict=True, reason="group j: nflreadpy upper bound")),
-])
+@pytest.mark.parametrize("pkg", ["mcp", "duckdb", "nflreadpy"])
 def test_dependency_has_upper_bound(pkg):
     assert re.search(r"<\s*\d", _spec(pkg)), _spec(pkg)
 
@@ -723,14 +678,12 @@ def _version_recorded(path) -> bool:
         con.close()
 
 
-@XF(strict=True, reason="group j: nflreadpy version in metadata")
 def test_ingest_records_nflreadpy_version_static(tmp_path, monkeypatch):
     import polars as pl
     df = pl.DataFrame({"team_abbr": ["KC", "BUF"], "team_name": ["Kansas City Chiefs", "Buffalo Bills"]})
     assert _version_recorded(_fake_ingest(tmp_path, monkeypatch, "teams", "load_teams", df))
 
 
-@XF(strict=True, reason="group j: nflreadpy version in metadata")
 def test_ingest_records_nflreadpy_version_seasonal(tmp_path, monkeypatch):
     import polars as pl
     df = pl.DataFrame({"game_id": ["2024_01_KC_BAL"], "season": [2024], "week": [1],
@@ -752,7 +705,6 @@ def test_schema_summary_plays_floor_is_1999():
     assert re.search(r"Table: plays \(1999 through", _SCHEMA_SUMMARY)
 
 
-@XF(strict=True, reason="group j: game_context season floor says 2013")
 def test_schema_game_context_season_floor_is_1999():
     line = next(l for l in _SCHEMA_CATEGORIES["game_context"].splitlines() if l.strip().startswith("season "))
     assert "1999" in line and "2013" not in line, line
@@ -764,7 +716,6 @@ def test_registry_pbp_floor_matches_summary():
 
 
 @pytest.mark.integration
-@XF(strict=True, reason="group j: plays column count text")
 def test_schema_summary_column_count_matches_describe(real_db):
     n = len(real_db.execute("DESCRIBE plays").fetchall())  # 373 on grpE_v3
     m = re.search(r"Table: plays \([^)]*?(\d+) columns\)", _SCHEMA_SUMMARY)

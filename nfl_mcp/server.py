@@ -22,7 +22,8 @@ import anyio
 from anyio import to_thread
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp.types import CallToolResult, TextContent, Tool
+from mcp.server.lowlevel.helper_types import ReadResourceContents
+from mcp.types import CallToolResult, Resource, ResourceTemplate, TextContent, Tool, ToolAnnotations
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -30,6 +31,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from .database import get_db_connection
+from .discovery import DATA_NOTES, table_info
 from .tools import (
     nfl_schema, nfl_status, nfl_query, nfl_search_plays,
     nfl_team_stats, nfl_player_stats, nfl_player_lookup, nfl_compare,
@@ -132,12 +134,15 @@ def _tool_error_payload(tool_name: str, exc: Exception) -> dict[str, Any]:
 
 def _failure_from_result(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
     """Convert a tool's {"error": ...} dict into the one error shape."""
-    extras = {k: v for k, v in result.items() if k not in ("error", "code")}
+    extras = {k: v for k, v in result.items() if k not in ("error", "code", "data_as_of")}
     message = str(result["error"])
     code = result.get("code")
     if not isinstance(code, str):
         code = "TIMEOUT" if "timeout" in message.lower() else "TOOL_ERROR"
-    return _error_payload(code, message, **{**extras, "tool": tool_name})
+    payload = _error_payload(code, message, **{**extras, "tool": tool_name})
+    if "data_as_of" in result:
+        payload["data_as_of"] = result["data_as_of"]
+    return payload
 
 
 def _row_count(result: Any) -> Any:
@@ -174,7 +179,10 @@ TOOLS = [
             "Returns the NFL database schema. By default returns a compact summary with "
             "key columns and available categories. Pass category='<name>' for full column "
             "details on a specific section, or category='all' for everything. "
-            "Pass table='<name>' to get the live column list for any non-pbp table."
+            "Pass table='<name>' to get the live column list, grain and join keys for any "
+            "table. The default call also returns relationships (joins checked against the "
+            "loaded data), data_notes (coverage and caveats) and derived_tables. The same "
+            "facts are the MCP resources nfl://schema, nfl://relationships and nfl://data-notes."
         ),
         inputSchema={
             "type": "object",
@@ -200,19 +208,23 @@ TOOLS = [
     Tool(
         name="nfl_status",
         description=(
-            "Returns database health: play counts, loaded seasons, and a summary of all ingested datasets with row counts and last refresh time. Call this first to understand what data is available."
+            "Returns database health: play counts, loaded seasons, and a summary of all ingested "
+            "datasets with row counts, the newest season and week, and the last refresh time "
+            "of each. Every tool response also carries data_as_of, the newest load time of the "
+            "tables that tool read. Call this first to understand what data is available."
         ),
         inputSchema={"type": "object", "properties": {}},
     ),
     Tool(
         name="nfl_query",
         description=(
-            "LAST RESORT: Execute raw SQL only when nfl_search_plays, nfl_team_stats, "
-            "nfl_player_stats, and nfl_compare cannot answer the question. "
-            "Requires calling nfl_schema first, and column names must be copied from it, "
-            "never guessed (per-play EPA is `epa`, not `play_epa`). "
-            "One read-only statement per call: SELECT (including WITH, DESCRIBE, "
-            "SUMMARIZE) or EXPLAIN. Other statement types are rejected. "
+            "Run one read-only SQL statement. Use it for joins, aggregates and questions the "
+            "other tools do not cover (nfl_search_plays, nfl_team_stats, nfl_player_stats and "
+            "nfl_compare answer the common play, team and player questions faster). "
+            "Call nfl_schema first, and copy column names from it, "
+            "never guess them (per-play EPA is `epa`, not `play_epa`). "
+            "One statement per call: SELECT (including a WITH common table expression, CTE), "
+            "DESCRIBE, SUMMARIZE or EXPLAIN. Other statement types are rejected. "
             "max_rows 1-500 (default 100, larger values are clamped to 500). 10s timeout."
         ),
         inputSchema={
@@ -240,8 +252,9 @@ TOOLS = [
             "player had in the play), team, season, week, play type, situation (red zone, "
             "third/fourth down, two-minute drill, goal to go), down, quarter, field "
             "position, score differential, shotgun, no-huddle, or win probability, plus "
-            "touchdowns, turnovers or minimum yards. Rows carry the game and play ids and "
-            "the passer, rusher and receiver ids. Sorted by impact (ABS EPA) unless sort_by says "
+            "touchdowns, turnovers or minimum yards. Returns one row per play, from 1999 on. Rows "
+            "carry game_id and play_id (play_id repeats across games, so pair it with "
+            "game_id) and the passer, rusher and receiver ids. Sorted by impact (ABS EPA) unless sort_by says "
             "otherwise; page with limit and offset. Use this instead of nfl_query "
             "whenever looking for plays."
         ),
@@ -283,7 +296,7 @@ TOOLS = [
                 },
                 "season": {
                     "type": "integer",
-                    "description": "Exact season year (2013 through the current season). Use season_from/season_to for ranges.",
+                    "description": "Exact season year (1999 through the current season). Use season_from/season_to for ranges.",
                 },
                 "season_from": {
                     "type": "integer",
@@ -295,7 +308,7 @@ TOOLS = [
                 },
                 "week": {
                     "type": "integer",
-                    "description": "Week number (1–22)",
+                    "description": "Week number (1-22)",
                 },
                 "season_type": {
                     "type": "string",
@@ -566,8 +579,9 @@ TOOLS = [
     Tool(
         name="nfl_catalog",
         description=(
-            "Returns a catalog of every dataset loaded into the local database: "
-            "table name, row count, seasons available, and when it was last refreshed. "
+            "Returns a catalog of every table in the local database: grain (what one row is), "
+            "live row count, first and last season, join keys, whether the table is derived "
+            "(rebuilt from other tables at ingest), and when it was last loaded. "
             "Call this first to discover what data is available beyond play-by-play."
         ),
         inputSchema={"type": "object", "properties": {}},
@@ -1043,6 +1057,30 @@ _PAGED_TOOLS = frozenset({
     "nfl_separation_opportunity", "nfl_drop_rate", "nfl_contract_value", "nfl_injury_return",
     "nfl_team_records",
 })
+# What one row is, and the id field the row is keyed on. Several source tables hold an id the
+# tool does not return; the sentence says so.
+_GRAIN_SENTENCE = {
+    "nfl_roster": " Returns one row per player per team per season. The source id is gsis_id; "
+                  "rows do not carry it (nfl_player_lookup returns it).",
+    "nfl_injuries": " Returns one row per player per team per week. The source id is gsis_id; "
+                    "rows do not carry it (nfl_player_lookup returns it).",
+    "nfl_schedule": " Returns one row per game, identified by game_id.",
+    "nfl_snap_counts": " Returns one row per player per game. Rows carry pfr_player_id, the "
+                       "Pro Football Reference id, which is not the gsis_id (players maps one to "
+                       "the other).",
+    "nfl_fantasy_opportunity": " Returns one row per player per game. player_id is the gsis_id.",
+    "nfl_fantasy_rankings": " Returns one row per player per ranking set. The weekly source table "
+                            "has fantasypros_id; rows do not carry it, so match players by name.",
+    "nfl_td_luck": " Returns one row per player per season per season type (REG and POST rows both "
+                   "appear, and rows do not say which). player_id is the gsis_id.",
+    "nfl_role_trend": " Returns one row per player per week. player_id is the gsis_id.",
+    "nfl_separation_opportunity": " Returns one row per player per season. player_id is the gsis_id.",
+    "nfl_drop_rate": " Returns one row per player per season per season type (REG and POST rows both "
+                     "appear, and rows do not say which). player_id is the gsis_id.",
+    "nfl_contract_value": " Returns one row per player per season. player_id is the gsis_id.",
+    "nfl_injury_return": " Returns one row per injury_type, position and week_post_return.",
+    "nfl_team_records": " Returns one row per franchise per season, keyed on team.",
+}
 _PAGE_SENTENCE = (
     " Paged: limit (1-500, default 100) and offset. The result has count and truncated; when "
     "truncated is true, hint names the next offset."
@@ -1057,12 +1095,94 @@ for _tool in TOOLS:
             "type": "integer", "minimum": 0, "default": 0,
             "description": "Rows to skip, for the next page (default 0).",
         }
-        _tool.description += _PAGE_SENTENCE
+        _tool.description += _GRAIN_SENTENCE.get(_tool.name, "") + _PAGE_SENTENCE
+
+
+# Every tool only reads the local database. Every result is a JSON object (an error is one too).
+_READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "data_as_of": {
+            "type": "string",
+            "description": "Newest load time (ISO 8601, UTC) of the tables this tool read.",
+        },
+    },
+}
+for _tool in TOOLS:
+    _tool.annotations = _READ_ONLY
+    _tool.outputSchema = _OUTPUT_SCHEMA
 
 
 @_mcp_server.list_tools()
 async def list_tools() -> list[Tool]:
     return TOOLS
+
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+# The same discovery facts as nfl_schema, for clients that read resources instead of calling tools.
+
+_RESOURCES = [
+    Resource(uri="nfl://schema", name="schema", title="Database schema",
+             description="Plays summary, every table with its grain and join keys, and the derived tables.",
+             mimeType="text/plain"),
+    Resource(uri="nfl://relationships", name="relationships", title="Table relationships",
+             description="Joins between tables, with the columns to join on. Each was checked on loaded data.",
+             mimeType="application/json"),
+    Resource(uri="nfl://data-notes", name="data-notes", title="Data notes",
+             description="Coverage start years, id systems and other caveats.",
+             mimeType="text/plain"),
+]
+_SCHEMA_PREFIX = "nfl://schema/"
+
+
+def _table_schema_text(table: str) -> str:
+    info = nfl_schema(table=table)
+    if "error" in info:
+        raise ValueError(info["error"])
+    lines = [f"Table: {table}", f"Grain: {info['grain']}", f"Join keys: {', '.join(info['join_keys']) or 'none'}",
+             f"Derived: {'yes' if info['derived'] else 'no'}", "Columns:"]
+    lines += [f"  {c['column_name']} {c['data_type']}" for c in info["columns"]]
+    return "\n".join(lines)
+
+
+def _read_resource_text(uri: str) -> tuple[str, str]:
+    """(text, mime type) of one resource. Runs in a worker thread: it reads the database."""
+    if uri == "nfl://schema":
+        info = nfl_schema()
+        lines = [info["schema"], "", "Tables (grain; join keys):"]
+        for name in info["available_tables"]:
+            grain, keys = table_info(name)
+            flag = " [derived]" if name in info["derived_tables"] else ""
+            lines.append(f"  {name}{flag}: {grain}; keys: {', '.join(keys) or 'none'}")
+        return "\n".join(lines), "text/plain"
+    if uri == "nfl://relationships":
+        return to_json({"relationships": nfl_schema()["relationships"]}), "application/json"
+    if uri == "nfl://data-notes":
+        return "\n".join(f"- {n}" for n in DATA_NOTES), "text/plain"
+    if uri.startswith(_SCHEMA_PREFIX) and len(uri) > len(_SCHEMA_PREFIX):
+        return _table_schema_text(uri[len(_SCHEMA_PREFIX):]), "text/plain"
+    raise ValueError(f"Unknown resource: {uri}")
+
+
+@_mcp_server.list_resources()
+async def list_resources() -> list[Resource]:
+    return _RESOURCES
+
+
+@_mcp_server.list_resource_templates()
+async def list_resource_templates() -> list[ResourceTemplate]:
+    return [ResourceTemplate(uriTemplate=_SCHEMA_PREFIX + "{table}", name="table-schema",
+                             title="Schema of one table",
+                             description="Grain, join keys and live columns of one table, e.g. nfl://schema/plays.",
+                             mimeType="text/plain")]
+
+
+@_mcp_server.read_resource()
+async def read_resource(uri: Any) -> list[ReadResourceContents]:
+    text, mime = await to_thread.run_sync(functools.partial(_read_resource_text, str(uri)),
+                                          limiter=get_tool_limiter())
+    return [ReadResourceContents(content=text, mime_type=mime)]
 
 
 @_mcp_server.call_tool()
@@ -1128,7 +1248,9 @@ async def call_tool(name: str, arguments: Any) -> CallToolResult:
 
     _log_call(name, args, started, result, failure)
     payload = failure if failure is not None else result
-    return CallToolResult(content=[TextContent(type="text", text=to_json(payload))],
+    text = to_json(payload)
+    return CallToolResult(content=[TextContent(type="text", text=text)],
+                          structuredContent=json.loads(text) if isinstance(payload, dict) else None,
                           isError=failure is not None)
 
 
