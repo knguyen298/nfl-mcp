@@ -580,3 +580,40 @@ def test_auth_token_never_logged(monkeypatch, synth_db, clean_env, caplog):
     for r in caplog.records:
         text = r.getMessage() + (r.exc_text or "")
         assert TOKEN not in text and wrong not in text
+
+
+# ── 10. review fixes ────────────────────────────────────────────────────────────
+
+def test_tool_error_dict_with_message_and_tool_keys_keeps_envelope(monkeypatch, clean_env):
+    patch_tool(monkeypatch, "nfl_status", lambda: {"error": "boom", "message": "m", "tool": "t"})
+    result = call("nfl_status", {})
+    payload = json.loads(text_of(result))
+    assert result.isError is True
+    assert payload["error"] == "boom" and isinstance(payload["code"], str)
+    assert payload["details"]["message"] == "m"
+
+
+@pytest.mark.parametrize("raw", ["inf", "nan", "-1", "0", "abc"])
+def test_timeout_env_non_finite_or_invalid_falls_back_to_default(raw, monkeypatch):
+    monkeypatch.setenv("NFL_MCP_QUERY_TIMEOUT_SECONDS", raw)
+    assert tools._query_timeout() == tools._QUERY_TIMEOUT_SECONDS
+
+
+def test_auth_env_token_is_stripped(monkeypatch, synth_db, clean_env):
+    monkeypatch.setenv("NFL_MCP_AUTH_TOKEN", f"  {TOKEN}\n")
+    with TestClient(server.create_app()) as client:
+        assert _post_init(client, {"Authorization": f"Bearer {TOKEN}"}).status_code == 200
+        assert _post_init(client).status_code == 401
+
+
+def test_auth_whitespace_only_token_means_unset_with_warning(monkeypatch, synth_db, clean_env, caplog):
+    monkeypatch.setenv("NFL_MCP_AUTH_TOKEN", "   ")
+    with caplog.at_level(logging.WARNING, logger="nfl-mcp"):
+        with TestClient(server.create_app()) as client:
+            assert _post_init(client).status_code == 200
+    assert any("NFL_MCP_AUTH_TOKEN" in r.getMessage() for r in caplog.records)
+
+
+def test_log_filter_survives_format_args_mismatch():
+    record = logging.LogRecord("nfl-mcp", logging.INFO, __file__, 1, "mismatch %s %s", (1,), None)
+    assert server._CutLongRecords().filter(record) is True

@@ -56,7 +56,10 @@ class _CutLongRecords(logging.Filter):
     """Cut oversized messages and traceback lines (a pasted SQL statement can be thousands of chars)."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
+        try:
+            message = record.getMessage()
+        except (TypeError, ValueError, KeyError):
+            return True  # format/args mismatch: leave it for logging.handleError
         if len(message) > _LOG_MESSAGE_CHARS:
             record.msg, record.args = message[:_LOG_MESSAGE_CHARS] + "...", None
         if record.exc_info and not record.exc_text:
@@ -112,7 +115,7 @@ def get_tool_limiter() -> anyio.CapacityLimiter:
     return _TOOL_LIMITER
 
 
-def _error_payload(code: str, message: str, **details: Any) -> dict[str, Any]:
+def _error_payload(code: str, message: str, /, **details: Any) -> dict[str, Any]:
     """The one error shape: top-level error and code, everything else under details."""
     return {"error": message, "code": code, "details": details}
 
@@ -134,7 +137,7 @@ def _failure_from_result(tool_name: str, result: dict[str, Any]) -> dict[str, An
     code = result.get("code")
     if not isinstance(code, str):
         code = "TIMEOUT" if "timeout" in message.lower() else "TOOL_ERROR"
-    return _error_payload(code, message, tool=tool_name, **extras)
+    return _error_payload(code, message, **{**extras, "tool": tool_name})
 
 
 def _row_count(result: Any) -> Any:
@@ -994,7 +997,10 @@ def create_app() -> Starlette:
             expose_headers=["Mcp-Session-Id"],
         )
     ]
-    token = os.getenv("NFL_MCP_AUTH_TOKEN")
+    raw_token = os.getenv("NFL_MCP_AUTH_TOKEN")
+    token = (raw_token or "").strip()
+    if raw_token and not token:
+        logger.warning("NFL_MCP_AUTH_TOKEN is only whitespace; auth is disabled.")
     if token:
         middleware.append(Middleware(_BearerAuth, token=token))
 

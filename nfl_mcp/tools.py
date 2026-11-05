@@ -11,6 +11,7 @@ NFL MCP Server tools:
 
 import difflib
 import logging
+import math
 import os
 import re
 import threading
@@ -597,7 +598,7 @@ def _query_timeout() -> float:
             value = float(raw)
         except ValueError:
             value = 0
-        if value > 0:
+        if math.isfinite(value) and value > 0:
             return value
         logger.warning("Ignoring invalid NFL_MCP_QUERY_TIMEOUT_SECONDS=%r", raw[:40])
     return _QUERY_TIMEOUT_SECONDS
