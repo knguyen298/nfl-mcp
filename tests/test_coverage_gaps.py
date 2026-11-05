@@ -702,3 +702,28 @@ class TestDataAsOf:
         assert tools._data_as_of(str(db)) == {"plays": "2024-01-01T12:00:00.000000Z"}
         assert list(tools._AS_OF_CACHE.values()) == [{"plays": "2024-01-01T12:00:00.000000Z"}]
         assert (resolved, 1, 1) not in tools._AS_OF_CACHE
+
+
+# ── lines that only the local-database tests reached (they skip on GitHub) ──────
+
+def test_find_players_season_range_narrows_by_roster(monkeypatch):
+    seen = {}
+
+    def fake_execute(sql, params=None):
+        seen["sql"], seen["params"] = sql, params
+        return []
+
+    monkeypatch.setattr(tools, "_execute", fake_execute)
+    assert tools._find_players("Josh Allen", season_from=2020, season_to=2023) == ([], False)
+    assert "r.season >= ?" in seen["sql"] and "r.season <= ?" in seen["sql"]
+    assert seen["params"][-2:] == [2020, 2023]
+
+
+def test_add_version_column_on_old_metadata_table():
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE _ingest_metadata (dataset_id VARCHAR, table_name VARCHAR)")
+    assert not ingest._has_version_column(con)
+    ingest._add_version_column(con)
+    assert ingest._has_version_column(con)
+    ingest._add_version_column(con)  # a second run leaves the column as it is
+    assert ingest._has_version_column(con)
