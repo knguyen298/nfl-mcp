@@ -340,14 +340,17 @@ class TestContainerLifecycle:
 
         entrypoint, updater, data, bin_dir = _sim(tmp_path)
         _run(entrypoint, bin_dir)
-        with open(data / ".update.lock", "w") as held:
-            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fd = os.open(data, os.O_RDONLY)   # the script locks the directory itself
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             out = _run(updater, bin_dir)   # exits 0, like a run with nothing to do
 
             assert "Another update is already running" in out
             assert "[stub nfl-mcp" not in out
             assert not (data / "nflread_b.duckdb").exists()
             assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
+        finally:
+            os.close(fd)
         # Lock released: the next run proceeds.
         _run(updater, bin_dir)
         assert os.readlink(data / "nflread.duckdb") == "nflread_b.duckdb"

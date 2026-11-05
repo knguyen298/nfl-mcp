@@ -80,11 +80,6 @@ def _read_version(conn, columns: dict[str, set[str]]) -> int:
     return conn.execute("SELECT MAX(version) FROM _schema_version").fetchone()[0] or 0
 
 
-def read_version(conn) -> int:
-    """The schema version recorded in the database (0 when none)."""
-    return _read_version(conn, _columns(conn))
-
-
 def _gaps(columns, tables) -> tuple[list[str], list[str]]:
     """(missing tables, missing 'table.column' pairs) among `tables`, in REQUIRED_COLUMNS order."""
     missing_tables = [t for t in tables if t not in columns]
