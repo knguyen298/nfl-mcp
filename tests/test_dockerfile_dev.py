@@ -181,10 +181,14 @@ def test_update_scripts_parse_as_posix_shell():
 # These run the actual scripts with the container paths rewritten to a temp dir and
 # nfl-mcp / supercronic stubbed on PATH.
 
+# Only `ingest` writes the database; `validate` exits with $STUB_VALIDATE_EXIT (default 0).
 _NFL_MCP_STUB = (
     '#!/bin/sh\n'
     'echo "[stub nfl-mcp $*]"\n'
-    'if [ -n "${NFL_MCP_DB_PATH:-}" ]; then printf INGESTED > "$NFL_MCP_DB_PATH"; fi\n'
+    'if [ "${1:-}" = validate ]; then exit "${STUB_VALIDATE_EXIT:-0}"; fi\n'
+    'if [ "${1:-}" = ingest ] && [ -n "${NFL_MCP_DB_PATH:-}" ]; then\n'
+    '    printf INGESTED > "$NFL_MCP_DB_PATH"\n'
+    'fi\n'
 )
 
 
@@ -226,8 +230,8 @@ def _sim(tmp_path, *, with_seed=True, existing_baked=False):
     return entrypoint_path, updater_path, data, bin_dir
 
 
-def _run(script, bin_dir):
-    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+def _run(script, bin_dir, **extra_env):
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", **extra_env}
     result = subprocess.run(["sh", str(script)], capture_output=True, text=True, env=env)
     assert result.returncode == 0, result.stderr
     return result.stdout
@@ -279,6 +283,41 @@ class TestContainerLifecycle:
         _run(updater, bin_dir)
         assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
         assert (data / "nflread_b.duckdb").exists()
+
+    def test_updater_makes_the_new_slot_read_only_and_can_reuse_it(self, tmp_path):
+        entrypoint, updater, data, bin_dir = _sim(tmp_path)
+        _run(entrypoint, bin_dir)
+
+        _run(updater, bin_dir)
+        assert (data / "nflread_b.duckdb").stat().st_mode & 0o222 == 0
+
+        # B is now active and read-only; the next pass copies it into A and must still write.
+        _run(updater, bin_dir)
+        assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
+        assert (data / "nflread_a.duckdb").read_text() == "INGESTED"
+
+    def test_updater_keeps_the_active_slot_when_validation_fails(self, tmp_path):
+        entrypoint, updater, data, bin_dir = _sim(tmp_path)
+        _run(entrypoint, bin_dir)
+        env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "STUB_VALIDATE_EXIT": "1"}
+        result = subprocess.run(["sh", str(updater)], capture_output=True, text=True, env=env)
+
+        assert result.returncode != 0
+        assert "validation failed" in result.stdout
+        assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
+        assert (data / "nflread_a.duckdb").read_text() == "SEED_V1"
+
+    def test_restart_after_an_update_keeps_the_swapped_slot(self, tmp_path):
+        entrypoint, updater, data, bin_dir = _sim(tmp_path)
+        _run(entrypoint, bin_dir)
+        _run(updater, bin_dir)
+
+        _run(entrypoint, bin_dir)
+        assert os.readlink(data / "nflread.duckdb") == "nflread_b.duckdb"
+
+    def test_cold_ingest_tolerates_failed_datasets(self, tmp_path):
+        entrypoint, _, _, bin_dir = _sim(tmp_path, with_seed=False)
+        assert "[stub nfl-mcp ingest --allow-failures]" in _run(entrypoint, bin_dir)
 
     def test_updater_refuses_to_run_without_the_symlink(self, tmp_path):
         _, updater, data, bin_dir = _sim(tmp_path)

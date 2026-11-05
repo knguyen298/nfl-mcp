@@ -35,11 +35,27 @@ fi
 
 echo "[$(date -u)] Copying active DB to target slot..."
 cp "$DB_DIR/$CURRENT" "$TARGET"
+# cp keeps the read-only mode the active slot got when it was swapped in; the ingest
+# needs to write to this copy.
+chmod u+w "$TARGET"
 
 # Incremental: completed seasons are skipped; the current season and static
 # snapshot tables (rankings, players, contracts) are re-fetched every run.
 echo "[$(date -u)] Running incremental ingest..."
 NFL_MCP_DB_PATH="$TARGET" nfl-mcp ingest
+
+# Refuse to publish a bad slot: missing tables or columns, fewer rows or an older newest
+# week than the active slot, duplicate plays, or empty key columns. On failure the active
+# slot stays in place and the new slot is left on disk for inspection.
+echo "[$(date -u)] Validating $(basename "$TARGET") against $CURRENT..."
+if ! nfl-mcp validate --db "$TARGET" --current "$DB_DIR/$CURRENT"; then
+    echo "[$(date -u)] ERROR: validation failed. Keeping $CURRENT active."
+    exit 1
+fi
+
+# Read-only from here on: nothing can modify the slot the server is about to read.
+# The next ingest into this slot restores write permission after its copy.
+chmod a-w "$TARGET"
 
 # Atomic rename of the link. The server opens a fresh read-only DuckDB connection per
 # tool call (see nfl_mcp/database.py), so the next query reads the new slot — no restart,

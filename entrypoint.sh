@@ -27,12 +27,18 @@ if [ ! -f "$SLOT_A" ]; then
     else
         # No seed (e.g. the dev image): fall back to a cold ingest.
         echo "[init] No seed found; ingesting into slot A (slow startup)..."
-        NFL_MCP_DB_PATH="$SLOT_A" nfl-mcp ingest
+        # --allow-failures: one flaky season must not crash-loop a first boot. The ingest
+        # prints "Ingest failed for: ..." naming each failure; the weekly update fills gaps.
+        NFL_MCP_DB_PATH="$SLOT_A" nfl-mcp ingest --allow-failures
     fi
 fi
 
-# Relative link: the symlink lives in $DB_DIR, so the target name resolves there.
-ln -sfn "$(basename "$SLOT_A")" "$SYMLINK"
+# Relative link: the symlink lives in $DB_DIR, so the target name resolves there. Only
+# create it when absent: after an update swapped to slot B, a restart must keep serving
+# B, not relink to the older slot A.
+if [ ! -L "$SYMLINK" ]; then
+    ln -sfn "$(basename "$SLOT_A")" "$SYMLINK"
+fi
 echo "[init] Active DB: $(readlink "$SYMLINK")"
 
 cat > /tmp/crontab << 'EOF'

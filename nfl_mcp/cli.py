@@ -5,6 +5,7 @@ NFL MCP — command-line entry point
   nfl-mcp serve               Start the MCP server (Streamable HTTP)
   nfl-mcp ingest              Load NFL play-by-play data into the database
   nfl-mcp rebuild             Rebuild the derived tables from the loaded data
+  nfl-mcp validate            Check a database slot before it replaces the active one
   nfl-mcp setup-client        Configure Claude Desktop / VS Code MCP
   nfl-mcp doctor              Check that everything is working
 """
@@ -195,6 +196,35 @@ def rebuild(db_path):
     finally:
         conn.close()
     click.secho("Derived tables rebuilt.", fg="green")
+
+
+# ── validate ───────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option("--db", "db_path", required=True, type=click.Path(dir_okay=False),
+              help="Database file to check (the freshly ingested slot).")
+@click.option("--current", "current_path", default=None, type=click.Path(dir_okay=False),
+              help="The active slot. The new file must not hold fewer rows or an older "
+                   "newest week than this one.")
+def validate(db_path, current_path):
+    """Check a database file before it is swapped in. Exit 1 if any check fails.
+
+    Both files are opened read-only. Checks: required tables and columns, row counts
+    against the current slot, duplicate plays, newest week, and key columns in the
+    newest week.
+    """
+    from .validate import run_checks
+
+    results = run_checks(Path(db_path).expanduser(),
+                         Path(current_path).expanduser() if current_path else None)
+    for r in results:
+        click.secho(f"{'ok  ' if r.ok else 'FAIL'} {r.name}: {r.detail}",
+                    fg="green" if r.ok else "red")
+    failed = [r for r in results if not r.ok]
+    if failed:
+        click.secho(f"Validation failed: {len(failed)} of {len(results)} checks.", fg="red")
+        sys.exit(1)
+    click.secho(f"Validation passed: {len(results)} checks.", fg="green")
 
 
 # ── init ───────────────────────────────────────────────────────────────────────

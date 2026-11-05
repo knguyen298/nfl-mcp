@@ -199,8 +199,6 @@ def invoke_validate(*args):
     return result, (result.output or "") + (extra or "")
 
 
-XF = "group E: {}"
-
 # ── 1. REQUIRED_COLUMNS ────────────────────────────────────────────────────────
 
 
@@ -212,7 +210,6 @@ def _required_columns():
     return rc
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("REQUIRED_COLUMNS module"))
 def test_required_columns_is_dict_of_table_to_column_list():
     rc = _required_columns()
     assert isinstance(rc, dict) and rc
@@ -223,7 +220,6 @@ def test_required_columns_is_dict_of_table_to_column_list():
         assert len(cols) == len(set(cols)), f"duplicate column in {table}"
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("REQUIRED_COLUMNS tables"))
 @pytest.mark.parametrize("table", [
     "plays", "schedules", "players", "rosters", "snap_counts", "player_stats", "injuries",
     "team_offense_stats", "team_defense_stats", "situational_stats", "team_records",
@@ -239,14 +235,12 @@ def _tables_in_tools_sql():
     return names - {"information_schema"}
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("REQUIRED_COLUMNS covers tools.py tables"))
 def test_required_columns_cover_every_table_in_tools_sql():
     # Oracle: table names parsed from the tools.py source text, not from the new module.
     missing = sorted(_tables_in_tools_sql() - set(_required_columns()))
     assert missing == []
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("REQUIRED_COLUMNS columns used by tools"))
 @pytest.mark.parametrize("table,column", [
     ("plays", "game_id"), ("plays", "play_id"), ("plays", "season"), ("plays", "week"),
     ("plays", "epa"), ("plays", "posteam"), ("schedules", "home_team"),
@@ -272,7 +266,6 @@ def require_db():
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("require_db")
-@pytest.mark.xfail(strict=True, reason=XF.format("REQUIRED_COLUMNS against loaded DB"))
 def test_every_required_column_exists_in_loaded_db():
     rc = _required_columns()
     con = duckdb.connect(str(REAL_DB), read_only=True)
@@ -299,7 +292,6 @@ def real_copy(tmp_path_factory):
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("require_db")
-@pytest.mark.xfail(strict=True, reason=XF.format("run_checks on loaded DB"))
 @pytest.mark.parametrize("with_current", [False, True])
 def test_run_checks_passes_on_loaded_db(real_copy, with_current):
     # The loaded DB has 0 duplicate (game_id, play_id) (audit, re-checkable) and is compared
@@ -310,7 +302,6 @@ def test_run_checks_passes_on_loaded_db(real_copy, with_current):
 # ── 2. good slot passes ────────────────────────────────────────────────────────
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("run_checks good slot"))
 @pytest.mark.parametrize("with_current", [False, True])
 def test_run_checks_good_slot_all_ok(slots, with_current):
     new = slots("new")
@@ -318,7 +309,6 @@ def test_run_checks_good_slot_all_ok(slots, with_current):
     assert_all_ok(run_checks(new, current))
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("run_checks opens read-only"))
 def test_run_checks_works_on_read_only_slots(slots):
     # The active slot is a-w after a swap; validate must open both files read_only.
     new, current = slots("new"), slots("current")
@@ -329,7 +319,6 @@ def test_run_checks_works_on_read_only_slots(slots):
     assert (new.stat().st_mtime_ns, current.stat().st_mtime_ns) == before
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("validate CLI"))
 @pytest.mark.parametrize("with_current", [False, True])
 def test_cli_validate_good_slot_exits_zero(slots, with_current):
     args = ["--db", slots("new")] + (["--current", slots("current")] if with_current else [])
@@ -340,19 +329,16 @@ def test_cli_validate_good_slot_exits_zero(slots, with_current):
 # ── 3. missing table / column ──────────────────────────────────────────────────
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("missing required table"))
 @pytest.mark.parametrize("table", ["plays", "schedules", "players", "team_offense_stats"])
 def test_missing_required_table_fails_naming_table(slots, table):
     assert_fails_with(run_checks(slots("new", drop_tables={table})), table)
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("missing required column"))
 @pytest.mark.parametrize("table,column", [("plays", "epa"), ("schedules", "home_team"), ("rosters", "full_name")])
 def test_missing_required_column_fails_naming_table_and_column(slots, table, column):
     assert_fails_with(run_checks(slots("new", drop_columns={table: [column]})), table, column)
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("validate CLI failure exit"))
 @pytest.mark.parametrize("kw,words", [
     ({"drop_tables": {"schedules"}}, ["schedules"]),
     ({"drop_columns": {"plays": ["posteam"]}}, ["plays", "posteam"]),
@@ -364,7 +350,6 @@ def test_cli_validate_bad_slot_exits_one_and_prints_failure(slots, kw, words):
         assert word in out
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("validate CLI missing file"))
 def test_cli_validate_missing_db_file_exits_nonzero(tmp_path):
     result, out = invoke_validate("--db", tmp_path / "absent.duckdb")
     assert result.exit_code not in (0, None), out
@@ -374,14 +359,12 @@ def test_cli_validate_missing_db_file_exits_nonzero(tmp_path):
 # ── 4. row-count floor ─────────────────────────────────────────────────────────
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("row-count floor"))
 def test_row_floor_plays_drop_beyond_tolerance_fails(slots):
     new, current = slots("new", make_plays(190)), slots("current", make_plays(200))
     # 190 < 200 * 0.99 = 198 -> fail naming plays, 190 and 200.
     assert_fails_with(run_checks(new, current), "plays", 190, 200)
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("row-count floor other table"))
 def test_row_floor_other_table_drop_fails(slots):
     new = slots("new", row_counts={"player_stats": 40})
     current = slots("current", row_counts={"player_stats": 50})
@@ -389,7 +372,6 @@ def test_row_floor_other_table_drop_fails(slots):
     assert_fails_with(run_checks(new, current), "player_stats", 40, 50)
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("row-count floor tolerance"))
 @pytest.mark.parametrize("new_n", [199, 200, 260])
 def test_row_floor_within_tolerance_or_growth_ok(slots, new_n):
     # 199/200 is a 0.5 percent drop, inside the 1 percent tolerance; 200 and 260 do not drop.
@@ -397,7 +379,6 @@ def test_row_floor_within_tolerance_or_growth_ok(slots, new_n):
     assert_all_ok(run_checks(new, current))
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("row-count floor skips table absent in current"))
 @pytest.mark.parametrize("table", ["snap_counts", "team_records"])
 def test_row_floor_ignores_table_missing_from_current(slots, table):
     new, current = slots("new"), slots("current", drop_tables={table})
@@ -407,7 +388,6 @@ def test_row_floor_ignores_table_missing_from_current(slots, table):
 # ── 5. duplicate (game_id, play_id) ────────────────────────────────────────────
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("duplicate plays"))
 def test_duplicate_plays_three_doubled_keys_fails_with_count(slots):
     plays = make_plays(200)
     plays += plays[:3]  # 203 rows, 200 distinct keys -> 3 duplicate rows
@@ -416,14 +396,12 @@ def test_duplicate_plays_three_doubled_keys_fails_with_count(slots):
     assert any("dup" in t.lower() for t in failures(results))
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("duplicate plays count"))
 def test_duplicate_plays_tripled_key_counts_extra_rows(slots):
     plays = make_plays(200)
     plays += [plays[0], plays[0], plays[1], plays[2]]  # 204 rows, 200 distinct -> 4 extra
     assert_fails_with(run_checks(slots("new", plays)), 4)
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("duplicate plays ok"))
 def test_same_play_id_in_different_games_is_not_duplicate(slots):
     # play_id 1.0 in two different games is two distinct keys -> no duplicate.
     plays = make_plays(100, weeks=((2025, 9),)) + make_plays(100, weeks=((2025, 8),))
@@ -433,7 +411,6 @@ def test_same_play_id_in_different_games_is_not_duplicate(slots):
 # ── 6. newest week regression ──────────────────────────────────────────────────
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("newest week regression"))
 @pytest.mark.parametrize("new_weeks,current_weeks", [
     (((2025, 8),), ((2025, 8), (2025, 9))),       # current has week 9, new stops at 8
     (((2025, 22),), ((2026, 1),)),                 # older season, higher week number
@@ -444,7 +421,6 @@ def test_newest_week_older_than_current_fails(slots, new_weeks, current_weeks):
     assert_fails_with(run_checks(new, current), "week")
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("newest week ok"))
 @pytest.mark.parametrize("new_weeks,current_weeks", [
     (((2025, 8), (2025, 9)), ((2025, 8), (2025, 9))),   # equal
     (((2025, 9), (2025, 10)), ((2025, 8), (2025, 9))),  # one week newer
@@ -456,7 +432,6 @@ def test_newest_week_equal_or_newer_ok(slots, new_weeks, current_weeks):
     assert_all_ok(run_checks(new, current))
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("newest week without current slot"))
 def test_newest_week_without_current_slot_ok(slots):
     assert_all_ok(run_checks(slots("new", make_plays(200, weeks=((2025, 8),)))))
 
@@ -478,7 +453,6 @@ def _null_newest(plays, cols, keep_one=False):
     return out
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("null key columns"))
 @pytest.mark.parametrize("cols", [("epa",), ("posteam",), ("epa", "posteam")])
 def test_null_key_column_in_newest_week_fails(slots, cols):
     plays = _null_newest(make_plays(200), cols)  # all 100 week-9 rows NULL in cols
@@ -487,20 +461,17 @@ def test_null_key_column_in_newest_week_fails(slots, cols):
         assert_fails_with(results, col)
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("null season/week"))
 def test_plays_with_no_season_or_week_fails(slots):
     plays = [(g, pid, None, None, None, None) for g, pid, *_ in make_plays(200)]
     assert_fails_with(run_checks(slots("new", plays)), "season")
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("null key columns ok"))
 @pytest.mark.parametrize("cols", [("epa",), ("epa", "posteam")])
 def test_one_non_null_row_in_newest_week_ok(slots, cols):
     plays = _null_newest(make_plays(200), cols, keep_one=True)  # 99 NULL, 1 non-null
     assert_all_ok(run_checks(slots("new", plays)))
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("null keys only in newest week"))
 def test_null_epa_in_older_week_only_ok(slots):
     # Week 8 rows all NULL epa; newest week 9 is fully populated -> ok.
     plays = [(g, pid, s, w, None if w == 8 else e, t) for g, pid, s, w, e, t in make_plays(200)]
@@ -534,14 +505,12 @@ def _positions():
 # ── 8. update_db.sh validate and chmod ─────────────────────────────────────────
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("update_db.sh validate step"))
 def test_update_db_validates_between_ingest_and_swap():
     _, pos = _positions()
     assert pos["validate"] != -1, "nfl-mcp validate not called"
     assert 0 <= pos["ingest"] < pos["validate"] < pos["swap"]
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("update_db.sh validate arguments"))
 def test_update_db_validates_target_against_current_slot():
     lines, pos = _positions()
     assert pos["validate"] != -1
@@ -573,14 +542,12 @@ def _guard_form(lines, v, swap):
     return "set-e" if errexit and plain else None
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("update_db.sh swap guarded by validate"))
 def test_update_db_swap_only_reached_when_validate_succeeds():
     lines, pos = _positions()
     assert pos["validate"] != -1
     assert _guard_form(lines, pos["validate"], pos["swap"]) in ("if", "if-then", "or", "set-e")
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("update_db.sh chmod a-w before swap"))
 def test_update_db_makes_target_read_only_before_swap():
     lines, pos = _positions()
     i = next((k for k, line in enumerate(lines) if re.search(r"chmod\s+(a-w|ugo-w|-w|0?444)\s", line)
@@ -589,7 +556,6 @@ def test_update_db_makes_target_read_only_before_swap():
     assert pos["ingest"] < i < pos["swap"]
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("update_db.sh restore write before ingest"))
 def test_update_db_restores_write_permission_after_copy_before_ingest():
     # cp keeps the a-w mode of the active slot, so the restore must follow the copy.
     lines, pos = _positions()
@@ -628,12 +594,10 @@ def _link_guard():
     return None
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("entrypoint link only when absent"))
 def test_entrypoint_slot_a_link_is_guarded():
     assert _link_guard() is not None
 
 
-@pytest.mark.xfail(strict=True, reason=XF.format("entrypoint guard tests the symlink"))
 def test_entrypoint_link_guard_checks_symlink_absence():
     guard = _link_guard() or ""
     assert re.search(ABSENT, guard) or re.search(r'\[\s+-[Lh]\s+"\$SYMLINK"\s+\]\s*\|\|', guard), guard
