@@ -126,13 +126,15 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999):
         dataset_ids.append("espn_records")
 
     from .ingest import run_ingest_datasets
-    run_ingest_datasets(
+    failures = run_ingest_datasets(
         dataset_ids=dataset_ids,
         start=start,
         end=end,
         fresh=fresh,
         skip_views=skip_views,
     )
+    if failures:
+        raise click.ClickException("Ingest failed for: " + "; ".join(failures))
 
 
 # ── init ───────────────────────────────────────────────────────────────────────

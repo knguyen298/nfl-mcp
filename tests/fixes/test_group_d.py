@@ -154,7 +154,6 @@ class TestDepthChartsRefetch:
     defn = REGISTRY["depth_charts"]
 
     @MODES
-    @pytest.mark.xfail(strict=True, reason=XF + "1 depth_charts 2025+ delete key")
     def test_depth_charts_2025_shape_loaded_twice_keeps_one_copy(self, conn, monkeypatch, mode):
         _fake_nfl(monkeypatch, load_depth_charts=_loader_from({2025: _dc_new(2025, 4)}))
         ing._ingest_generic_dataset(conn, self.defn, [2025], fresh=False)
@@ -169,7 +168,6 @@ class TestDepthChartsRefetch:
         _refetch(conn, monkeypatch, self.defn, 2024, mode)
         assert _count(conn, "SELECT COUNT(*) FROM depth_charts") == 3  # 3 rows, one copy
 
-    @pytest.mark.xfail(strict=True, reason=XF + "1 depth_charts mixed-shape re-fetch")
     def test_depth_charts_mixed_db_refetch_2025_keeps_2024(self, conn, monkeypatch):
         _fake_nfl(monkeypatch, load_depth_charts=_loader_from(
             {2024: _dc_2024(3), 2025: _dc_new(2025, 4)}))
@@ -188,7 +186,6 @@ class TestDepthChartsRefetch:
         assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE gsis_id LIKE '24-%'") == 3
         assert _count(conn, "SELECT COUNT(*) FROM depth_charts WHERE gsis_id LIKE '25-%'") == 4
 
-    @pytest.mark.xfail(strict=True, reason=XF + "1 depth_charts 2025 vs 2026 dt windows")
     def test_depth_charts_refetch_2026_keeps_2025_dt_rows(self, conn, monkeypatch):
         _fake_nfl(monkeypatch, load_depth_charts=_loader_from(
             {2025: _dc_new(2025, 4), 2026: _dc_new(2026, 2)}))
@@ -207,14 +204,12 @@ class TestParticipationRefetch:
     p24 = staticmethod(lambda: _part(2024, [("01_TEN_CHI", 2)]))                    # 2 rows
 
     @MODES
-    @pytest.mark.xfail(strict=True, reason=XF + "2 participation game-id prefix delete")
     def test_participation_2025_loaded_twice_keeps_one_copy(self, conn, monkeypatch, mode):
         _fake_nfl(monkeypatch, load_participation=_loader_from({2025: self.p25}))
         ing._ingest_generic_dataset(conn, self.defn, [2025], fresh=False)
         _refetch(conn, monkeypatch, self.defn, 2025, mode)
         assert _count(conn, "SELECT COUNT(*) FROM participation") == 3  # today: 6
 
-    @pytest.mark.xfail(strict=True, reason=XF + "2 participation game-id prefix delete")
     def test_participation_refetch_2025_with_2024_present_counts_exact(self, conn, monkeypatch):
         _fake_nfl(monkeypatch, load_participation=_loader_from({2024: self.p24, 2025: self.p25}))
         ing._ingest_generic_dataset(conn, self.defn, [2024, 2025], fresh=False)
@@ -250,7 +245,6 @@ def _missing_key_case(name):
 
 
 class TestDeleteFailureIsLoud:
-    @pytest.mark.xfail(strict=True, reason=XF + "3 bare except around DELETE")
     def test_generic_loader_source_has_no_bare_except_around_delete(self):
         src = inspect.getsource(ing._ingest_generic_dataset)
         swallowed = [m for m in re.finditer(r"except Exception:\s*\n\s*pass", src)
@@ -258,7 +252,6 @@ class TestDeleteFailureIsLoud:
         assert swallowed == [], "DELETE is still wrapped in `except Exception: pass`"
 
     @pytest.mark.parametrize("case", ["generic_season", "participation"])
-    @pytest.mark.xfail(strict=True, reason=XF + "3 explicit delete-key check")
     def test_missing_delete_key_column_is_not_a_silent_append(self, conn, monkeypatch, case):
         defn, ddl, df = _missing_key_case(case)
         for sql in ddl:
@@ -327,7 +320,6 @@ class TestSeasonTransaction:
     defn = REGISTRY["schedules"]
 
     @pytest.mark.parametrize("fail_in", ["_write_df_to_table", "_record_loaded"])
-    @pytest.mark.xfail(strict=True, reason=XF + "4 DELETE+INSERT+metadata in one transaction")
     def test_failure_after_delete_leaves_old_season(self, conn, monkeypatch, fail_in):
         _fake_nfl(monkeypatch, load_schedules=_loader_from({2024: _sched(2024, 3)}))
         ing._ingest_generic_dataset(conn, self.defn, [2024], fresh=False)   # 3 rows, meta 3
@@ -347,7 +339,6 @@ class TestSeasonTransaction:
         assert _count(conn, "SELECT COUNT(*) FROM schedules WHERE season = 2024") == 3
         assert _meta(conn, "schedules", 2024) == [3]
 
-    @pytest.mark.xfail(strict=True, reason=XF + "4 pbp DELETE+INSERT in one transaction")
     def test_pbp_insert_failure_keeps_previous_plays(self, conn, monkeypatch):
         _fake_nfl(monkeypatch, load_pbp=lambda seasons: _pbp(2024, 3))
         ing._create_plays_table(conn, _pbp(2024, 3))
@@ -396,7 +387,6 @@ class TestExitStatus:
         ("schedules", "rosters", "rosters"),
         ("rosters", "schedules", "schedules"),
     ])
-    @pytest.mark.xfail(strict=True, reason=XF + "5 non-zero exit on loader failure")
     def test_failed_fetch_continues_then_exits_nonzero(self, monkeypatch, tmp_path,
                                                        failing, ok, ok_table):
         good = {"schedules": lambda s, **k: _sched(s[0], 2), "rosters": lambda s, **k: _roster(s[0], 2)}
@@ -408,7 +398,6 @@ class TestExitStatus:
         assert result.exit_code != 0, result.output
         assert failing in result.output
 
-    @pytest.mark.xfail(strict=True, reason=XF + "5 non-zero exit on pbp season failure")
     def test_failed_pbp_season_exits_nonzero(self, monkeypatch, tmp_path):
         # schema discovery (2025) works, the 2024 season fetch fails -> soft failure today
         def load_pbp(seasons):
@@ -443,7 +432,6 @@ class TestFreshScope:
         return sizes, db
 
     @pytest.mark.parametrize("target, other, other_n", [(2025, 2024, 3), (2024, 2025, 2)])
-    @pytest.mark.xfail(strict=True, reason=XF + "6 --fresh drops only requested seasons")
     def test_fresh_one_season_keeps_other_season_plays(self, monkeypatch, tmp_path,
                                                        target, other, other_n):
         sizes, db = self._seed(monkeypatch, tmp_path)
@@ -454,7 +442,6 @@ class TestFreshScope:
         assert _db_count(db, f"SELECT COUNT(*) FROM plays WHERE season = {other}") == other_n
         assert _db_count(db, f"SELECT COUNT(*) FROM plays WHERE season = {target}") == 4
 
-    @pytest.mark.xfail(strict=True, reason=XF + "6 --fresh leaves metadata consistent")
     def test_fresh_one_season_metadata_matches_plays(self, monkeypatch, tmp_path):
         sizes, db = self._seed(monkeypatch, tmp_path)
         sizes[2025] = 4

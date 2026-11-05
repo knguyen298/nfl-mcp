@@ -30,6 +30,13 @@ class DatasetDef:
     # dataset; "espn" is the external records fetch, which is not an nflreadpy loader and
     # is opt-in because it is rate-limited and belongs to another publisher.
     source: str = "nflreadpy"
+    # How a re-fetch finds the season's old rows. delete_key is the column; delete_match
+    # "equals" means delete_key = season, "id_prefix" means delete_key starts with
+    # "<season>_" (nflverse game ids). stamp_season: the file has no season column in some
+    # years (depth_charts 2025+), so the loader adds one from the season it fetched.
+    delete_key: str = "season"
+    delete_match: str = "equals"
+    stamp_season: bool = False
 
 
 # ── Registry ───────────────────────────────────────────────────────────────────
@@ -179,6 +186,8 @@ _DEFS: list[DatasetDef] = [
         seasonal=True, default=True,
         description="Weekly depth charts",
         min_season=2001,
+        # 2025+ files have dt/team/pos_* and no season column; the loader stamps one.
+        stamp_season=True,
     ),
     DatasetDef(
         dataset_id="officials",
@@ -195,6 +204,8 @@ _DEFS: list[DatasetDef] = [
         seasonal=True, default=True,
         description="Player participation per play — very large dataset",
         min_season=2016,
+        # No season column; nflverse_game_id is '<season>_<week>_<away>_<home>'.
+        delete_key="nflverse_game_id", delete_match="id_prefix",
         # No upper bound: upstream publishes every season from 2016 onward.
     ),
     DatasetDef(
