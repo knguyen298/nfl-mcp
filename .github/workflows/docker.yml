@@ -19,7 +19,29 @@ permissions:
   packages: write
 
 jobs:
+  # Release, cron and manual publishes all run the unit tests first.
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[dev]"
+
+      - name: Run unit tests
+        run: pytest tests -q --no-cov -p no:cacheprovider -m unit
+
   build-and-push:
+    needs: unit
     runs-on: ubuntu-latest
     steps:
       - name: Check out source

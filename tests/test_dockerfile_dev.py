@@ -333,3 +333,53 @@ class TestContainerLifecycle:
 
         assert result.returncode != 0
         assert "is not a symlink" in result.stdout
+
+
+class TestRootStartDropsPrivileges:
+    """entrypoint.sh started as root chowns a foreign-owned /data, then re-runs as nflmcp.
+
+    Nothing runs as root: `id`, `find`, `chown` and `setpriv` are stubs. The `find` stub reports
+    the directory itself as foreign-owned unless the owner is nflmcp.
+    """
+
+    @staticmethod
+    def _stubs(bin_dir, tmp_path, *, owner):
+        log = tmp_path / "calls.log"
+        stubs = {
+            "id": '[ "$1" = -u ] && echo 0\n',
+            "find": f'[ {owner} = nflmcp ] || echo "$1"\n',
+            "chown": 'echo "chown $*" >> "$CALL_LOG"\n',
+            "setpriv": 'echo "setpriv $*" >> "$CALL_LOG"\n',
+        }
+        for name, body in stubs.items():
+            (bin_dir / name).write_text("#!/bin/sh\n" + body)
+            (bin_dir / name).chmod(0o755)
+        return log
+
+    def test_foreign_owner_is_chowned_then_script_reruns_as_nflmcp(self, tmp_path):
+        entrypoint, _, data, bin_dir = _sim(tmp_path)
+        log = self._stubs(bin_dir, tmp_path, owner="root")
+        out = _run(entrypoint, bin_dir, CALL_LOG=str(log))
+
+        calls = log.read_text().splitlines()
+        assert calls == [
+            f"chown -R nflmcp:nflmcp {data}",
+            f"setpriv --reuid=nflmcp --regid=nflmcp --init-groups {entrypoint}",
+        ]
+        assert "changing owner" in out
+        # The stub setpriv does not re-run the script, so nothing below the drop executed.
+        assert "[serve started]" not in out
+        assert not (data / "nflread.duckdb").exists()
+
+    def test_correct_owner_is_not_chowned_again(self, tmp_path):
+        entrypoint, _, _, bin_dir = _sim(tmp_path)
+        log = self._stubs(bin_dir, tmp_path, owner="nflmcp")
+        _run(entrypoint, bin_dir, CALL_LOG=str(log))
+
+        calls = log.read_text().splitlines()
+        assert len(calls) == 1 and calls[0].startswith("setpriv --reuid=nflmcp")
+
+    def test_non_root_start_skips_the_drop(self, tmp_path):
+        entrypoint, _, data, bin_dir = _sim(tmp_path)
+        out = _run(entrypoint, bin_dir)   # real `id -u` is not 0 here
+        assert "[serve started]" in out and "changing owner" not in out
