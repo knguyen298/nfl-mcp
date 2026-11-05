@@ -238,19 +238,6 @@ def _sql_error_detail(exc: Exception) -> Dict[str, Any]:
     return {}
 
 
-def _query_timeout() -> float:
-    """Seconds allowed per nfl_query; NFL_MCP_QUERY_TIMEOUT_SECONDS overrides."""
-    raw = os.getenv("NFL_MCP_QUERY_TIMEOUT_SECONDS")
-    if raw:
-        try:
-            value = float(raw)
-        except ValueError:
-            value = 0.0
-        if math.isfinite(value) and value > 0:
-            return value
-    return _QUERY_TIMEOUT_SECONDS
-
-
 def _unique_names(names: list[str]) -> list[str]:
     """Make column names unique the way DuckDB does: a, a_1, a_2, ..."""
     seen: set[str] = set()
