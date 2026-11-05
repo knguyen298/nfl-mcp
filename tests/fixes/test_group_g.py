@@ -64,6 +64,7 @@ import pytest
 
 from nfl_mcp import tools
 from nfl_mcp.config import get_duckdb_path
+from nfl_mcp.database import get_db_connection
 
 # ── ids (real gsis ids; the synthetic DB reuses them) ─────────────────────────
 JA = "00-0034857"   # Josh Allen QB BUF
@@ -150,7 +151,9 @@ PLAY_COLS = {c: "DOUBLE" for c in (
     "touchdown fumble_lost epa qb_epa cpoe").split()}
 PLAY_COLS.update({c: "VARCHAR" for c in (
     "game_id season_type posteam defteam play_type passer_player_id passer_player_name "
-    "rusher_player_id rusher_player_name receiver_player_id receiver_player_name").split()})
+    "rusher_player_id rusher_player_name receiver_player_id receiver_player_name "
+    "lateral_receiver_player_id lateral_rusher_player_id td_player_id").split()})
+PLAY_COLS.update(lateral_receiving_yards="DOUBLE", lateral_rushing_yards="DOUBLE")
 PLAY_COLS.update(season="INTEGER", week="INTEGER")
 _NAME = {JA: "J.Allen", BA: "B.Allen", KA: "K.Allen", KY: "K.Allen", JV: "J.Williams",
          JM: "J.Williams", OB: "O.Beckham", CH: "J.Chase", AE: "A.Estime", TK: "T.Kelce",
@@ -206,7 +209,16 @@ O1 = _pass(PM, OB, complete=1, yds=7, team="KC")
 E1 = _run(AE, yds=3, team="PIT")
 S1 = _run(SB, yds=10, td=1, team="PHI")
 T1 = _pass(PM, TK, complete=1, yds=11, team="KC")
-PLAYS = [P1, P2, P3, P4, P5, P6, P7, P8, R1, R2, R3, R4, P9, B1, K1, W1, W2, W3, O1, E1, S1, T1]
+# Laterals, in their own game (week 4) and on players no other test counts.
+# L1: Mahomes -> Beckham, 4 yds, lateral to Kelce for 30 more, Kelce scores.
+L1 = _pass(PM, OB, complete=1, yds=34, td=1, epa=1.0, week=4, team="KC")
+L1.update(receiving_yards=4, lateral_receiver_player_id=TK, lateral_receiving_yards=30,
+          td_player_id=TK)
+# L2: Barkley runs 3 yds, laterals to Estime who gains 7 more.
+L2 = _run(SB, yds=3, week=4, team="PHI")
+L2.update(lateral_rusher_player_id=AE, lateral_rushing_yards=7)
+PLAYS = [P1, P2, P3, P4, P5, P6, P7, P8, R1, R2, R3, R4, P9, B1, K1, W1, W2, W3, O1, E1, S1, T1,
+         L1, L2]
 FTN_PLAYS = [(P1, True), (P2, False), (P3, False), (P4, False), (P5, False), (R1, True),
              (R2, False), (P9, False), (B1, False), (K1, True)]  # (play, is_play_action)
 
@@ -318,10 +330,6 @@ def syn(_synthetic_path, monkeypatch):
     return _synthetic_path
 
 
-def xf(item):
-    return pytest.mark.xfail(strict=True, reason=f"group g: {item}")
-
-
 # ── 1. nfl_player_lookup ─────────────────────────────────────────────────────
 
 def _lookup_ids(**kw):
@@ -331,13 +339,11 @@ def _lookup_ids(**kw):
     return {c["gsis_id"] for c in res["candidates"]}
 
 
-@xf("nfl_player_lookup")
 @pytest.mark.parametrize("name", ["Allen", "allen", "ALLEN"])
 def test_lookup_surname_returns_all_four_allens(syn, name):
     assert _lookup_ids(name=name) == ALLENS  # 4 Allen rows in players
 
 
-@xf("nfl_player_lookup")
 def test_lookup_candidate_has_contract_keys(syn):
     res = call("nfl_player_lookup", name="Keenan Allen")
     (c,) = res["candidates"]
@@ -345,7 +351,6 @@ def test_lookup_candidate_has_contract_keys(syn):
     assert {"display_name", "short_name", "teams", "first_season", "last_season"} <= set(c)
 
 
-@xf("nfl_player_lookup")
 @pytest.mark.parametrize("kw, expected", [
     (dict(name="Josh Allen"), {JA}),
     (dict(name="Allen", team="CHI"), {KA}),               # only Keenan has a CHI roster row
@@ -358,7 +363,6 @@ def test_lookup_full_name_and_filters_narrow(syn, kw, expected):
     assert _lookup_ids(**kw) == expected
 
 
-@xf("nfl_player_lookup name normalization")
 @pytest.mark.parametrize("name, gid", [
     ("Odell Beckham Jr.", OB), ("Odell Beckham", OB), ("odell beckham jr", OB),
     ("Patrick Mahomes II", PM),
@@ -370,7 +374,6 @@ def test_lookup_suffix_punctuation_accent_variants(syn, name, gid):
     assert _lookup_ids(name=name) == {gid}
 
 
-@xf("nfl_player_lookup")
 @pytest.mark.parametrize("name", ["Zzyzx Nobody", "Allenby"])
 def test_lookup_no_match_is_empty_not_error(syn, name):
     res = call("nfl_player_lookup", name=name)
@@ -379,7 +382,6 @@ def test_lookup_no_match_is_empty_not_error(syn, name):
 
 # ── 2. nfl_player_stats identity ─────────────────────────────────────────────
 
-@xf("player_stats ambiguous name")
 @pytest.mark.parametrize("kw", [dict(player_name="Allen", season=2024),
                                 dict(player_name="Allen"),
                                 dict(player_name="K.Allen", season=2024)])
@@ -389,7 +391,6 @@ def test_player_stats_ambiguous_name_returns_candidates(syn, kw):
     assert "seasons" not in res
 
 
-@xf("player_stats resolves by id")
 @pytest.mark.parametrize("kw, gid", [
     (dict(player_name="Josh Allen"), JA),
     (dict(player_id=JA), JA),
@@ -404,7 +405,6 @@ def test_player_stats_resolves_single_player(syn, kw, gid):
     assert res["player_name"] == dict((p[0], p[1]) for p in _PLAYERS)[gid]
 
 
-@xf("player_stats unknown id")
 @pytest.mark.parametrize("gid", ["00-9999999", "not-an-id"])
 def test_player_stats_unknown_player_id_is_error(syn, gid):
     res = call("nfl_player_stats", player_id=gid)
@@ -420,7 +420,6 @@ def ja_reg(syn):
     return _entry(res)
 
 
-@xf("passing definitions")
 @pytest.mark.parametrize("key, expected", [
     ("attempts", 5),        # P1 P2 P3 P4 P6(spike); not P5 sack, P7 2pt, P8 no_play
     ("completions", 2),     # P1 P2 (P7 is a two-point try)
@@ -434,7 +433,6 @@ def test_passing_counts_follow_definitions(ja_reg, key, expected):
     assert ja_reg["passing"][key] == expected
 
 
-@xf("epa per attempt vs dropback")
 def test_epa_per_attempt_and_per_dropback_differ_with_negative_sack(ja_reg):
     # attempts: 1.2 + 2.0 - 0.4 - 2.0 - 0.3 = 0.5 over 5 -> 0.1
     assert ja_reg["passing"]["epa_per_attempt"] == pytest.approx(0.1, abs=1e-3)
@@ -442,7 +440,6 @@ def test_epa_per_attempt_and_per_dropback_differ_with_negative_sack(ja_reg):
     assert ja_reg["passing"]["epa_per_dropback"] == pytest.approx(0.0, abs=1e-3)
 
 
-@xf("rushing definitions")
 @pytest.mark.parametrize("key, expected", [
     ("carries", 3),          # R1, R2 scramble, R3 kneel; not R4 two-point
     ("yards", 16),           # 5 + 12 - 1
@@ -453,12 +450,10 @@ def test_rushing_counts_follow_definitions(ja_reg, key, expected):
     assert ja_reg["rushing"][key] == expected
 
 
-@xf("yards_per_carry = yards / carries")
 def test_yards_per_carry_is_yards_over_carries(ja_reg):
     assert ja_reg["rushing"]["yards_per_carry"] == pytest.approx(16 / 3, abs=0.01)
 
 
-@xf("receiving definitions")
 @pytest.mark.parametrize("gid, expected", [
     (CH, dict(targets=3, receptions=2, yards=30, touchdowns=1)),  # P1-P3; P7 2pt excluded
     (KA, dict(targets=2, receptions=1, yards=8, touchdowns=0)),   # P4 (Josh) + B1 (Brandon)
@@ -469,7 +464,6 @@ def test_receiving_counts_follow_definitions(syn, gid, expected):
     assert {k: rec[k] for k in expected} == expected
 
 
-@xf("season_type split")
 def test_player_stats_splits_reg_and_post(syn):
     res = call("nfl_player_stats", player_id=JA, season=2024)
     by_type = {s["season_type"]: s for s in res["seasons"]}
@@ -477,7 +471,6 @@ def test_player_stats_splits_reg_and_post(syn):
     assert by_type["POST"]["passing"]["attempts"] == 1  # P9
 
 
-@xf("definitions block")
 def test_definitions_block_names_each_rule(syn):
     res = call("nfl_player_stats", player_id=JA, season=2024)
     defs = res["definitions"]
@@ -487,9 +480,75 @@ def test_definitions_block_names_each_rule(syn):
     assert "sack" in defs["attempts"] and "two_point" in defs["attempts"]
 
 
+@pytest.mark.parametrize("gid, block, expected", [
+    # O1 (7 yds) + L1 (4 yds caught; the 30 after the lateral belong to Kelce, so is the TD)
+    (OB, "receiving", dict(targets=2, receptions=2, yards=11, touchdowns=0)),
+    # T1 (target, 11 yds) + 30 lateral yards and the TD from L1; L1 is not his target
+    (TK, "receiving", dict(targets=1, receptions=1, yards=41, touchdowns=1)),
+    # O1 + T1 + L1 are attempts; yards 7 + 11 + 34; one TD (L1)
+    (PM, "passing", dict(attempts=3, completions=3, yards=52, touchdowns=1)),
+    # S1 (10 yds, TD) + L2 (3 yds before the lateral); 2 carries
+    (SB, "rushing", dict(carries=2, yards=13, touchdowns=1)),
+    # E1 (3 yds) + 7 lateral yards from L2; the lateral is not a carry for him
+    (AE, "rushing", dict(carries=1, yards=10, touchdowns=0)),
+])
+def test_lateral_yards_and_touchdowns_go_to_the_player_who_got_them(syn, gid, block, expected):
+    res = call("nfl_player_stats", player_id=gid, season=2024, season_type="REG")
+    got = _entry(res)[block]
+    assert {k: got[k] for k in expected} == expected
+
+
+def test_player_stats_lists_reg_before_post(syn):
+    res = call("nfl_player_stats", player_id=JA, season=2024)
+    assert [s["season_type"] for s in res["seasons"]] == ["REG", "POST"]
+
+
+def test_definitions_note_the_reversed_no_play_pass(syn):
+    defs = call("nfl_player_stats", player_id=JA, season=2024)["definitions"]
+    assert "no_play" in defs["attempts"] and "one below" in defs["attempts"]
+    assert "lateral" in defs["yards"] and "td_player_id" in defs["touchdowns"]
+
+
+# ── name resolution when the filter leaves nobody ────────────────────────────
+
+@pytest.mark.parametrize("name, ids", [("Allen", ALLENS), ("J.Williams", {JV, JM})])
+def test_player_stats_season_without_roster_rows_is_still_ambiguous(syn, name, ids):
+    res = call("nfl_player_stats", player_name=name, season=2019)  # rosters start in 2023 here
+    _assert_ambiguous(res, ids=ids)
+
+
+def test_player_stats_season_without_roster_rows_uses_a_lone_match(syn):
+    res = call("nfl_player_stats", player_name="Patrick Mahomes", season=2019)
+    assert res["player_id"] == PM and res["seasons"] == []
+
+
+def test_compare_season_without_roster_rows_is_ambiguous(syn):
+    res = call("nfl_compare", entity1="Allen", entity2="Patrick Mahomes", compare_type="player",
+               season=2019)
+    _assert_ambiguous(res, ids=ALLENS)
+
+
+# ── partial names on derived tools ───────────────────────────────────────────
+
+def test_derived_tool_partial_name_matching_several_ids_is_ambiguous(syn):
+    res = call("nfl_td_luck", player="Alle", season=2024)  # "Alle" is no player's name
+    _assert_ambiguous(res, ids={JA, KA, BA})
+    assert not res.get("td_luck")
+
+
+def test_derived_tool_partial_name_matching_one_id_filters_on_it(syn):
+    res = call("nfl_td_luck", player="Chas", season=2024)
+    assert {r["player_id"] for r in res["td_luck"]} == {CH}
+    assert res["player_id"] == CH
+
+
+@pytest.mark.parametrize("text", ["%", "_", "A_len"])
+def test_derived_tool_partial_name_wildcards_are_literal(syn, text):
+    assert call("nfl_td_luck", player=text)["td_luck"] == []
+
+
 # ── 4. nfl_compare player mode ───────────────────────────────────────────────
 
-@xf("compare player ids")
 def test_compare_two_same_short_name_players_by_id(syn):
     res = call("nfl_compare", entity1=JV, entity2=JM, compare_type="player", season=2024)
     players = res["players"]
@@ -499,7 +558,6 @@ def test_compare_two_same_short_name_players_by_id(syn):
     assert [_entry(p)["rushing"]["yards"] for p in players] == [10, 9]
 
 
-@xf("compare ambiguous")
 @pytest.mark.parametrize("e1, e2", [("Allen", "Patrick Mahomes"), ("Patrick Mahomes", "J.Williams")])
 def test_compare_ambiguous_name_returns_candidates(syn, e1, e2):
     res = call("nfl_compare", entity1=e1, entity2=e2, compare_type="player", season=2024)
@@ -514,7 +572,6 @@ def _snap_players(res):
     return [r["player"] for r in res["snap_counts"]]
 
 
-@xf("snap_counts full name")
 @pytest.mark.parametrize("kw", [dict(player="Travis Kelce"), dict(player="travis kelce"),
                                 dict(player_id=TK)])
 def test_snap_counts_full_name_or_id_returns_rows(syn, kw):
@@ -527,7 +584,6 @@ def test_snap_counts_surname_still_works(syn):
 
 # ── 6. nfl_ftn_charting ──────────────────────────────────────────────────────
 
-@xf("ftn_charting player identity")
 @pytest.mark.parametrize("kw", [dict(player_id=JA), dict(player="Josh Allen")])
 def test_ftn_charting_one_player_by_id_or_full_name(syn, kw):
     res = call("nfl_ftn_charting", season=2024, season_type="REG", **kw)
@@ -536,13 +592,11 @@ def test_ftn_charting_one_player_by_id_or_full_name(syn, kw):
     assert res["charting"]["play_action"]["plays"] == 2
 
 
-@xf("ftn_charting player identity")
 def test_ftn_charting_receiver_by_id(syn):
     res = call("nfl_ftn_charting", player_id=KA, season=2024)
     assert res["total_plays"] == 2  # P4 (from Josh) + B1 (from Brandon)
 
 
-@xf("ftn_charting ambiguous")
 @pytest.mark.parametrize("name", ["Allen", "K.Allen"])
 def test_ftn_charting_ambiguous_name_not_merged(syn, name):
     res = call("nfl_ftn_charting", player=name, season=2024)
@@ -561,14 +615,12 @@ LIST_TOOLS = [
 ]
 
 
-@xf("player_id on derived tools")
 @pytest.mark.parametrize("fn, key, gid, _n, _ids", LIST_TOOLS)
 def test_derived_tool_filters_by_player_id(syn, fn, key, gid, _n, _ids):
     rows = call(fn, player_id=gid)[key]
     assert rows and {r["player_id"] for r in rows} == {gid}
 
 
-@xf("ambiguous on derived tools")
 @pytest.mark.parametrize("fn, key, _gid, name, ids", LIST_TOOLS)
 def test_derived_tool_ambiguous_name(syn, fn, key, _gid, name, ids):
     res = call(fn, player=name)
@@ -582,14 +634,12 @@ def test_derived_tool_unique_full_name_keeps_working(syn, fn, key):
     assert rows and {r["player_id"] for r in rows} == {KA}
 
 
-@xf("drop_rate name resolution through players")
 @pytest.mark.parametrize("name", ["Ja'Marr Chase", "Jamarr Chase"])
 def test_drop_rate_full_name_finds_short_form_row(syn, name):
     rows = tools.nfl_drop_rate(player=name)["drop_rate"]
     assert [r["player_id"] for r in rows] == [CH]
 
 
-@xf("fantasy_rankings punctuation-insensitive match")
 @pytest.mark.parametrize("name, stored", [("Ja'Marr Chase", "JaMarr Chase"),
                                           ("Amon-Ra St. Brown", "Amon-Ra St Brown")])
 def test_fantasy_rankings_week_ignores_punctuation(syn, name, stored):
@@ -609,13 +659,11 @@ def real_db():
     path = get_duckdb_path()
     if not Path(path).exists():
         pytest.skip("No DuckDB database loaded")
-    con = duckdb.connect(str(path), read_only=True)
-    try:
+    # Same opener as the tools, so this open connection never clashes with theirs.
+    with get_db_connection() as con:
         if con.execute("SELECT COUNT(*) FROM plays WHERE season = 2024").fetchone()[0] == 0:
             pytest.skip("no 2024 plays")
         yield con
-    finally:
-        con.close()
 
 
 def _oracle(con, gid, col):
@@ -645,7 +693,6 @@ ORACLE_CASES = [
 
 
 @pytest.mark.integration
-@xf("player_stats by id matches nflverse player_stats")
 @pytest.mark.parametrize("gid, group, key, col", ORACLE_CASES,
                          ids=[f"{g}-{grp}-{k}" for g, grp, k, _c in ORACLE_CASES])
 def test_player_stats_matches_official_2024_reg(real_db, gid, group, key, col):
@@ -655,7 +702,6 @@ def test_player_stats_matches_official_2024_reg(real_db, gid, group, key, col):
 
 
 @pytest.mark.integration
-@xf("player_stats ambiguous on real data")
 def test_real_allen_2024_is_ambiguous(real_db):
     # Josh, Brandon, Keenan and Kyle Allen all have 2024 roster rows (checked in rosters).
     on_roster = {r[0] for r in real_db.execute(
@@ -668,7 +714,6 @@ def test_real_allen_2024_is_ambiguous(real_db):
 
 
 @pytest.mark.integration
-@xf("season narrows name resolution")
 def test_real_josh_allen_2024_resolves_to_buf_qb(real_db):
     # players holds two "Josh Allen" rows; the C (00-0030833) last played in 2016.
     ids = {r[0] for r in real_db.execute(
@@ -679,14 +724,12 @@ def test_real_josh_allen_2024_resolves_to_buf_qb(real_db):
 
 
 @pytest.mark.integration
-@xf("nfl_player_lookup")
 def test_real_lookup_josh_allen_lists_both(real_db):
     res = call("nfl_player_lookup", name="Josh Allen")
     assert {c["gsis_id"] for c in res["candidates"]} == {JA, JA_C}
 
 
 @pytest.mark.integration
-@xf("snap_counts full name / pfr_id")
 @pytest.mark.parametrize("kw", [dict(player="Travis Kelce"), dict(player_id=TK)])
 def test_real_snap_counts_kelce_2024(real_db, kw):
     # Oracle: rows keyed by the PFR id, a different column than the name the tool matches.
@@ -697,7 +740,6 @@ def test_real_snap_counts_kelce_2024(real_db, kw):
 
 
 @pytest.mark.integration
-@xf("ftn_charting by player_id")
 def test_real_ftn_charting_by_id_matches_id_join(real_db):
     # Oracle (c): direct join on the id columns with the tool's documented filter
     # (scrimmage pass/run plays, offensive perspective). Not circular: it keys on
@@ -712,7 +754,6 @@ def test_real_ftn_charting_by_id_matches_id_join(real_db):
 
 
 @pytest.mark.integration
-@xf("drop_rate name resolution")
 def test_real_drop_rate_full_name_chase_2024(real_db):
     res = tools.nfl_drop_rate(player="Ja'Marr Chase", season=2024)
     assert res["drop_rate"] and {r["player_id"] for r in res["drop_rate"]} == {CH}

@@ -178,16 +178,16 @@ class TestNflPlayerStats:
         result = nfl_player_stats(player_name="P.Mahomes", stat_type="passing")
         assert "error" not in result
         assert len(result["seasons"]) > 0
-        season = result["seasons"][0]
-        assert "attempts" in season
-        assert "completions" in season
-        assert "avg_epa" in season
+        passing = result["seasons"][0]["passing"]
+        assert "attempts" in passing
+        assert "completions" in passing
+        assert "epa_per_attempt" in passing
 
     def test_rushing_stats(self):
         result = nfl_player_stats(player_name="D.Henry", stat_type="rushing", season=2024)
         assert "error" not in result
         assert len(result["seasons"]) > 0
-        assert "carries" in result["seasons"][0]
+        assert "carries" in result["seasons"][0]["rushing"]
 
     def test_receiving_stats(self):
         result = nfl_player_stats(player_name="J.Jefferson", stat_type="receiving")
@@ -212,12 +212,11 @@ class TestNflCompare:
 
     def test_compare_players(self):
         result = nfl_compare(
-            entity1="P.Mahomes", entity2="L.Jackson",
+            entity1="Patrick Mahomes", entity2="00-0034796",  # Lamar Jackson QB; the name has a CB twin
             compare_type="player", season=2024
         )
         assert "error" not in result
-        assert "P.Mahomes" in result
-        assert "L.Jackson" in result
+        assert [p["player_name"] for p in result["players"]] == ["Patrick Mahomes", "Lamar Jackson"]
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("require_db")
