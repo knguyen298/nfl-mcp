@@ -736,3 +736,40 @@ def test_real_play_type_accepted_and_exclusive(ptype):
     res = tools.nfl_search_plays(season=2024, week=1, play_type=ptype, max_rows=5)
     assert "error" not in res and res["rows"]
     assert {r["play_type"] for r in res["rows"]} == {ptype}
+
+
+# ── player_id is validated like group G's tools ─────────────────────────────────
+
+@pytest.fixture
+def no_players_db(tmp_path, monkeypatch):
+    """A plays table with no players table at all."""
+    path = tmp_path / "noplayers.duckdb"
+    con = duckdb.connect(str(path))
+    _table(con, "plays", PLAY_COLS, ROWS)
+    _meta(con)
+    con.close()
+    monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))
+
+
+def test_player_id_without_players_table_is_used_as_given(no_players_db):
+    assert _pids(_search(player_id=K1, player_role="kicker", play_type="field_goal")) == {20, 54}
+
+
+def test_player_id_with_trimmed_players_table_is_used_as_given(plays_db):
+    # the fixture players table has no name columns and there is no rosters table
+    assert _pids(_search(player_id=P1, player_role="punter")) == {8}
+
+
+@_mark(*integration)
+def test_real_unknown_player_id_returns_unknown_player_id_error():
+    res = tools.nfl_search_plays(season=2024, player_id="00-9999999")
+    assert res.get("code") == "UNKNOWN_PLAYER_ID" and "rows" not in res
+    same = tools.nfl_player_stats(player_id="00-9999999", season=2024)
+    assert same.get("code") == res["code"]
+
+
+@_mark(*integration)
+def test_real_known_player_id_still_searches():
+    gsis = _real("SELECT gsis_id FROM players WHERE display_name='Patrick Mahomes'")[0][0]
+    res = tools.nfl_search_plays(season=2024, week=1, player_id=gsis, player_role="passer", limit=5)
+    assert "error" not in res and res["rows"]

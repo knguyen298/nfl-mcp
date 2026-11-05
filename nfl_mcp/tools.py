@@ -1029,7 +1029,17 @@ def nfl_search_plays(
             return {"rows": [], "count": 0, "row_count": 0, "truncated": False,
                     "reason": f"No player matches '{player}'. Try nfl_player_lookup."}
         gsis_id = resolved["gsis_id"]
-    if gsis_id is not None:  # a player_id is used as given: it is matched on the plays id columns
+    elif gsis_id is not None:
+        try:
+            _, early = _resolve_player(None, gsis_id)
+        except (duckdb.CatalogException, duckdb.BinderException):
+            early = None  # no usable players table (a trimmed database): use the id as given
+        except (duckdb.Error, ValueError, TimeoutError) as e:
+            logger.exception("Tool error")
+            return {"error": str(e)}
+        if early is not None:
+            return early
+    if gsis_id is not None:
         id_columns = [f"{c}_player_id" for c in _ROLE_COLUMNS[role or "any"]]
         conditions.append("(" + " OR ".join(f"{c} = ?" for c in id_columns) + ")")
         params.extend([gsis_id] * len(id_columns))
