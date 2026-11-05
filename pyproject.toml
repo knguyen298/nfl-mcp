@@ -18,7 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=1.0,<2",
-    "duckdb>=1.5.5,<2",
+    "duckdb>=2.0,<3",
     "pyarrow>=14.0",
     "nflreadpy>=0.1.5,<0.2",
     "polars>=0.20",

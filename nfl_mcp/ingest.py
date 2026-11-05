@@ -22,6 +22,13 @@ from .seasons import FIRST_SEASON, EARLIEST_SEASON, all_seasons, current_season
 ALL_SEASONS = all_seasons()
 
 
+def _register(conn: duckdb.DuckDBPyConnection, name: str, table: object) -> None:
+    """conn.register after closing any open result. DuckDB 2.0 refuses to register a view while
+    an earlier query on the connection is not read to the end (for example, after fetchone)."""
+    conn.complete()
+    conn.register(name, table)
+
+
 def _refresh_seasons() -> set[int]:
     """Seasons that are re-fetched on every ingest, even if already recorded as loaded.
 
@@ -325,7 +332,7 @@ def _create_plays_table(conn: duckdb.DuckDBPyConnection, sample_df: pl.DataFrame
         conn.execute("SELECT 1 FROM plays LIMIT 0")
         print("  plays table already exists")
     except duckdb.CatalogException:
-        conn.register("_schema_df", renamed.to_arrow())
+        _register(conn, "_schema_df", renamed.to_arrow())
         conn.execute(
             "CREATE TABLE plays AS "
             "SELECT *, '' AS enhanced_description FROM _schema_df"
@@ -371,7 +378,7 @@ def _ingest_pbp_season(conn: duckdb.DuckDBPyConnection, season: int) -> int:
         with _transaction(conn):
             _reconcile_schema(conn, "plays", df)
             conn.execute("DELETE FROM plays WHERE season = ?", [season])
-            conn.register("_ingest_df", df.to_arrow())
+            _register(conn, "_ingest_df", df.to_arrow())
             conn.execute("INSERT INTO plays BY NAME SELECT * FROM _ingest_df")
             if total:
                 _record_loaded(conn, "pbp", "plays", "load_pbp", total, season)
@@ -398,7 +405,7 @@ def _write_df_to_table(
     if replace:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
 
-    conn.register("_load_df", df.to_arrow())
+    _register(conn, "_load_df", df.to_arrow())
     try:
         if _table_exists(conn, table):
             _reconcile_schema(conn, table, df)

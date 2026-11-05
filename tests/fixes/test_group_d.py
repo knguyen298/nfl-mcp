@@ -349,6 +349,7 @@ class TestDepthChartsLegacyRestamp:
     def test_table_without_season_column_is_restamped(self, conn, monkeypatch):
         frames = self._frames()
         raw = frames[2025].select(["dt", "team", "player_name", "gsis_id"])
+        conn.complete()  # DuckDB 2.0: close the open result before register
         conn.register("raw25", raw.to_arrow())
         conn.execute("CREATE TABLE depth_charts AS SELECT * FROM raw25")
         ing._record_loaded(conn, "depth_charts", "depth_charts", "load_depth_charts", 4, season=2025)
