@@ -39,7 +39,7 @@ from .tools import (
     nfl_fantasy_opportunity, nfl_fantasy_rankings, nfl_ftn_charting,
     nfl_td_luck, nfl_role_trend, nfl_separation_opportunity,
     nfl_drop_rate, nfl_contract_value, nfl_injury_return,
-    nfl_team_records,
+    nfl_team_records, _as_of,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -1075,8 +1075,8 @@ _GRAIN_SENTENCE = {
                    "appear, and rows do not say which). player_id is the gsis_id.",
     "nfl_role_trend": " Returns one row per player per week. player_id is the gsis_id.",
     "nfl_separation_opportunity": " Returns one row per player per season. player_id is the gsis_id.",
-    "nfl_drop_rate": " Returns one row per player per season per season type (REG and POST rows both "
-                     "appear, and rows do not say which). player_id is the gsis_id.",
+    "nfl_drop_rate": " Returns one row per player per team per season per season type (REG and POST rows "
+                     "both appear, and rows do not say which). player_id is the gsis_id.",
     "nfl_contract_value": " Returns one row per player per season. player_id is the gsis_id.",
     "nfl_injury_return": " Returns one row per injury_type, position and week_post_return.",
     "nfl_team_records": " Returns one row per franchise per season, keyed on team.",
@@ -1185,6 +1185,11 @@ async def read_resource(uri: Any) -> list[ReadResourceContents]:
     return [ReadResourceContents(content=text, mime_type=mime)]
 
 
+def _as_of_database() -> str | None:
+    """Newest load time over the whole database, or None when it cannot be read."""
+    return _as_of(None)
+
+
 @_mcp_server.call_tool()
 async def call_tool(name: str, arguments: Any) -> CallToolResult:
     _DISPATCH = {
@@ -1245,6 +1250,12 @@ async def call_tool(name: str, arguments: Any) -> CallToolResult:
         else:
             if isinstance(result, dict) and "error" in result:
                 failure = _failure_from_result(name, result)
+
+    if failure is not None and "data_as_of" not in failure:
+        # Errors raised before or inside a tool carry the database-wide stamp too.
+        stamp = await to_thread.run_sync(_as_of_database, limiter=get_tool_limiter())
+        if stamp:
+            failure["data_as_of"] = stamp
 
     _log_call(name, args, started, result, failure)
     payload = failure if failure is not None else result

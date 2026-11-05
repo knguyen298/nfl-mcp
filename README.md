@@ -197,7 +197,9 @@ lacks and fixes it. It never deletes the file. It runs three steps in this order
 
 1. Rebuild the derived tables. This needs no network.
 2. Fill the `season` column of `depth_charts`. This downloads data.
-3. Reload any raw table that lacks a column the tools need. This downloads data.
+3. Reload any raw table that lacks a column the tools need. This downloads data. When this
+   step runs, the command rebuilds the derived tables once more afterward, because they
+   are built from the raw tables.
 
 The command stamps the current version only when nothing is left to do. Running it twice is
 safe.

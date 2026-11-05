@@ -1657,6 +1657,9 @@ def _data_as_of(db_path: str) -> dict[str, str]:
             rows = conn.execute(
                 "SELECT table_name, MAX(loaded_at) FROM _ingest_metadata GROUP BY table_name").fetchall()
         times = {name: _iso_utc(loaded) for name, loaded in rows if loaded is not None}
+    except duckdb.CatalogException:  # no _ingest_metadata: cache the empty answer, log once
+        logger.warning("data_as_of unavailable: the database has no _ingest_metadata table")
+        times = {}
     except Exception as e:  # noqa: BLE001 - freshness is extra detail; a tool call must not fail for it
         logger.warning("data_as_of unavailable: %s", e)
         return {}

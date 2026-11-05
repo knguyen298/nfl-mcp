@@ -67,11 +67,13 @@ TABLE_INFO: dict[str, tuple[str, list[str]]] = {
                        ["player_id"]),
     "player_role_trend": ("one row per player per week", ["player_id"]),
     "player_separation_opportunity": ("one row per player per season", ["player_id"]),
-    "player_drop_rate": ("one row per player per season per season type (REG or POST)",
+    "player_drop_rate": ("one row per player per team per season per season type (REG or POST)",
                          ["player_id"]),
     "player_contract_value": ("one row per player per season", ["player_id"]),
     "injury_return_curve": ("one row per injury type, position and week after return",
                             ["injury_type", "position"]),
+    "_schema_version": ("one row per schema version stamp (the database version is the highest)",
+                        ["version"]),
 }
 
 _UNKNOWN_GRAIN = "not described yet; see nfl_schema(table=...) for the columns"

@@ -720,3 +720,67 @@ def test_schema_summary_column_count_matches_describe(real_db):
     n = len(real_db.execute("DESCRIBE plays").fetchall())  # 373 on grpE_v3
     m = re.search(r"Table: plays \([^)]*?(\d+) columns\)", _SCHEMA_SUMMARY)
     assert m and int(m.group(1)) == n, (m and m.group(1), n)
+
+
+# ── 10. Review follow-ups ─────────────────────────────────────────────────────
+
+def _call(name, args):
+    return _handle(types.CallToolRequest(method="tools/call",
+                                         params=types.CallToolRequestParams(name=name, arguments=args)))
+
+
+@pytest.mark.parametrize("name,args,code", [
+    ("nfl_status", {"bogus": 1}, "INVALID_ARGUMENTS"),
+    ("nfl_no_such_tool", {}, "UNKNOWN_TOOL"),
+])
+def test_call_tool_error_paths_carry_data_as_of(synth, name, args, code):
+    res = _call(name, args)
+    assert res.isError
+    payload = json.loads(res.content[0].text)
+    assert payload["code"] == code
+    assert _as_utc_naive(payload["data_as_of"]) == GLOBAL_MAX
+    assert res.structuredContent == payload
+
+
+def test_call_tool_exception_carries_data_as_of(synth, monkeypatch):
+    def boom(**kw):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(server, "nfl_status", boom)
+    res = _call("nfl_status", {})
+    payload = json.loads(res.content[0].text)
+    assert res.isError and payload["code"] == "TOOL_EXECUTION_ERROR"
+    assert _as_utc_naive(payload["data_as_of"]) == GLOBAL_MAX
+
+
+def test_data_as_of_empty_result_is_cached(tmp_path, monkeypatch):
+    path = tmp_path / "nometa.duckdb"
+    con = duckdb.connect(str(path))
+    con.execute("CREATE TABLE schedules (game_id VARCHAR, season INTEGER, week INTEGER, game_type VARCHAR, "
+                "gameday VARCHAR, gametime VARCHAR, away_team VARCHAR, home_team VARCHAR, away_score INTEGER, "
+                "home_score INTEGER, result INTEGER, overtime INTEGER, spread_line DOUBLE, total_line DOUBLE, "
+                "div_game INTEGER, roof VARCHAR, surface VARCHAR, temp INTEGER, wind INTEGER, away_coach VARCHAR, "
+                "home_coach VARCHAR, referee VARCHAR, stadium VARCHAR)")
+    con.close()
+    monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))
+    log: list[str] = []
+    real_connect = duckdb.connect
+    monkeypatch.setattr(duckdb, "connect", lambda *a, **k: _SpyConn(real_connect(*a, **k), log))
+    assert "data_as_of" not in tools.nfl_schedule(season=2024)
+    assert any("_ingest_metadata" in s for s in log)
+    log.clear()
+    assert "data_as_of" not in tools.nfl_schedule(season=2024)
+    assert not [s for s in log if "_ingest_metadata" in s], log
+
+
+def test_catalog_describes_schema_version_table(synth):
+    con = duckdb.connect(str(synth))
+    con.execute("CREATE TABLE _schema_version (version INTEGER, applied_at TIMESTAMP, nfl_mcp_version VARCHAR)")
+    con.close()
+    entry = _catalog(tools.nfl_catalog())["_schema_version"]
+    assert "not described" not in entry["grain"]
+
+
+def test_drop_rate_grain_names_team():
+    from nfl_mcp.discovery import table_info
+    assert "per team" in table_info("player_drop_rate")[0]
+    assert "per team" in _desc("nfl_drop_rate")
