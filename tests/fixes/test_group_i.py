@@ -265,7 +265,6 @@ def test_play_type_filter_returns_only_that_type(plays_db, ptype):
     assert {r["play_type"] for r in res["rows"]} == {ptype}
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "unknown play_type must be an error")
 @pytest.mark.parametrize("bad", ["passs", "kneel"])
 def test_play_type_unknown_errors_with_allowed_list(plays_db, bad):
     res = _search(play_type=bad)
@@ -280,7 +279,6 @@ def _schema_play_type_enum():
     return set(tool.inputSchema["properties"]["play_type"]["enum"])
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "server.py play_type enum lists 5 of 9 values")
 def test_schema_play_type_enum_matches_real_distinct_list():
     assert _schema_play_type_enum() == REAL_PLAY_TYPES
 
@@ -305,19 +303,16 @@ ROLE_CASES = [(X1, role, pids) for role, pids in X1_ROLES.items()] + [
 ]
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "player_role/player_id not implemented")
 @pytest.mark.parametrize("pid_, role, expected", ROLE_CASES,
                          ids=[f"{r}-{p[-2:]}" for p, r, _ in ROLE_CASES])
 def test_player_role_returns_exact_rows(plays_db, pid_, role, expected):
     assert _pids(_search(player_id=pid_, player_role=role)) == expected
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "player_role/player_id not implemented")
 def test_player_role_kicker_with_play_type_field_goal(plays_db):
     assert _pids(_search(player_id=K1, player_role="kicker", play_type="field_goal")) == {20, 54}
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "player_role/player_id not implemented")
 @pytest.mark.parametrize("bad", ["quarterback", "tackler"])
 def test_player_role_unknown_is_error(plays_db, bad):
     res = _search(player_id=X1, player_role=bad)
@@ -339,7 +334,6 @@ SITUATIONS_TODAY = {
 }
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "two_minute is Q4-only; new situations missing")
 @pytest.mark.parametrize("situation", list(SITUATIONS))
 def test_situation_new_definitions(plays_db, situation):
     assert _pids(_search(situation=situation)) == SITUATIONS[situation]
@@ -377,7 +371,6 @@ FILTER_CASES = [
 ]
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "play filters not implemented")
 @pytest.mark.parametrize("kw, expected", FILTER_CASES, ids=[str(k) for k, _ in FILTER_CASES])
 def test_filter_narrows_to_hand_counted_rows(plays_db, kw, expected):
     assert _pids(_search(**kw)) == expected
@@ -394,14 +387,12 @@ def test_default_order_is_abs_epa_desc(plays_db):
     assert [_pid(r) for r in rows[:2]] == [38, 25]  # |6.5|, |-5.2|; every other |epa| <= 0.30
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "sort_by not implemented")
 @pytest.mark.parametrize("sort_by", list(SORTS))
 def test_sort_by_first_two_rows(plays_db, sort_by):
     res = _search(sort_by=sort_by)
     assert [_pid(r) for r in res["rows"][:2]] == SORTS[sort_by]
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "sort_by not implemented")
 @pytest.mark.parametrize("bad", ["random", "epa; DROP TABLE plays"])
 def test_sort_by_unknown_is_error(plays_db, bad):
     res = _search(sort_by=bad)
@@ -410,7 +401,6 @@ def test_sort_by_unknown_is_error(plays_db, bad):
 
 # ── 8. columns ───────────────────────────────────────────────────────────────────
 
-@pytest.mark.xfail(strict=True, reason=XF + "columns not implemented")
 def test_columns_extra_appear_in_rows(plays_db):
     res = _search(play_type="pass", columns=["air_yards", "cpoe"])
     row = next(r for r in res["rows"] if _pid(r) == 38)
@@ -418,7 +408,6 @@ def test_columns_extra_appear_in_rows(plays_db):
     assert all("air_yards" in r and "cpoe" in r for r in res["rows"])
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "columns not implemented")
 @pytest.mark.parametrize("cols, suggestion", [
     (["air_yard"], "air_yards"), (["cpoe", "cpoee"], "cpoe"), (['epa" FROM plays --'], None)])
 def test_columns_unknown_errors_with_did_you_mean(plays_db, cols, suggestion):
@@ -436,14 +425,12 @@ DEFAULT_KEYS = {"game_id", "play_id", "passer_player_id", "rusher_player_id",
                 "play_type", "desc", "epa", "wpa"}
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "default output lacks game_id/play_id/ids")
 @pytest.mark.parametrize("ptype", ["pass", "kickoff"])
 def test_default_output_has_id_and_context_keys(plays_db, ptype):
     rows = _search(play_type=ptype)["rows"]
     assert rows and all(DEFAULT_KEYS <= set(r) for r in rows)
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "default output lacks game_id/play_id/ids")
 def test_default_output_ids_match_fixture(plays_db):
     row = next(r for r in _search(play_type="pass")["rows"] if _pid(r) == 49)
     assert (row["game_id"], row["play_id"], row["passer_player_id"]) == ("2024_02_KC_CIN", 490.0, X1)
@@ -455,7 +442,6 @@ def test_max_rows_still_limits_rows(plays_db):
     assert len(_search(max_rows=3)["rows"]) == 3
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "max_rows alias must report count/truncated")
 @pytest.mark.parametrize("n, truncated", [(3, True), (60, False)])
 def test_max_rows_alias_reports_truncation(plays_db, n, truncated):
     res = _search(max_rows=n)
@@ -593,10 +579,6 @@ def _page(spec, **kw):
 
 ORDER = {s[0]: [s[3](i, LETTERS[i])[s[6]] for i in range(7)] for s in PAGE_SPECS}
 
-pagination = pytest.mark.xfail(strict=True, reason=XF + "limit/offset/count/truncated/hint missing")
-
-
-@pagination
 @pytest.mark.parametrize("spec", PAGE_SPECS, ids=SPEC_IDS)
 def test_limit_three_returns_first_page_truncated(page_db, spec):
     res, ids = _page(spec, limit=3)
@@ -605,7 +587,6 @@ def test_limit_three_returns_first_page_truncated(page_db, spec):
     assert isinstance(res["hint"], str) and res["hint"]
 
 
-@pagination
 @pytest.mark.parametrize("spec", PAGE_SPECS, ids=SPEC_IDS)
 def test_offset_pages_follow_order(page_db, spec):
     res2, ids2 = _page(spec, limit=3, offset=3)
@@ -615,7 +596,6 @@ def test_offset_pages_follow_order(page_db, spec):
     assert "hint" not in res3
 
 
-@pagination
 @pytest.mark.parametrize("spec", PAGE_SPECS, ids=SPEC_IDS)
 def test_limit_equal_to_row_count_not_truncated(page_db, spec):
     res, ids = _page(spec, limit=7)
@@ -623,7 +603,6 @@ def test_limit_equal_to_row_count_not_truncated(page_db, spec):
     assert "hint" not in res
 
 
-@pagination
 @pytest.mark.parametrize("spec", PAGE_SPECS, ids=SPEC_IDS)
 def test_pages_disjoint_and_cover_all_rows(page_db, spec):
     pages = [_page(spec, limit=3, offset=o)[1] for o in (0, 3, 6)]
@@ -632,14 +611,12 @@ def test_pages_disjoint_and_cover_all_rows(page_db, spec):
     assert set(flat) == set(ORDER[spec[0]])
 
 
-@pagination
 @pytest.mark.parametrize("spec", PAGE_SPECS, ids=SPEC_IDS)
 def test_hint_mentions_offset_and_nfl_query(page_db, spec):
     hint = _page(spec, limit=2, offset=1)[0]["hint"]
     assert "offset" in hint and "nfl_query" in hint
 
 
-@pytest.mark.xfail(strict=True, reason=XF + "limit is not validated")
 @pytest.mark.parametrize("bad", [0, -1, 501, "5"])
 @pytest.mark.parametrize("spec", PAGE_SPECS, ids=SPEC_IDS)
 def test_bad_limit_returns_error(page_db, spec, bad):
@@ -648,7 +625,6 @@ def test_bad_limit_returns_error(page_db, spec, bad):
     assert set(res) >= {"error"} and spec[5] not in res
 
 
-@pagination
 @pytest.mark.parametrize("tool, list_key", [("nfl_roster", "players"), ("nfl_search_plays", "rows")])
 def test_default_limit_is_100(page_db, tool, list_key):
     res = getattr(tools, tool)(season=2023)  # 120 matching rows in the fixture
@@ -686,7 +662,7 @@ def _mark(*marks):
     return wrap
 
 
-@_mark(*integration, pytest.mark.xfail(strict=True, reason=XF + "snap_counts cap 500, no truncated"))
+@_mark(*integration)
 def test_real_snap_counts_kc_2024_first_page_truncated():
     direct = _real("SELECT COUNT(*) FROM snap_counts WHERE team='KC' AND season=2024")[0][0]
     assert direct > 500  # 933 in grpE_v3 (all game types)
@@ -694,7 +670,7 @@ def test_real_snap_counts_kc_2024_first_page_truncated():
     assert (res["count"], res["truncated"]) == (500, True)
 
 
-@_mark(*integration, pytest.mark.xfail(strict=True, reason=XF + "snap_counts has no offset"))
+@_mark(*integration)
 def test_real_snap_counts_kc_2024_two_pages_cover_every_row_once():
     direct = _real("SELECT COUNT(DISTINCT (week, pfr_player_id)) , COUNT(*) FROM snap_counts "
                    "WHERE team='KC' AND season=2024")[0]
@@ -706,7 +682,7 @@ def test_real_snap_counts_kc_2024_two_pages_cover_every_row_once():
     assert len(keys) == len(set(keys)) == direct[1]
 
 
-@_mark(*integration, pytest.mark.xfail(strict=True, reason=XF + "roster cap 500, no truncated"))
+@_mark(*integration)
 @pytest.mark.parametrize("team", [None, "KC"])
 def test_real_roster_2024_truncation_matches_direct_count(team):
     sql = "SELECT COUNT(*) FROM rosters WHERE season=2024" + (" AND team=?" if team else "")
@@ -717,7 +693,7 @@ def test_real_roster_2024_truncation_matches_direct_count(team):
     assert res["truncated"] is (direct > 500)  # all teams: 3,216 > 500; KC alone (99) fits
 
 
-@_mark(*integration, pytest.mark.xfail(strict=True, reason=XF + "player_role not implemented"))
+@_mark(*integration)
 @pytest.mark.parametrize("season_type", [None, "REG", "POST"])
 def test_real_butker_kicker_field_goals_match_player_stats(season_type):
     gsis = _real("SELECT gsis_id FROM players WHERE display_name='Harrison Butker'")[0][0]
@@ -736,7 +712,7 @@ def test_real_butker_kicker_field_goals_match_player_stats(season_type):
     assert all(r["play_type"] == "field_goal" for r in res["rows"])
 
 
-@_mark(*integration, pytest.mark.xfail(strict=True, reason=XF + "player_role not implemented"))
+@_mark(*integration)
 def test_real_mahomes_passer_week1_matches_direct_count():
     gsis = _real("SELECT gsis_id FROM players WHERE display_name='Patrick Mahomes'")[0][0]
     direct = _real("SELECT COUNT(*) FROM plays WHERE season=2024 AND week=1 "
@@ -747,7 +723,7 @@ def test_real_mahomes_passer_week1_matches_direct_count():
     assert all(r["passer_player_id"] == gsis for r in res["rows"])
 
 
-@_mark(*integration, pytest.mark.xfail(strict=True, reason=XF + "server.py play_type enum incomplete"))
+@_mark(*integration)
 def test_real_schema_enum_equals_distinct_play_types():
     real = {r[0] for r in _real("SELECT DISTINCT play_type FROM plays WHERE play_type IS NOT NULL")}
     assert real == REAL_PLAY_TYPES

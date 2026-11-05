@@ -46,7 +46,7 @@ PLAY_COLS = {
     "play_type": "VARCHAR", "down": "DOUBLE", "ydstogo": "DOUBLE", "yardline_100": "DOUBLE",
     "qtr": "DOUBLE", "half_seconds_remaining": "DOUBLE", "game_seconds_remaining": "DOUBLE",
     "goal_to_go": "INTEGER", "shotgun": "INTEGER", "no_huddle": "INTEGER",
-    "score_differential": "DOUBLE", "wp": "DOUBLE", "desc": "VARCHAR", "epa": "DOUBLE",
+    "score_differential": "DOUBLE", "wp": "DOUBLE", "wpa": "DOUBLE", "desc": "VARCHAR", "epa": "DOUBLE",
     "yards_gained": "DOUBLE", "passer_player_name": "VARCHAR", "passer_player_id": "VARCHAR",
     "rusher_player_name": "VARCHAR", "rusher_player_id": "VARCHAR",
     "receiver_player_name": "VARCHAR", "receiver_player_id": "VARCHAR",

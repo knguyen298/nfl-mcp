@@ -236,9 +236,13 @@ TOOLS = [
     Tool(
         name="nfl_search_plays",
         description=(
-            "PREFERRED for finding specific plays. Search by player, team, season, "
-            "week, play type, situation, touchdowns, turnovers, or minimum yards. "
-            "Returns plays sorted by impact (EPA). Use this instead of nfl_query "
+            "PREFERRED for finding specific plays. Search by player (and the role the "
+            "player had in the play), team, season, week, play type, situation (red zone, "
+            "third/fourth down, two-minute drill, goal to go), down, quarter, field "
+            "position, score differential, shotgun, no-huddle, or win probability, plus "
+            "touchdowns, turnovers or minimum yards. Rows carry the game and play ids and "
+            "the passer, rusher and receiver ids. Sorted by impact (ABS EPA) unless sort_by says "
+            "otherwise; page with limit and offset. Use this instead of nfl_query "
             "whenever looking for plays."
         ),
         inputSchema={
@@ -254,7 +258,28 @@ TOOLS = [
                 },
                 "player": {
                     "type": "string",
-                    "description": "Player name (partial match, e.g. 'Mahomes', 'J.Jefferson')",
+                    "description": (
+                        "Player name, e.g. 'Mahomes', 'Patrick Mahomes' or 'J.Jefferson'. It "
+                        "resolves through the players table. A name that matches several "
+                        "players returns ambiguous candidates; then pass player_id. The team "
+                        "argument does not narrow the name (team is the offense)."
+                    ),
+                },
+                "player_id": {
+                    "type": "string",
+                    "description": "Player gsis_id (from nfl_player_lookup). Takes precedence over a name.",
+                },
+                "player_role": {
+                    "type": "string",
+                    "enum": ["passer", "rusher", "receiver", "any_offense", "defender",
+                             "kicker", "punter", "returner", "any"],
+                    "description": (
+                        "Role the player had in the play. Needs player or player_id. passer, "
+                        "rusher, receiver: that id column. any_offense: any of the three. "
+                        "defender: sack, tackle, assist, interception, pass defense, forced "
+                        "fumble, QB hit or tackle for loss. kicker, punter. returner: kickoff "
+                        "or punt returner. any (default): every role."
+                    ),
                 },
                 "season": {
                     "type": "integer",
@@ -279,13 +304,20 @@ TOOLS = [
                 },
                 "play_type": {
                     "type": "string",
-                    "enum": ["pass", "run", "field_goal", "punt", "kickoff"],
-                    "description": "Type of play",
+                    "enum": ["pass", "run", "field_goal", "punt", "kickoff", "extra_point",
+                             "qb_kneel", "qb_spike", "no_play"],
+                    "description": "Type of play. Plays with no type are never selected by this filter.",
                 },
                 "situation": {
                     "type": "string",
-                    "enum": ["red_zone", "third_down", "fourth_down", "two_minute"],
-                    "description": "Game situation filter",
+                    "enum": ["red_zone", "third_down", "fourth_down", "two_minute",
+                             "two_minute_half", "two_minute_game", "goal_to_go"],
+                    "description": (
+                        "Game situation. red_zone: yardline_100 <= 20. third_down, fourth_down. "
+                        "two_minute: 2:00 or less left in the half in quarter 2, 4 or overtime. "
+                        "two_minute_half: quarter 2 only. two_minute_game: quarter 4 and overtime. "
+                        "goal_to_go."
+                    ),
                 },
                 "is_touchdown": {
                     "type": "boolean",
@@ -299,10 +331,50 @@ TOOLS = [
                     "type": "integer",
                     "description": "Minimum yards gained",
                 },
+                "down": {"type": "integer", "description": "Down (1-4)."},
+                "qtr": {"type": "integer", "description": "Quarter (1-4; 5 is overtime)."},
+                "min_yardline_100": {
+                    "type": "number",
+                    "description": "Minimum yards from the opponent end zone (inclusive; 1 is the goal line, 99 is own 1).",
+                },
+                "max_yardline_100": {
+                    "type": "number",
+                    "description": "Maximum yards from the opponent end zone (inclusive).",
+                },
+                "min_score_differential": {
+                    "type": "number",
+                    "description": "Minimum offense lead (offense score minus defense score), inclusive. Negative means trailing.",
+                },
+                "max_score_differential": {
+                    "type": "number",
+                    "description": "Maximum offense lead, inclusive.",
+                },
+                "shotgun": {"type": "boolean", "description": "true: shotgun plays only. false: not in shotgun."},
+                "no_huddle": {"type": "boolean", "description": "true: no-huddle plays only. false: huddle plays."},
+                "min_wp": {"type": "number", "description": "Minimum offense win probability (0-1), inclusive."},
+                "max_wp": {"type": "number", "description": "Maximum offense win probability (0-1), inclusive."},
+                "sort_by": {
+                    "type": "string",
+                    "enum": ["abs_epa", "epa", "wpa", "yards_gained", "game_order"],
+                    "default": "abs_epa",
+                    "description": (
+                        "abs_epa (default): biggest EPA swing first, either direction. epa, wpa, "
+                        "yards_gained: highest first. game_order: game_id then play_id ascending."
+                    ),
+                },
+                "columns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Extra plays columns to return (for example air_yards, cpoe), checked "
+                        "against the live schema. An unknown name returns an error with did_you_mean."
+                    ),
+                },
                 "max_rows": {
                     "type": "integer",
-                    "description": "Max results (default 50, max 500)",
-                    "default": 50,
+                    "description": "Alias of limit, kept for older callers.",
+                    "minimum": 1,
+                    "maximum": 500,
                 },
             },
         },
@@ -961,6 +1033,31 @@ TOOLS = [
         },
     ),
 ]
+
+
+# Every list tool pages the same way. The tool returns count, truncated and, when more
+# rows match, a hint that names offset and nfl_query.
+_PAGED_TOOLS = frozenset({
+    "nfl_roster", "nfl_injuries", "nfl_schedule", "nfl_snap_counts", "nfl_fantasy_opportunity",
+    "nfl_fantasy_rankings", "nfl_search_plays", "nfl_td_luck", "nfl_role_trend",
+    "nfl_separation_opportunity", "nfl_drop_rate", "nfl_contract_value", "nfl_injury_return",
+    "nfl_team_records",
+})
+_PAGE_SENTENCE = (
+    " Paged: limit (1-500, default 100) and offset. The result has count and truncated; when "
+    "truncated is true, hint names the next offset."
+)
+for _tool in TOOLS:
+    if _tool.name in _PAGED_TOOLS:
+        _tool.inputSchema["properties"]["limit"] = {
+            "type": "integer", "minimum": 1, "maximum": 500, "default": 100,
+            "description": "Max rows on this page (default 100, max 500).",
+        }
+        _tool.inputSchema["properties"]["offset"] = {
+            "type": "integer", "minimum": 0, "default": 0,
+            "description": "Rows to skip, for the next page (default 0).",
+        }
+        _tool.description += _PAGE_SENTENCE
 
 
 @_mcp_server.list_tools()
