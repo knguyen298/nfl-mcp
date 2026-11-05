@@ -369,6 +369,24 @@ def test_columns_match_row_keys(db, sql):
         assert list(row) == names
 
 
+def test_duplicate_column_names_made_unique(db):
+    result = nfl_query("SELECT 1 AS a, 2 AS a")
+    assert [c["name"] for c in result["columns"]] == ["a", "a_1"]
+    assert result["rows"] == [{"a": 1, "a_1": 2}]
+
+
+def test_self_join_keeps_every_column(db):
+    result = nfl_query(
+        "SELECT * FROM plays a JOIN plays b ON a.game_id = b.game_id AND a.play_id = b.play_id"
+    )
+    names = [c["name"] for c in result["columns"]]
+    assert len(names) == 2 * len(PLAYS_COLUMNS) == len(set(names))  # 10 + 10, all unique
+    assert result["row_count"] == 12  # each play joins only itself
+    for row in result["rows"]:
+        assert list(row) == names
+        assert row["game_id"] == row["game_id_1"] and row["epa"] == row["epa_1"]
+
+
 # ── 6. Error detail ────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("sql,unknown,expected", [
@@ -404,3 +422,38 @@ def test_timeout_enforced(db, monkeypatch):
         "SELECT sum(a.range + b.range) AS s FROM range(1000000) a CROSS JOIN range(1000000) b"
     )
     assert "timeout" in result.get("error", "").lower(), result
+
+
+# ── 8. EXPLAIN gate, non-string sql ────────────────────────────────────────────
+
+@pytest.mark.parametrize("sql", [
+    "EXPLAIN SELECT count(*) FROM plays",
+    "EXPLAIN ANALYZE SELECT count(*) FROM plays",
+    "/* c */ explain analyze SELECT count(*) FROM plays;",
+])
+def test_explain_of_select_allowed(db, sql):
+    assert "error" not in nfl_query(sql)
+
+
+@pytest.mark.parametrize("sql,stype", [
+    ("EXPLAIN COPY (SELECT 1) TO '{tmp}/out.csv'", "COPY"),
+    ("EXPLAIN ANALYZE COPY (SELECT 1) TO '{tmp}/out.csv'", "COPY"),
+    ("EXPLAIN ANALYZE CREATE TEMP TABLE z AS SELECT 1", "CREATE"),
+    ("explain (analyze) INSERT INTO plays SELECT * FROM plays", "INSERT"),
+])
+def test_explain_of_write_rejected(db, tmp_path, sql, stype):
+    result = nfl_query(sql.format(tmp=tmp_path))
+    assert result.get("statement_type") == stype, result
+    assert stype in result["error"].upper()
+    assert _plays_count(db) == 12
+    assert not (tmp_path / "out.csv").exists()
+
+
+@pytest.mark.parametrize("bad", [None, 123])
+def test_non_string_sql_returns_error(db, bad):
+    assert nfl_query(bad) == {"error": "sql must be a string"}
+
+
+def test_infinite_timeout_env_falls_back(monkeypatch):
+    monkeypatch.setenv("NFL_MCP_QUERY_TIMEOUT_SECONDS", "inf")
+    assert tools._query_timeout() == tools._QUERY_TIMEOUT_SECONDS

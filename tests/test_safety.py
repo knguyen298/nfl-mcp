@@ -39,6 +39,14 @@ class TestNflQueryGuardrails:
         result = nfl_query("SELECT 1; COPY plays TO '/tmp/dump'")
         assert "error" in result
 
+    def test_rejects_pg_read_file(self):
+        result = nfl_query("SELECT pg_read_file('/etc/passwd')")
+        assert "error" in result
+
+    def test_rejects_pg_read_binary_file(self):
+        result = nfl_query("SELECT pg_read_binary_file('/etc/passwd')")
+        assert "error" in result
+
     def test_allows_trailing_semicolon(self):
         # A single trailing semicolon is one statement, not rejected
         result = nfl_query("SELECT 1;")
