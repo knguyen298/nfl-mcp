@@ -281,7 +281,8 @@ def upgrade(db_path, check_only, no_fetch):
         click.secho("Database is current.", fg="green")
         return
 
-    if not os.access(path, os.W_OK):
+    # os.access is always true for root, so also look at the mode bits of the real file.
+    if not os.access(path, os.W_OK) or path.resolve().stat().st_mode & 0o222 == 0:
         raise click.ClickException(
             f"{path} is read-only. The active container slot is read-only on purpose; "
             "the next update_db.sh run upgrades a copy of it.")

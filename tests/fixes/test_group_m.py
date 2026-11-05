@@ -159,7 +159,19 @@ SCHEMA = {
              "rush_touchdown:D two_point_attempt:D fumble:D complete_pass:D "
              "passer_player_name:V passing_yards:D receiver_player_id:V receiver_player_name:V "
              "receiving_yards:D rusher_player_name:V rushing_yards:D fumbled_1_team:V season:I "
-             "cpoe:D away_score:I home_score:I pass:D first_down:D special:D name:V fantasy:V",
+             "cpoe:D away_score:I home_score:I pass:D first_down:D special:D name:V fantasy:V "
+             # group I: nfl_search_plays filters, sort keys and the role id columns
+             "goal_to_go:D score_differential:D wp:D wpa:D passer_player_id:V "
+             "rusher_player_id:V kicker_player_id:V punter_player_id:V "
+             "kickoff_returner_player_id:V punt_returner_player_id:V sack_player_id:V "
+             "half_sack_1_player_id:V half_sack_2_player_id:V solo_tackle_1_player_id:V "
+             "solo_tackle_2_player_id:V assist_tackle_1_player_id:V assist_tackle_2_player_id:V "
+             "assist_tackle_3_player_id:V assist_tackle_4_player_id:V "
+             "tackle_with_assist_1_player_id:V tackle_with_assist_2_player_id:V "
+             "interception_player_id:V pass_defense_1_player_id:V pass_defense_2_player_id:V "
+             "forced_fumble_player_1_player_id:V forced_fumble_player_2_player_id:V "
+             "qb_hit_1_player_id:V qb_hit_2_player_id:V tackle_for_loss_1_player_id:V "
+             "tackle_for_loss_2_player_id:V",
     "schedules": "game_id:V season:I game_type:V week:I gameday:V gametime:V away_team:V "
                  "away_score:I home_team:V home_score:I result:I overtime:I spread_line:D "
                  "total_line:D div_game:I roof:V surface:V temp:I wind:I away_coach:V "
@@ -1056,7 +1068,7 @@ def test_raw_missing_column_reingests_metadata_seasons_fresh(tmp_path, monkeypat
                     drop_columns={"rosters": ["college"]})
     fake = FakeNfl().install(monkeypatch)
     result = _upgrade(path)
-    assert result.ran == ["raw_columns"] and result.stamped
+    assert result.ran == ["raw_columns", "derived_tables"] and result.stamped
     # 2022 and 2023 are recorded as loaded and are not the current season, so only
     # fresh=True re-fetches them.
     assert fake.seasons("load_rosters") == {2022, 2023}
@@ -1090,7 +1102,7 @@ def test_raw_missing_static_table_loads_once(tmp_path, monkeypatch):
     fake = FakeNfl().install(monkeypatch)
     result = _upgrade(path)
     assert [(c[1], c[2].get("type")) for c in fake.named("load_ff_rankings")] == [(None, "week")]
-    assert result.ran == ["raw_columns"] and result.stamped
+    assert result.ran == ["raw_columns", "derived_tables"] and result.stamped
 
 
 def test_raw_missing_column_and_table_reingest_both(tmp_path, monkeypatch):
@@ -1116,6 +1128,40 @@ def test_missing_derived_source_table_is_complete_after_two_runs(tmp_path, monke
         assert {"players", "player_role_trend", "injury_return_curve"} <= set(_columns(con))
     finally:
         con.close()
+
+
+def test_raw_columns_run_always_rebuilds_derived_tables_after(tmp_path, monkeypatch):
+    # No structural gap in the derived tables, but the raw data was reloaded: the derived
+    # tables are rebuilt after it, once, and listed once in ran.
+    path = build_db(tmp_path / "r.duckdb", drop_columns={"rosters": ["college"]})
+    FakeNfl().install(monkeypatch)
+    order = []
+    real_run = _migrate()._ACTIONS["raw_columns"]
+    monkeypatch.setitem(_migrate()._ACTIONS, "raw_columns",
+                        lambda conn: (order.append("raw"), real_run(conn)))
+    real_rebuild = ing.rebuild_derived_tables
+    monkeypatch.setattr(ing, "rebuild_derived_tables",
+                        lambda conn: (order.append("derived"), real_rebuild(conn)))
+    result = _upgrade(path)
+    assert order == ["raw", "derived"]
+    assert result.ran == ["raw_columns", "derived_tables"] and result.stamped
+
+
+def test_derived_failure_before_raw_columns_is_cleared_by_the_rebuild_after(tmp_path, monkeypatch):
+    path = build_db(tmp_path / "r.duckdb", derived="v0", drop_columns={"rosters": ["college"]})
+    FakeNfl().install(monkeypatch)
+    real_rebuild = ing.rebuild_derived_tables
+    calls = []
+
+    def flaky(conn):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("first rebuild fails")
+        return real_rebuild(conn)
+    monkeypatch.setattr(ing, "rebuild_derived_tables", flaky)
+    result = _upgrade(path)
+    assert len(calls) == 2
+    assert result.failed == [] and result.ran == ["raw_columns", "derived_tables"] and result.stamped
 
 
 # ── newer database ──
@@ -1157,6 +1203,16 @@ def test_stamp_if_current_on_stamped_database_adds_no_row(tmp_path):
     with _rw(path) as con:
         assert _migrate().stamp_if_current(con) is False
     assert _versions(path) == [1]
+
+
+def test_stamp_if_current_logs_one_warning_when_the_check_raises(tmp_path, monkeypatch, caplog):
+    path = current_synth(tmp_path, versions=None)
+    monkeypatch.setattr(_migrate(), "check", lambda conn: (_ for _ in ()).throw(RuntimeError("boom")))
+    with _rw(path) as con, caplog.at_level(logging.WARNING, logger="nfl-mcp"):
+        assert _migrate().stamp_if_current(con) is False
+    hits = [r for r in caplog.records if r.levelno == logging.WARNING and "boom" in r.getMessage()]
+    assert len(hits) == 1, caplog.records
+    assert _versions(path) == []
 
 
 @pytest.mark.parametrize("kw", [
@@ -1400,6 +1456,33 @@ def test_cli_upgrade_read_only_file_is_refused(tmp_path, monkeypatch):
     assert "read-only" in out and "update_db.sh" in out, out
     assert (path.stat().st_mtime_ns, path.stat().st_size) == before
     assert fake.calls == [] and not Path(f"{path}.wal").exists()
+
+
+def test_cli_upgrade_refuses_a_file_with_no_write_bits_even_when_access_says_yes(
+        tmp_path, monkeypatch):
+    # Root passes os.access(W_OK) on a 0444 file; the mode bits must still refuse it.
+    path = v0_synth(tmp_path)
+    path.chmod(0o444)
+    monkeypatch.setattr(os, "access", lambda *a, **k: True)
+    fake = FakeNfl().install(monkeypatch)
+    before = (path.stat().st_mtime_ns, path.stat().st_size)
+    result, out = _cli("upgrade", "--db", path)
+    assert result.exit_code == 1, out
+    assert str(path) in out and "read-only" in out and "update_db.sh" in out
+    assert (path.stat().st_mtime_ns, path.stat().st_size) == before
+    assert fake.calls == [] and not Path(f"{path}.wal").exists()
+
+
+def test_cli_upgrade_refuses_a_symlink_to_a_read_only_slot(tmp_path, monkeypatch):
+    # The served path is a symlink; the slot behind it is the file whose mode counts.
+    slot = v0_synth(tmp_path)
+    slot.chmod(0o444)
+    link = tmp_path / "active.duckdb"
+    link.symlink_to(slot.name)
+    monkeypatch.setattr(os, "access", lambda *a, **k: True)
+    result, out = _cli("upgrade", "--db", link)
+    assert result.exit_code == 1 and "read-only" in out, out
+    assert _versions(slot) == []
 
 
 @pytest.mark.integration

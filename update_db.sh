@@ -9,6 +9,14 @@ if [ ! -L "$SYMLINK" ]; then
     exit 1
 fi
 
+# One update at a time: a cron run that starts while the boot-time update is still working
+# would pick the same idle slot and delete the file the first run has open.
+exec 9>"$DB_DIR/.update.lock"
+if ! flock -n 9; then
+    echo "[$(date -u)] Another update is already running; skipping this run."
+    exit 0
+fi
+
 CURRENT=$(readlink "$SYMLINK")
 
 if [ "$CURRENT" = "nflread_a.duckdb" ]; then

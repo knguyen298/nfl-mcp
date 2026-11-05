@@ -11,11 +11,14 @@ derived tables, a season on every depth_charts row, and every REQUIRED_COLUMNS t
 """
 
 import datetime
+import logging
 from dataclasses import dataclass, field
 
 from . import __version__
 from .registry import REGISTRY
 from .required_columns import REQUIRED_COLUMNS
+
+logger = logging.getLogger("nfl-mcp")
 
 SCHEMA_VERSION = 1
 
@@ -163,7 +166,8 @@ def stamp_if_current(conn) -> bool:
         if not _stampable(check(conn)):
             return False
         _stamp(conn)
-    except Exception:  # noqa: BLE001 - a stamp is a courtesy, never a reason to fail a caller
+    except Exception as e:  # noqa: BLE001 - a stamp is a courtesy, never a reason to fail a caller
+        logger.warning("Schema version not stamped: %s", e)
         return False
     return True
 
@@ -250,10 +254,6 @@ _ACTIONS = {"derived_tables": _run_derived, "depth_charts_season": _run_depth,
 
 # ── upgrade ────────────────────────────────────────────────────────────────────
 
-def _needs(status: UpgradeStatus, name: str) -> bool:
-    return any(s.name == name and s.needed for s in status.steps)
-
-
 def upgrade(conn, *, fetch: bool = True) -> UpgradeResult:
     """Run the needed steps in order, then stamp SCHEMA_VERSION when none is left.
 
@@ -287,9 +287,9 @@ def upgrade(conn, *, fetch: bool = True) -> UpgradeResult:
             result.pending.append(step.name)
             continue
         run(step.name)
-    # New raw data can change what the derived tables are built from (a missing source
-    # table): finish in the same run rather than leaving a second one.
-    if "raw_columns" in result.ran and _needs(check(conn), "derived_tables"):
+    # New raw data changes what the derived tables are built from: rebuild them once more
+    # so this run leaves them current, whether or not a structural gap remains.
+    if "raw_columns" in result.ran:
         run("derived_tables")
 
     after = check(conn)
