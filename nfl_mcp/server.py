@@ -5,18 +5,31 @@ Tools: nfl_schema, nfl_status, nfl_query, nfl_search_plays, nfl_team_stats, nfl_
 """
 
 import contextlib
+import datetime as dt
+import functools
+import hmac
+import json
 import logging
+import math
+import os
+import time
+import traceback
 from collections.abc import AsyncIterator
+from decimal import Decimal
 from typing import Any
 
+import anyio
+from anyio import to_thread
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp.types import TextContent, Tool
+from mcp.types import CallToolResult, TextContent, Tool
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from .database import get_db_connection
 from .tools import (
     nfl_schema, nfl_status, nfl_query, nfl_search_plays,
     nfl_team_stats, nfl_player_stats, nfl_compare,
@@ -32,25 +45,123 @@ logger = logging.getLogger("nfl-mcp")
 
 _mcp_server = Server("nfl-mcp")
 
+_DEFAULT_MAX_CONCURRENT = 2
+_LOG_FIELD_CHARS = 200
+_LOG_MESSAGE_CHARS = 800
+_LOG_TRACE_LINE_CHARS = 300
+_TOOL_LIMITER: anyio.CapacityLimiter | None = None
+
+
+class _CutLongRecords(logging.Filter):
+    """Cut oversized messages and traceback lines (a pasted SQL statement can be thousands of chars)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if len(message) > _LOG_MESSAGE_CHARS:
+            record.msg, record.args = message[:_LOG_MESSAGE_CHARS] + "...", None
+        if record.exc_info and not record.exc_text:
+            lines = "".join(traceback.format_exception(*record.exc_info)).rstrip().splitlines()
+            record.exc_text = "\n".join(_cut(line, _LOG_TRACE_LINE_CHARS) for line in lines)
+        return True
+
+
+logger.addFilter(_CutLongRecords())
+
+
+def _cut(text: Any, limit: int = _LOG_FIELD_CHARS) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _clean(obj: Any) -> Any:
+    """Make a value strict-JSON safe: NaN/Inf -> None, Decimal -> number, dates -> ISO 8601."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, Decimal):
+        if not obj.is_finite():
+            return None
+        return int(obj) if obj == obj.to_integral_value() and obj.as_tuple().exponent >= 0 else float(obj)
+    if isinstance(obj, (dt.datetime, dt.date, dt.time)):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: _clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean(v) for v in obj]
+    return obj
+
+
+def to_json(obj: Any) -> str:
+    """Serialize a tool result as compact, strict JSON (no NaN/Infinity, no indentation)."""
+    return json.dumps(_clean(obj), allow_nan=False, default=str)
+
+
+def get_tool_limiter() -> anyio.CapacityLimiter:
+    """Return the limiter shared by all tool calls, created on first use inside the running loop."""
+    global _TOOL_LIMITER
+    if _TOOL_LIMITER is None:
+        raw = os.getenv("NFL_MCP_MAX_CONCURRENT_QUERIES")
+        try:
+            tokens = int(raw) if raw else _DEFAULT_MAX_CONCURRENT
+        except ValueError:
+            tokens = 0
+        if tokens < 1:
+            logger.warning("Invalid NFL_MCP_MAX_CONCURRENT_QUERIES=%r; using %d",
+                           _cut(raw, 40), _DEFAULT_MAX_CONCURRENT)
+            tokens = _DEFAULT_MAX_CONCURRENT
+        _TOOL_LIMITER = anyio.CapacityLimiter(tokens)
+    return _TOOL_LIMITER
+
+
+def _error_payload(code: str, message: str, **details: Any) -> dict[str, Any]:
+    """The one error shape: top-level error and code, everything else under details."""
+    return {"error": message, "code": code, "details": details}
+
 
 def _tool_error_payload(tool_name: str, exc: Exception) -> dict[str, Any]:
-    if isinstance(exc, ValueError) and str(exc).startswith("Unknown tool:"):
-        code = "UNKNOWN_TOOL"
-    elif isinstance(exc, TimeoutError):
+    if isinstance(exc, TimeoutError):
         code = "TIMEOUT"
     elif isinstance(exc, TypeError):
         code = "INVALID_ARGUMENTS"
     else:
         code = "TOOL_EXECUTION_ERROR"
-    return {
-        "ok": False,
-        "error": {
-            "code": code,
-            "type": type(exc).__name__,
-            "message": str(exc),
-            "tool": tool_name,
-        },
-    }
+    return _error_payload(code, str(exc), tool=tool_name, type=type(exc).__name__)
+
+
+def _failure_from_result(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Convert a tool's {"error": ...} dict into the one error shape."""
+    extras = {k: v for k, v in result.items() if k not in ("error", "code")}
+    message = str(result["error"])
+    code = result.get("code")
+    if not isinstance(code, str):
+        code = "TIMEOUT" if "timeout" in message.lower() else "TOOL_ERROR"
+    return _error_payload(code, message, tool=tool_name, **extras)
+
+
+def _row_count(result: Any) -> Any:
+    if isinstance(result, dict):
+        for key in ("row_count", "count"):
+            if isinstance(result.get(key), int):
+                return result[key]
+        for value in result.values():
+            if isinstance(value, list):
+                return len(value)
+    return "-"
+
+
+def _log_call(name: str, arguments: dict, started: float, result: Any, failure: dict | None) -> None:
+    """One INFO record per call: tool, duration, rows, truncated, and error/code on failure."""
+    parts = [
+        f"tool={name}",
+        f"duration_ms={(time.perf_counter() - started) * 1000:.1f}",
+        f"rows={_row_count(result)}",
+    ]
+    truncated = result.get("truncated") if isinstance(result, dict) else None
+    parts.append(f"truncated={str(truncated).lower() if isinstance(truncated, bool) else '-'}")
+    if failure is not None:
+        parts += [f"code={failure['code']}", f"error={_cut(failure['error'])!r}"]
+    if arguments:
+        parts.append(f"args={_cut(to_json(arguments))}")
+    logger.info(" ".join(parts))
 
 
 TOOLS = [
@@ -747,9 +858,7 @@ async def list_tools() -> list[Tool]:
 
 
 @_mcp_server.call_tool()
-async def call_tool(name: str, arguments: Any) -> list[TextContent]:
-    import json
-
+async def call_tool(name: str, arguments: Any) -> CallToolResult:
     _DISPATCH = {
         "nfl_schema":       nfl_schema,
         "nfl_status":       nfl_status,
@@ -775,20 +884,81 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         "nfl_team_records":         nfl_team_records,
     }
 
-    try:
-        fn = _DISPATCH.get(name)
-        if fn is None:
-            raise ValueError(f"Unknown tool: {name}")
-        result = fn(**arguments) if arguments else fn()
-        return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+    started = time.perf_counter()
+    args = arguments if isinstance(arguments, dict) else {}
+    result: Any = None
+    failure: dict[str, Any] | None = None
 
+    fn = _DISPATCH.get(name)
+    tool = next((t for t in TOOLS if t.name == name), None)
+    if fn is None:
+        failure = _error_payload("UNKNOWN_TOOL", f"Unknown tool: {name}", tool=name)
+    elif arguments is not None and not isinstance(arguments, dict):
+        failure = _error_payload("INVALID_ARGUMENTS", "Tool arguments must be a JSON object.", tool=name)
+    else:
+        valid = list(tool.inputSchema.get("properties", {})) if tool else None
+        unknown = [a for a in args if valid is not None and a not in valid]
+        if unknown:
+            listed = ", ".join(valid) if valid else "none (this tool takes no arguments)"
+            failure = _error_payload(
+                "INVALID_ARGUMENTS",
+                f"Unknown argument{'s' if len(unknown) > 1 else ''} {', '.join(repr(a) for a in unknown)} "
+                f"for {name}. Valid arguments: {listed}.",
+                tool=name, unknown=unknown, valid=valid,
+            )
+
+    if failure is None:
+        try:
+            result = await to_thread.run_sync(functools.partial(fn, **args), limiter=get_tool_limiter())
+        except Exception as e:
+            logger.error("Tool %s raised %s: %s", name, type(e).__name__, _cut(e), exc_info=True)
+            failure = _tool_error_payload(name, e)
+        else:
+            if isinstance(result, dict) and "error" in result:
+                failure = _failure_from_result(name, result)
+
+    _log_call(name, args, started, result, failure)
+    payload = failure if failure is not None else result
+    return CallToolResult(content=[TextContent(type="text", text=to_json(payload))],
+                          isError=failure is not None)
+
+
+class _BearerAuth:
+    """Pure ASGI middleware: every HTTP request needs `Authorization: Bearer <token>`."""
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.token = token.encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            header = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
+            scheme, _, supplied = header.partition(" ")
+            if scheme.lower() != "bearer" or not hmac.compare_digest(supplied.strip().encode(), self.token):
+                response = JSONResponse({"error": "Unauthorized", "code": "UNAUTHORIZED", "details": {}},
+                                        status_code=401, headers={"WWW-Authenticate": "Bearer"})
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+def _healthz(request) -> JSONResponse:
+    """200 when the database opens and answers SELECT 1, else 503."""
+    try:
+        with get_db_connection() as conn:
+            conn.execute("SELECT 1").fetchone()
     except Exception as e:
-        logger.error(f"Error in {name}: {e}", exc_info=True)
-        return [TextContent(type="text", text=json.dumps(_tool_error_payload(name, e), indent=2))]
+        logger.warning("Health check failed: %s", _cut(e), exc_info=True)
+        return JSONResponse({"ok": False, "error": type(e).__name__}, status_code=503)
+    return JSONResponse({"ok": True})
 
 
 def create_app() -> Starlette:
-    """Return a Starlette ASGI app that serves the MCP server over Streamable HTTP."""
+    """Return a Starlette ASGI app that serves the MCP server over Streamable HTTP.
+
+    NFL_MCP_AUTH_TOKEN (bearer auth on every route) and NFL_MCP_CORS_ORIGINS
+    (comma-separated) are read here, when the app is built.
+    """
     session_manager = StreamableHTTPSessionManager(
         app=_mcp_server,
         json_response=False,
@@ -804,22 +974,35 @@ def create_app() -> Starlette:
 
     from mcp.server.fastmcp.server import StreamableHTTPASGIApp
 
+    origins = [o.strip() for o in os.getenv("NFL_MCP_CORS_ORIGINS", "").split(",") if o.strip()]
+    if not origins:
+        logger.warning("NFL_MCP_CORS_ORIGINS is not set; CORS allows every origin. "
+                       "Set it to a comma-separated list of origins to restrict browser access.")
+        origins = ["*"]
+
     # Browser-based clients (e.g. MCP Inspector) send a CORS preflight OPTIONS
     # request before every call. Without this middleware those preflights get
     # 405 Method Not Allowed and the connection never establishes. Expose
     # Mcp-Session-Id so the browser can read it back from responses.
+    # CORS is outermost so preflights are answered without a token and 401s carry CORS headers.
     middleware = [
         Middleware(
             CORSMiddleware,
-            allow_origins=["*"],
+            allow_origins=origins,
             allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
             allow_headers=["*"],
             expose_headers=["Mcp-Session-Id"],
         )
     ]
+    token = os.getenv("NFL_MCP_AUTH_TOKEN")
+    if token:
+        middleware.append(Middleware(_BearerAuth, token=token))
 
     return Starlette(
         lifespan=lifespan,
         middleware=middleware,
-        routes=[Route("/mcp", endpoint=StreamableHTTPASGIApp(session_manager))],
+        routes=[
+            Route("/mcp", endpoint=StreamableHTTPASGIApp(session_manager)),
+            Route("/healthz", endpoint=_healthz, methods=["GET"]),
+        ],
     )

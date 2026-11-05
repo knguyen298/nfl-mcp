@@ -11,6 +11,7 @@ NFL MCP Server tools:
 
 import difflib
 import logging
+import os
 import re
 import threading
 from collections.abc import Iterable, Sequence
@@ -588,20 +589,38 @@ def nfl_compare(
         return {"error": str(e)}
 
 
+def _query_timeout() -> float:
+    """Seconds a query may run. NFL_MCP_QUERY_TIMEOUT_SECONDS is read on every call."""
+    raw = os.getenv("NFL_MCP_QUERY_TIMEOUT_SECONDS")
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+        logger.warning("Ignoring invalid NFL_MCP_QUERY_TIMEOUT_SECONDS=%r", raw[:40])
+    return _QUERY_TIMEOUT_SECONDS
+
+
 def _execute(sql: str, params: Sequence[Any] | None = None) -> list[dict]:
     """Execute SQL on DuckDB with timeout and cancellation.
 
     Runs in a worker thread with a dedicated connection, and interrupts
     the active query if it exceeds the timeout.
     """
+    timeout = _query_timeout()
     result = [None]
     error = [None]
     thread_conn = [None]
+    cancelled = threading.Event()
 
     def _run():
         try:
             with get_db_connection() as conn:
                 thread_conn[0] = conn
+                if cancelled.is_set():
+                    return
                 if params is None:
                     rel = conn.execute(sql)
                 else:
@@ -613,16 +632,24 @@ def _execute(sql: str, params: Sequence[Any] | None = None) -> list[dict]:
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
-    t.join(timeout=_QUERY_TIMEOUT_SECONDS)
+    t.join(timeout=timeout)
     if t.is_alive():
-        conn = thread_conn[0]
-        if conn is not None:
-            try:
-                conn.interrupt()
-            except Exception:
-                logger.warning("Failed to interrupt timed out DuckDB query", exc_info=True)
-        t.join(timeout=1)
-        raise TimeoutError(f"Query exceeded {_QUERY_TIMEOUT_SECONDS} second timeout")
+        # Set first: a thread still opening its connection sees the flag and
+        # never starts the query. Otherwise it has a connection to interrupt.
+        cancelled.set()
+        for _ in range(4):
+            conn = thread_conn[0]
+            if conn is not None:
+                try:
+                    conn.interrupt()
+                except Exception:
+                    logger.warning("Failed to interrupt timed out DuckDB query", exc_info=True)
+            t.join(timeout=0.5)
+            if not t.is_alive():
+                break
+        else:
+            logger.warning("Timed out DuckDB query thread is still running after interrupt")
+        raise TimeoutError(f"Query exceeded {timeout:g} second timeout")
     if error[0]:
         raise error[0]
     return result[0]

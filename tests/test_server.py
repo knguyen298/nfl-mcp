@@ -6,24 +6,24 @@ import json
 from mcp.types import ListToolsRequest
 
 import nfl_mcp.server as server_module
-from nfl_mcp.server import _tool_error_payload, create_app
+from nfl_mcp.server import _error_payload, _tool_error_payload, create_app
 
 
 def test_error_payload_for_unknown_tool():
-    payload = _tool_error_payload("bad_tool", ValueError("Unknown tool: bad_tool"))
-    assert payload["ok"] is False
-    assert payload["error"]["code"] == "UNKNOWN_TOOL"
-    assert payload["error"]["tool"] == "bad_tool"
+    payload = _error_payload("UNKNOWN_TOOL", "Unknown tool: bad_tool", tool="bad_tool")
+    assert payload["error"] == "Unknown tool: bad_tool"
+    assert payload["code"] == "UNKNOWN_TOOL"
+    assert payload["details"]["tool"] == "bad_tool"
 
 
 def test_error_payload_for_timeout():
     payload = _tool_error_payload("nfl_query", TimeoutError("Query exceeded timeout"))
-    assert payload["error"]["code"] == "TIMEOUT"
+    assert payload["code"] == "TIMEOUT"
 
 
 def test_error_payload_for_invalid_arguments():
     payload = _tool_error_payload("nfl_query", TypeError("missing required argument"))
-    assert payload["error"]["code"] == "INVALID_ARGUMENTS"
+    assert payload["code"] == "INVALID_ARGUMENTS"
 
 
 def test_list_tools_returns_registered_tools():
@@ -39,15 +39,16 @@ def test_list_tools_registered_with_mcp_server():
 def test_call_tool_success_with_arguments(monkeypatch):
     monkeypatch.setattr(server_module, "nfl_query", lambda sql: {"rows": [{"sql": sql}]})
     result = asyncio.run(server_module.call_tool("nfl_query", {"sql": "SELECT 1"}))
-    payload = json.loads(result[0].text)
+    payload = json.loads(result.content[0].text)
+    assert result.isError is False
     assert payload["rows"][0]["sql"] == "SELECT 1"
 
 
 def test_call_tool_unknown_name_returns_error_payload():
     result = asyncio.run(server_module.call_tool("no_such_tool", {}))
-    payload = json.loads(result[0].text)
-    assert payload["ok"] is False
-    assert payload["error"]["code"] == "UNKNOWN_TOOL"
+    payload = json.loads(result.content[0].text)
+    assert result.isError is True
+    assert payload["code"] == "UNKNOWN_TOOL"
 
 
 def test_call_tool_tool_exception_returns_execution_error(monkeypatch):
@@ -56,10 +57,11 @@ def test_call_tool_tool_exception_returns_execution_error(monkeypatch):
 
     monkeypatch.setattr(server_module, "nfl_status", _boom)
     result = asyncio.run(server_module.call_tool("nfl_status", None))
-    payload = json.loads(result[0].text)
-    assert payload["ok"] is False
-    assert payload["error"]["code"] == "TOOL_EXECUTION_ERROR"
-    assert payload["error"]["tool"] == "nfl_status"
+    payload = json.loads(result.content[0].text)
+    assert result.isError is True
+    assert payload["code"] == "TOOL_EXECUTION_ERROR"
+    assert payload["error"] == "boom"
+    assert payload["details"]["tool"] == "nfl_status"
 
 
 def test_create_app_returns_starlette_app():
@@ -70,11 +72,13 @@ def test_create_app_returns_starlette_app():
     assert "/mcp" in route_paths
 
 
-def test_create_app_handles_cors_preflight():
+def test_create_app_handles_cors_preflight(monkeypatch):
     """Browser clients (e.g. MCP Inspector) send an OPTIONS preflight that must
-    not 405. The CORS middleware should answer it with permissive headers."""
+    not 405. With NFL_MCP_CORS_ORIGINS unset the CORS middleware answers it
+    with permissive headers."""
     from starlette.testclient import TestClient
 
+    monkeypatch.delenv("NFL_MCP_CORS_ORIGINS", raising=False)
     app = create_app()
     with TestClient(app) as client:
         resp = client.options(
@@ -140,7 +144,7 @@ def test_call_tool_dispatches_team_records(monkeypatch):
 
     monkeypatch.setattr(server_module, "nfl_team_records", fake)
     result = asyncio.run(server_module.call_tool("nfl_team_records", {"team": "OAK", "season": 1996}))
-    payload = json.loads(result[0].text)
+    payload = json.loads(result.content[0].text)
     assert payload["count"] == 1
     assert seen == {"team": "OAK", "season": 1996, "from_season": None, "to_season": None}
 
@@ -150,8 +154,6 @@ def test_every_exposed_tool_has_a_handler():
     exposed = {tool.name for tool in server_module.TOOLS}
     assert "nfl_team_records" in exposed
     for name in sorted(exposed):
-        payload = json.loads(asyncio.run(server_module.call_tool(name, {}))[0].text)
-        error = payload.get("error")
-        # Tools report failures as a plain string; only the server reports UNKNOWN_TOOL.
-        code = error.get("code") if isinstance(error, dict) else None
-        assert code != "UNKNOWN_TOOL", name
+        payload = json.loads(asyncio.run(server_module.call_tool(name, {})).content[0].text)
+        # Only the server reports UNKNOWN_TOOL.
+        assert payload.get("code") != "UNKNOWN_TOOL", name
