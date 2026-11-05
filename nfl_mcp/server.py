@@ -590,7 +590,7 @@ TOOLS = [
         name="nfl_roster",
         description=(
             "PREFERRED for roster questions. Look up who was on a team's roster "
-            "in a given season. Returns name, position, jersey number, experience, "
+            "in a given season. Returns name, gsis_id, position, jersey number, experience, "
             "college, height, and weight. Filter by team, season, and/or position."
         ),
         inputSchema={
@@ -616,8 +616,8 @@ TOOLS = [
         description=(
             "PREFERRED for injury report questions. Look up player injury status by "
             "team, season, week, player name, or report status (Out, Questionable, "
-            "Doubtful, Full Participation). Returns primary/secondary injuries and "
-            "both report and practice statuses."
+            "Doubtful, Full Participation). Returns name, gsis_id, season_type (REG or POST), "
+            "primary/secondary injuries and both report and practice statuses."
         ),
         inputSchema={
             "type": "object",
@@ -885,6 +885,11 @@ TOOLS = [
                 "position": {"type": "string", "description": "Position filter (e.g. WR, RB, TE)."},
                 "team": {"type": "string", "description": "Team abbreviation (e.g. KC). Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work."},
                 "season": {"type": "integer", "description": "Exact season year."},
+                "season_type": {
+                    "type": "string",
+                    "enum": ["REG", "POST"],
+                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Omit for both; each row says which it is.",
+                },
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
             },
         },
@@ -953,6 +958,11 @@ TOOLS = [
                 "player_id": {"type": "string", "description": "Player gsis_id (from nfl_player_lookup). Takes precedence over a name."},
                 "team": {"type": "string", "description": "Team abbreviation. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work."},
                 "season": {"type": "integer", "description": "Exact season year (2022+)."},
+                "season_type": {
+                    "type": "string",
+                    "enum": ["REG", "POST"],
+                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Omit for both; each row says which it is.",
+                },
                 "min_targets": {"type": "integer", "description": "Minimum catchable targets to qualify."},
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
             },
@@ -1057,13 +1067,12 @@ _PAGED_TOOLS = frozenset({
     "nfl_separation_opportunity", "nfl_drop_rate", "nfl_contract_value", "nfl_injury_return",
     "nfl_team_records",
 })
-# What one row is, and the id field the row is keyed on. Several source tables hold an id the
-# tool does not return; the sentence says so.
+# What one row is, and the id field the row is keyed on. When a source table holds an id the
+# tool does not return, the sentence says so.
 _GRAIN_SENTENCE = {
-    "nfl_roster": " Returns one row per player per team per season. The source id is gsis_id; "
-                  "rows do not carry it (nfl_player_lookup returns it).",
-    "nfl_injuries": " Returns one row per player per team per week. The source id is gsis_id; "
-                    "rows do not carry it (nfl_player_lookup returns it).",
+    "nfl_roster": " Returns one row per player per team per season. Each row carries gsis_id.",
+    "nfl_injuries": " Returns one row per player per team per week. Each row carries gsis_id and "
+                    "season_type (REG or POST).",
     "nfl_schedule": " Returns one row per game, identified by game_id.",
     "nfl_snap_counts": " Returns one row per player per game. Rows carry pfr_player_id, the "
                        "Pro Football Reference id, which is not the gsis_id (players maps one to "
@@ -1071,12 +1080,14 @@ _GRAIN_SENTENCE = {
     "nfl_fantasy_opportunity": " Returns one row per player per game. player_id is the gsis_id.",
     "nfl_fantasy_rankings": " Returns one row per player per ranking set. The weekly source table "
                             "has fantasypros_id; rows do not carry it, so match players by name.",
-    "nfl_td_luck": " Returns one row per player per season per season type (REG and POST rows both "
-                   "appear, and rows do not say which). player_id is the gsis_id.",
+    "nfl_td_luck": " Returns one row per player per season per season type. Both REG and POST rows "
+                   "appear unless season_type filters, and each row has a season_type. "
+                   "player_id is the gsis_id.",
     "nfl_role_trend": " Returns one row per player per week. player_id is the gsis_id.",
     "nfl_separation_opportunity": " Returns one row per player per season. player_id is the gsis_id.",
-    "nfl_drop_rate": " Returns one row per player per team per season per season type (REG and POST rows "
-                     "both appear, and rows do not say which). player_id is the gsis_id.",
+    "nfl_drop_rate": " Returns one row per player per team per season per season type. Both REG and "
+                     "POST rows appear unless season_type filters, and each row has a season_type. "
+                     "player_id is the gsis_id.",
     "nfl_contract_value": " Returns one row per player per season. player_id is the gsis_id.",
     "nfl_injury_return": " Returns one row per injury_type, position and week_post_return.",
     "nfl_team_records": " Returns one row per franchise per season, keyed on team.",

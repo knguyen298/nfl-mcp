@@ -92,7 +92,7 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
     ],
     # Derived analytic tables
     "player_td_luck": [
-        "player_id", "full_name", "position", "team", "season", "rec_td", "rec_td_exp",
+        "player_id", "full_name", "position", "team", "season", "season_type", "rec_td", "rec_td_exp",
         "rec_td_luck", "rush_td", "rush_td_exp", "rush_td_luck", "total_td_luck_score",
     ],
     "player_role_trend": [
@@ -109,7 +109,7 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
         "catch_percentage", "regression_candidate",
     ],
     "player_drop_rate": [
-        "player_id", "player", "team", "season", "catchable_targets", "drops",
+        "player_id", "player", "team", "season", "season_type", "catchable_targets", "drops",
         "drop_rate_pct", "contested_targets", "created_receptions",
     ],
     "player_contract_value": [

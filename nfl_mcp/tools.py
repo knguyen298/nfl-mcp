@@ -20,7 +20,7 @@ import re
 import threading
 import time
 import unicodedata
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
 from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any, Dict
@@ -186,6 +186,16 @@ def _play_season_type(value: Any) -> str | None:
         return key
     raise _BadArgument(
         f"Unknown season_type '{value}'. Use REG or POST; plays are stored as REG or POST only.")
+
+
+def _derived_season_type(value: Any) -> str | None:
+    """REG or POST for the derived player tables (nfl_td_luck, nfl_drop_rate), None for both."""
+    if value is None:
+        return None
+    key = value.strip().upper() if isinstance(value, str) else None
+    if key in ("REG", "POST"):
+        return key
+    raise _BadArgument(f"Unknown season_type '{value}'. Use REG or POST.")
 
 
 def _range_reason(
@@ -1183,6 +1193,38 @@ _STALE_ERROR = {
 }
 
 
+_STALE_PLAYER_TABLES = (
+    "Derived player tables predate season_type; rows blend REG and POST and carry no "
+    "season_type. Run 'nfl-mcp rebuild'."
+)
+_STALE_PLAYER_ERROR = {
+    "error": "Derived player tables are stale; run `nfl-mcp rebuild`",
+    "code": "STALE_DERIVED_TABLES",
+}
+
+
+def _season_typed_page(
+    build_sql: Callable[[bool], str],
+    params: list[Any],
+    limit: int,
+    offset: int,
+    season_type: str | None,
+) -> tuple[list[dict], dict, bool]:
+    """(rows, page, stale) for a derived player table. build_sql(has_season_type) gives the SQL.
+
+    A table built before season_type existed still answers a call without season_type (flagged
+    stale). A call that names a season_type raises _StaleDerivedTables on such a table.
+    """
+    try:
+        return (*_execute_limited(build_sql(True), params, limit, offset), False)
+    except duckdb.BinderException as e:
+        if 'column "season_type"' not in str(e):  # the message also quotes the SQL text
+            raise
+        if season_type is not None:
+            raise _StaleDerivedTables() from e
+    return (*_execute_limited(build_sql(False), params, limit, offset), True)
+
+
 def _team_rows(
     table: str,
     codes: Sequence[str],
@@ -1755,7 +1797,7 @@ def nfl_roster(
 ) -> Dict[str, Any]:
     """
     Look up roster data — who was on a team's roster in a given season.
-    Returns name, position, status, jersey number, experience, and measurables.
+    Returns name, gsis_id, position, status, jersey number, experience, and measurables.
     """
     limit, offset = _page_args(limit, offset)
     season = _int_arg("season", season)
@@ -1773,7 +1815,7 @@ def nfl_roster(
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
-        SELECT full_name, position, depth_chart_position, team, season,
+        SELECT full_name, gsis_id, position, depth_chart_position, team, season,
                jersey_number, status, years_exp, college, height, weight
         FROM rosters
         WHERE {where}
@@ -1823,7 +1865,10 @@ def nfl_injuries(
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
-        SELECT full_name, position, team, season, week,
+        SELECT full_name, gsis_id, position, team, season, week,
+               COALESCE(season_type, CASE game_type WHEN 'REG' THEN 'REG'
+                        WHEN 'WC' THEN 'POST' WHEN 'DIV' THEN 'POST'
+                        WHEN 'CON' THEN 'POST' WHEN 'SB' THEN 'POST' END) AS season_type,
                report_primary_injury, report_secondary_injury, report_status,
                practice_primary_injury, practice_secondary_injury, practice_status
         FROM injuries
@@ -2305,15 +2350,18 @@ def nfl_td_luck(
     limit: int = _DEFAULT_LIMIT,
     player_id: str | None = None,
     offset: int = 0,
+    season_type: str | None = None,
 ) -> Dict[str, Any]:
     """
     Touchdown luck — actual vs expected TDs per player-season from the
     player_td_luck table. Negative total_td_luck_score = scored fewer TDs than
     expected (positive-regression / "unlucky" candidate); positive = over-performed.
-    Default sort is most unlucky first (total_td_luck_score ASC).
+    Default sort is most unlucky first (total_td_luck_score ASC). Each row has a
+    season_type (REG or POST); season_type filters to one, and None returns both.
     """
     limit, offset = _page_args(limit, offset)
     season = _int_arg("season", season)
+    season_type = _derived_season_type(season_type)
     team_clause = _team_filter("team", team)
     team = _team_codes(team)  # codes for the player resolver
     conditions, params = [], []
@@ -2333,21 +2381,32 @@ def nfl_td_luck(
     if season is not None:
         conditions.append("season = ?")
         params.append(season)
+    if season_type:
+        conditions.append("season_type = ?")
+        params.append(season_type)
 
     where = " AND ".join(conditions) if conditions else "1=1"
-    sql = f"""
-        SELECT player_id, full_name, position, team, season,
+
+    def sql(typed: bool) -> str:
+        return f"""
+        SELECT player_id, full_name, position, team, season{", season_type" if typed else ""},
                rec_td, rec_td_exp, rec_td_luck,
                rush_td, rush_td_exp, rush_td_luck,
                total_td_luck_score
         FROM player_td_luck
         WHERE {where}
-        ORDER BY total_td_luck_score ASC NULLS LAST, player_id, season, rowid
+        ORDER BY total_td_luck_score ASC NULLS LAST, player_id, season,
+                 {"season_type DESC, " if typed else ""}rowid
     """
     try:
-        rows, page = _execute_limited(sql, params, limit, offset)
-        return _with_reason(_with_player({"td_luck": rows, **page}, resolved),
-                            rows, "player_td_luck", season=season)
+        rows, page, stale = _season_typed_page(sql, params, limit, offset, season_type)
+        result = _with_reason(_with_player({"td_luck": rows, **page}, resolved),
+                              rows, "player_td_luck", season=season)
+        if stale:
+            result["warning"] = _STALE_PLAYER_TABLES
+        return result
+    except _StaleDerivedTables:
+        return dict(_STALE_PLAYER_ERROR)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -2496,16 +2555,19 @@ def nfl_drop_rate(
     limit: int = _DEFAULT_LIMIT,
     player_id: str | None = None,
     offset: int = 0,
+    season_type: str | None = None,
 ) -> Dict[str, Any]:
     """
     Drop rate — share of catchable targets dropped per receiver-season from FTN
     charting (2022+) joined to plays (player_drop_rate). Also reports contested
     targets and created receptions. The player column holds nflverse short names
     ('J.Jefferson'); a full name in `player` resolves through players and filters by id.
-    Default sort is highest drop rate first (drop_rate_pct DESC).
+    Default sort is highest drop rate first (drop_rate_pct DESC). Each row has a
+    season_type (REG or POST); season_type filters to one, and None returns both.
     """
     limit, offset = _page_args(limit, offset)
     season = _int_arg("season", season)
+    season_type = _derived_season_type(season_type)
     if season is not None and season < 2022:
         return {"error": "FTN charting (drop) data is only available from 2022 onward"}
 
@@ -2526,23 +2588,34 @@ def nfl_drop_rate(
     if season is not None:
         conditions.append("season = ?")
         params.append(season)
+    if season_type:
+        conditions.append("season_type = ?")
+        params.append(season_type)
     if min_targets is not None:
         conditions.append("catchable_targets >= ?")
         params.append(min_targets)
 
     where = " AND ".join(conditions) if conditions else "1=1"
-    sql = f"""
-        SELECT player_id, player, team, season,
+
+    def sql(typed: bool) -> str:
+        return f"""
+        SELECT player_id, player, team, season{", season_type" if typed else ""},
                catchable_targets, drops, drop_rate_pct,
                contested_targets, created_receptions
         FROM player_drop_rate
         WHERE {where}
-        ORDER BY drop_rate_pct DESC NULLS LAST, player_id, season, rowid
+        ORDER BY drop_rate_pct DESC NULLS LAST, player_id, season,
+                 {"season_type DESC, " if typed else ""}rowid
     """
     try:
-        rows, page = _execute_limited(sql, params, limit, offset)
-        return _with_reason(_with_player({"drop_rate": rows, **page}, resolved),
-                            rows, "player_drop_rate", season=season)
+        rows, page, stale = _season_typed_page(sql, params, limit, offset, season_type)
+        result = _with_reason(_with_player({"drop_rate": rows, **page}, resolved),
+                              rows, "player_drop_rate", season=season)
+        if stale:
+            result["warning"] = _STALE_PLAYER_TABLES
+        return result
+    except _StaleDerivedTables:
+        return dict(_STALE_PLAYER_ERROR)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
