@@ -135,6 +135,9 @@ V0_GAPS = {
     "team_offense_stats": ["season_type", "pass_attempts"],
     "team_defense_stats": ["season_type", "def_touchdowns"],
     "situational_stats": ["season_type", "conversion_rule"],
+    # Group N: measured in /tmp/grpE_v3.duckdb, information_schema has no season_type here.
+    "player_td_luck": ["season_type"],
+    "player_drop_rate": ["season_type"],
 }
 V0_NULL_DEPTH = 1_280_630
 
