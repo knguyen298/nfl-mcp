@@ -382,6 +382,8 @@ class TestNflSnapCounts:
                 assert field in row
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("require_db")
 class TestNflFantasyOpportunity:
     def test_no_filters_returns_results(self):
         result = nfl_fantasy_opportunity(season=2024)
@@ -410,6 +412,8 @@ class TestNflFantasyOpportunity:
         assert "boom" in result["error"]
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("require_db")
 class TestNflFantasyRankings:
     def test_draft_scope_returns_results(self):
         result = nfl_fantasy_rankings(scope="draft")
@@ -449,13 +453,13 @@ class TestNflFantasyRankings:
         result = nfl_fantasy_rankings(scope="bogus")
         assert "error" in result
 
-    def test_invalid_limit_falls_back(self):
+    def test_invalid_limit_returns_error(self):
         result = nfl_fantasy_rankings(scope="draft", limit="oops")
-        assert "error" not in result
+        assert result["code"] == "INVALID_ARGUMENT"
 
-    def test_limit_is_capped(self):
+    def test_limit_above_cap_returns_error(self):
         result = nfl_fantasy_rankings(scope="draft", limit=99999)
-        assert result["count"] <= 500
+        assert result["code"] == "INVALID_ARGUMENT"
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):
@@ -520,9 +524,9 @@ class TestNflTdLuck:
         for field in ("full_name", "team", "season", "rec_td_luck", "rush_td_luck", "total_td_luck_score"):
             assert field in row
 
-    def test_invalid_limit_falls_back(self):
+    def test_invalid_limit_returns_error(self):
         result = nfl_td_luck(season=2024, limit="oops")
-        assert "error" not in result
+        assert result["code"] == "INVALID_ARGUMENT"
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):
@@ -580,9 +584,9 @@ class TestNflSeparationOpportunity:
         result = nfl_separation_opportunity(player="Jefferson", team="MIN", position="WR", season=2024)
         assert "error" not in result
 
-    def test_invalid_limit_falls_back(self):
+    def test_invalid_limit_returns_error(self):
         result = nfl_separation_opportunity(limit="oops")
-        assert "error" not in result
+        assert result["code"] == "INVALID_ARGUMENT"
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):
@@ -645,9 +649,9 @@ class TestNflContractValue:
         result = nfl_contract_value(player="Gibbs", team="DET", position="RB", season=2024)
         assert "error" not in result
 
-    def test_invalid_limit_falls_back(self):
+    def test_invalid_limit_returns_error(self):
         result = nfl_contract_value(season=2024, limit="oops")
-        assert "error" not in result
+        assert result["code"] == "INVALID_ARGUMENT"
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):
@@ -682,9 +686,9 @@ class TestNflInjuryReturn:
                           "avg_snap_pct_recovery", "median_snap_pct_recovery", "sample_size"):
                 assert field in row
 
-    def test_invalid_limit_falls_back(self):
+    def test_invalid_limit_returns_error(self):
         result = nfl_injury_return(injury_type="hamstring", limit="oops")
-        assert "error" not in result
+        assert result["code"] == "INVALID_ARGUMENT"
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):

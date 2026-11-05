@@ -733,7 +733,7 @@ def test_stale_tables_default_reg_returns_rows_with_warning(stale_db):
     res = tools.nfl_team_stats("KC", 2024, side="offense")
     assert [r["touchdowns"] for r in res["offense"]] == [50]
     assert "nfl-mcp rebuild" in res["warning"]
-    cmp = tools.nfl_compare("KC", "KC", compare_type="team", season=2024)
+    cmp = tools.nfl_compare("KC", "BUF", compare_type="team", season=2024)
     assert cmp["KC"]["offense"] and "nfl-mcp rebuild" in cmp["KC"]["warning"]
 
 

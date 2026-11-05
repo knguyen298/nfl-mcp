@@ -239,26 +239,47 @@ def _with_reason(result: dict[str, Any], rows: Any, table: str, **filters: Any) 
     return result
 
 
+# ── Pagination ─────────────────────────────────────────────────────────────────
+# Every list tool takes limit (1..500, default 100) and offset (>= 0) and reports
+# count, truncated and, when more rows match, a hint.
+
+_DEFAULT_LIMIT = 100
+
+
+def _page_args(limit: Any = _DEFAULT_LIMIT, offset: Any = 0, limit_name: str = "limit") -> tuple[int, int]:
+    """Validated (limit, offset). Strings are rejected, so "5" is an error, not 5."""
+    checked = []
+    for name, value, low, high, default in (
+        (limit_name, limit, 1, _MAX_ROWS, _DEFAULT_LIMIT), ("offset", offset, 0, None, 0),
+    ):
+        if isinstance(value, str):
+            raise _BadArgument(f"{name} must be an integer, got {value!r}")
+        number = _int_arg(name, value, low, high)
+        checked.append(default if number is None else number)
+    return checked[0], checked[1]
+
+
+def _execute_limited(
+    sql: str, params: Sequence[Any] | None, limit: int, offset: int = 0
+) -> tuple[list[dict], dict[str, Any]]:
+    """Run `sql` (which has no LIMIT) for one page: LIMIT limit+1 OFFSET offset.
+
+    Returns (rows, page). rows holds at most `limit` rows; page is {"count", "truncated"}
+    plus a "hint" when more rows match. The extra row only tells whether another page exists.
+    """
+    rows = _execute(f"{sql}\nLIMIT {limit + 1} OFFSET {offset}", params or None)
+    truncated = len(rows) > limit
+    rows = rows[:limit]
+    page: dict[str, Any] = {"count": len(rows), "truncated": truncated}
+    if truncated:
+        page["hint"] = (
+            f"More rows match. This page has {len(rows)} rows from offset {offset}. "
+            f"Call again with offset={offset + limit}, or use nfl_query for custom SQL."
+        )
+    return rows, page
+
+
 # ── Player identity ────────────────────────────────────────────────────────────
-
-def _normalize_player_name(name: str) -> str:
-    """
-    Convert full names to nflverse short format. Only nfl_search_plays still uses it,
-    because the plays name columns hold short names. Other player tools resolve names
-    through the players table (_find_players).
-    'Justin Jefferson' -> 'J.Jefferson'
-    'J.Jefferson'      -> 'J.Jefferson' (pass through)
-    'Jefferson'        -> 'Jefferson'   (last name only, pass through)
-    """
-    parts = name.strip().split()
-    if len(parts) == 1:
-        return name
-    if '.' in parts[0]:
-        return name
-    first = parts[0]
-    last = ' '.join(parts[1:])
-    return f"{first[0]}.{last}"
-
 
 _GSIS_ID = re.compile(r"\d{2}-\d{7}")
 _NAME_DROP = re.compile(r"[.'’`´]")
@@ -843,6 +864,90 @@ def nfl_query(sql: str, max_rows: int = 100) -> Dict[str, Any]:
     }
 
 
+_PLAY_TYPES = ("pass", "run", "field_goal", "punt", "kickoff", "extra_point", "qb_kneel",
+               "qb_spike", "no_play")
+_SITUATIONS = {
+    "red_zone": "yardline_100 <= 20",
+    "third_down": "down = 3",
+    "fourth_down": "down = 4",
+    "two_minute": "half_seconds_remaining <= 120 AND (qtr = 2 OR qtr >= 4)",
+    "two_minute_half": "qtr = 2 AND half_seconds_remaining <= 120",
+    "two_minute_game": "qtr >= 4 AND half_seconds_remaining <= 120",
+    "goal_to_go": "goal_to_go = 1",
+}
+# The plays id column behind each player_role. A play matches when any column matches.
+_ROLE_COLUMNS = {
+    "passer": ("passer",),
+    "rusher": ("rusher",),
+    "receiver": ("receiver",),
+    "any_offense": ("passer", "rusher", "receiver"),
+    "defender": (
+        "sack", "half_sack_1", "half_sack_2", "solo_tackle_1", "solo_tackle_2",
+        "assist_tackle_1", "assist_tackle_2", "assist_tackle_3", "assist_tackle_4",
+        "tackle_with_assist_1", "tackle_with_assist_2", "interception", "pass_defense_1",
+        "pass_defense_2", "forced_fumble_player_1", "forced_fumble_player_2", "qb_hit_1",
+        "qb_hit_2", "tackle_for_loss_1", "tackle_for_loss_2",
+    ),
+    "kicker": ("kicker",),
+    "punter": ("punter",),
+    "returner": ("kickoff_returner", "punt_returner"),
+}
+_ROLE_COLUMNS["any"] = tuple(dict.fromkeys(c for cols in _ROLE_COLUMNS.values() for c in cols))
+# Fixed allow-list: the key is the only user input; the SQL is never built from it.
+_PLAY_SORTS = {
+    "abs_epa": "ABS(epa) DESC NULLS LAST",
+    "epa": "epa DESC NULLS LAST",
+    "wpa": "wpa DESC NULLS LAST",
+    "yards_gained": "yards_gained DESC NULLS LAST",
+    "game_order": "game_id ASC, play_id ASC",
+}
+_PLAY_COLUMNS = (
+    "game_id", "play_id", "season", "week", "posteam", "defteam", "qtr", "down", "ydstogo",
+    "play_type", "yards_gained", "epa", "wpa", '"desc"', "passer_player_name",
+    "passer_player_id", "rusher_player_name", "rusher_player_id", "receiver_player_name",
+    "receiver_player_id", "touchdown", "interception",
+)
+_PLAYS_COLUMNS_SQL = (
+    "SELECT column_name FROM information_schema.columns "
+    "WHERE table_schema = 'main' AND table_name = 'plays'"
+)
+
+
+class _UnknownColumns(_BadArgument):
+    """columns named something the plays table does not have; carries did_you_mean."""
+
+    def __init__(self, message: str, did_you_mean: list[str]):
+        super().__init__(message, "UNKNOWN_COLUMN")
+        self.did_you_mean = did_you_mean
+
+    def as_error(self) -> dict[str, Any]:
+        return {**super().as_error(), "did_you_mean": self.did_you_mean}
+
+
+def _extra_play_columns(columns: Any) -> list[str]:
+    """Quoted extra plays columns, each checked against the live schema.
+
+    A name that is not a live column gives UNKNOWN_COLUMN with did_you_mean. Nothing from
+    the caller reaches the SQL except a name that matched a live column exactly.
+    """
+    if columns is None:
+        return []
+    if not isinstance(columns, (list, tuple)) or not all(isinstance(c, str) for c in columns):
+        raise _BadArgument("columns must be a list of plays column names")
+    live = {name.lower(): name for name in _live_names(_PLAYS_COLUMNS_SQL)}
+    if not live:
+        raise _BadArgument("Could not read the plays schema to check columns", "SCHEMA_UNAVAILABLE")
+    unknown = [c for c in columns if c.strip().lower() not in live]
+    if unknown:
+        suggestions = list(dict.fromkeys(n for c in unknown for n in _nearest(c, live.values())))
+        raise _UnknownColumns(
+            f"Unknown plays column(s): {', '.join(repr(c) for c in unknown)}. "
+            "Call nfl_schema(category=...) for play-by-play columns.", suggestions[:5])
+    default = {c.strip('"') for c in _PLAY_COLUMNS}
+    chosen = dict.fromkeys(live[c.strip().lower()] for c in columns)
+    return [f'"{name}"' for name in chosen if name not in default]
+
+
 @_checked
 def nfl_search_plays(
     team: str | None = None,
@@ -858,18 +963,50 @@ def nfl_search_plays(
     is_touchdown: bool = False,
     is_turnover: bool = False,
     min_yards: int | None = None,
-    max_rows: int = 50,
+    max_rows: int | None = None,
+    player_id: str | None = None,
+    player_role: str | None = None,
+    down: int | None = None,
+    qtr: int | None = None,
+    min_yardline_100: float | None = None,
+    max_yardline_100: float | None = None,
+    min_score_differential: float | None = None,
+    max_score_differential: float | None = None,
+    shotgun: bool | None = None,
+    no_huddle: bool | None = None,
+    min_wp: float | None = None,
+    max_wp: float | None = None,
+    sort_by: str = "abs_epa",
+    columns: list[str] | None = None,
+    limit: int = _DEFAULT_LIMIT,
+    offset: int = 0,
 ) -> Dict[str, Any]:
-    """Search for plays using structured filters instead of raw SQL."""
+    """Search for plays using structured filters instead of raw SQL. max_rows is an alias of limit."""
+    limit, offset = _page_args(
+        limit if max_rows is None else max_rows, offset, "limit" if max_rows is None else "max_rows")
     season, season_from, season_to = (_int_arg(n, v) for n, v in (
         ("season", season), ("season_from", season_from), ("season_to", season_to)))
-    week, min_yards, max_rows = (_int_arg(n, v) for n, v in (
-        ("week", week), ("min_yards", min_yards), ("max_rows", max_rows)))
+    week, min_yards, down, qtr = (_int_arg(n, v) for n, v in (
+        ("week", week), ("min_yards", min_yards), ("down", down), ("qtr", qtr)))
     season_type = _play_season_type(season_type)
-    situation = _choice_arg(
-        "situation", situation, ("red_zone", "third_down", "fourth_down", "two_minute"))
+    play_type = _choice_arg("play_type", play_type, _PLAY_TYPES)
+    situation = _choice_arg("situation", situation, tuple(_SITUATIONS))
+    role = _choice_arg("player_role", player_role, tuple(_ROLE_COLUMNS))
+    sort_by = _choice_arg("sort_by", sort_by, tuple(_PLAY_SORTS)) or "abs_epa"
     is_touchdown = _bool_arg("is_touchdown", is_touchdown)
     is_turnover = _bool_arg("is_turnover", is_turnover)
+    shotgun, no_huddle = (_bool_arg(n, v, default=None) for n, v in (
+        ("shotgun", shotgun), ("no_huddle", no_huddle)))
+    ranges = [(c, op, _num_arg(n, v)) for c, op, n, v in (
+        ("yardline_100", ">=", "min_yardline_100", min_yardline_100),
+        ("yardline_100", "<=", "max_yardline_100", max_yardline_100),
+        ("score_differential", ">=", "min_score_differential", min_score_differential),
+        ("score_differential", "<=", "max_score_differential", max_score_differential),
+        ("wp", ">=", "min_wp", min_wp), ("wp", "<=", "max_wp", max_wp))]
+    if role and not (player or (player_id and str(player_id).strip())):
+        raise _BadArgument("player_role needs player or player_id", "MISSING_PLAYER")
+    extra = _extra_play_columns(columns)
+
     conditions = []
     params: list[Any] = []
     for column, value, label in (("posteam", team, "team"), ("defteam", opponent, "opponent")):
@@ -877,41 +1014,35 @@ def nfl_search_plays(
         if clause:
             conditions.append(clause[0])
             params.extend(clause[1])
-    if player:
-        player = _normalize_player_name(player)
-        conditions.append(
-            "(passer_player_name ILIKE ? "
-            "OR rusher_player_name ILIKE ? "
-            "OR receiver_player_name ILIKE ?)"
-        )
-        pattern = f"%{player}%"
-        params.extend([pattern, pattern, pattern])
-    if season is not None:
-        conditions.append("season = ?")
-        params.append(season)
-    if season_from is not None:
-        conditions.append("season >= ?")
-        params.append(season_from)
-    if season_to is not None:
-        conditions.append("season <= ?")
-        params.append(season_to)
-    if week is not None:
-        conditions.append("week = ?")
-        params.append(week)
-    if season_type:
-        conditions.append("season_type = ?")
-        params.append(season_type)
-    if play_type:
-        conditions.append("play_type = ?")
-        params.append(play_type)
-    if situation == "red_zone":
-        conditions.append("yardline_100 <= 20")
-    elif situation == "third_down":
-        conditions.append("down = 3")
-    elif situation == "fourth_down":
-        conditions.append("down = 4")
-    elif situation == "two_minute":
-        conditions.append("qtr = 4 AND half_seconds_remaining <= 120")
+    resolved = None
+    gsis_id = str(player_id).strip() if player_id and str(player_id).strip() else None
+    if player and gsis_id is None:
+        try:
+            resolved, early = _resolve_player(
+                player, None, season=season, season_from=season_from, season_to=season_to)
+        except (duckdb.Error, ValueError, TimeoutError) as e:
+            logger.exception("Tool error")
+            return {"error": str(e)}
+        if early is not None:
+            return early
+        if resolved is None:
+            return {"rows": [], "count": 0, "row_count": 0, "truncated": False,
+                    "reason": f"No player matches '{player}'. Try nfl_player_lookup."}
+        gsis_id = resolved["gsis_id"]
+    if gsis_id is not None:  # a player_id is used as given: it is matched on the plays id columns
+        id_columns = [f"{c}_player_id" for c in _ROLE_COLUMNS[role or "any"]]
+        conditions.append("(" + " OR ".join(f"{c} = ?" for c in id_columns) + ")")
+        params.extend([gsis_id] * len(id_columns))
+    for column, op, value in (
+        ("season", "=", season), ("season", ">=", season_from), ("season", "<=", season_to),
+        ("week", "=", week), ("season_type", "=", season_type), ("play_type", "=", play_type),
+        ("down", "=", down), ("qtr", "=", qtr),
+    ):
+        if value is not None:
+            conditions.append(f"{column} {op} ?")
+            params.append(value)
+    if situation:
+        conditions.append(_SITUATIONS[situation])
     if is_touchdown:
         conditions.append("touchdown = 1")
     if is_turnover:
@@ -919,22 +1050,26 @@ def nfl_search_plays(
     if min_yards is not None:
         conditions.append("yards_gained >= ?")
         params.append(min_yards)
+    for column, flag in (("shotgun", shotgun), ("no_huddle", no_huddle)):
+        if flag is not None:
+            conditions.append(f"{column} = {1 if flag else 0}")
+    for column, op, value in ranges:
+        if value is not None:
+            conditions.append(f"{column} {op} ?")
+            params.append(value)
 
     where = " AND ".join(conditions) if conditions else "1=1"
-    max_rows = min(max_rows if max_rows is not None else 50, _MAX_ROWS)
-
     sql = (
-        f"SELECT season, week, posteam, defteam, down, ydstogo, play_type, "
-        f"yards_gained, epa, \"desc\", passer_player_name, rusher_player_name, "
-        f"receiver_player_name, touchdown, interception "
+        f"SELECT {', '.join([*_PLAY_COLUMNS, *extra])} "
         f"FROM plays WHERE {where} "
-        f"ORDER BY ABS(epa) DESC LIMIT {max_rows}"
+        f"ORDER BY {_PLAY_SORTS[sort_by]}, game_id, play_id, rowid"
     )
 
     try:
-        rows = _execute(sql, params)
-        return _with_reason({"rows": rows, "row_count": len(rows)}, rows, "plays",
-                            season=season, season_from=season_from, season_to=season_to, week=week)
+        rows, page = _execute_limited(sql, params, limit, offset)
+        result = _with_player({"rows": rows, **page, "row_count": len(rows)}, resolved)
+        return _with_reason(result, rows, "plays", season=season, season_from=season_from,
+                            season_to=season_to, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1458,11 +1593,14 @@ def nfl_roster(
     team: str | None = None,
     season: int | None = None,
     position: str | None = None,
+    limit: int = _DEFAULT_LIMIT,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Look up roster data — who was on a team's roster in a given season.
     Returns name, position, status, jersey number, experience, and measurables.
     """
+    limit, offset = _page_args(limit, offset)
     season = _int_arg("season", season)
     conditions, params = [], []
     clause = _team_filter("team", team)
@@ -1482,12 +1620,11 @@ def nfl_roster(
                jersey_number, status, years_exp, college, height, weight
         FROM rosters
         WHERE {where}
-        ORDER BY position, full_name
-        LIMIT 500
+        ORDER BY position, full_name, rowid
     """
     try:
-        rows = _execute(sql, params if params else None)
-        return _with_reason({"players": rows, "count": len(rows)}, rows, "rosters", season=season)
+        rows, page = _execute_limited(sql, params, limit, offset)
+        return _with_reason({"players": rows, **page}, rows, "rosters", season=season)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1500,11 +1637,14 @@ def nfl_injuries(
     week: int | None = None,
     player: str | None = None,
     report_status: str | None = None,
+    limit: int = _DEFAULT_LIMIT,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Look up injury report data. Filter by team, season, week, player name, or
     report status (e.g. 'Out', 'Questionable', 'Doubtful', 'Full Participation').
     """
+    limit, offset = _page_args(limit, offset)
     season, week = _int_arg("season", season), _int_arg("week", week)
     conditions, params = [], []
     clause = _team_filter("team", team)
@@ -1531,12 +1671,11 @@ def nfl_injuries(
                practice_primary_injury, practice_secondary_injury, practice_status
         FROM injuries
         WHERE {where}
-        ORDER BY season, week, team, full_name
-        LIMIT 500
+        ORDER BY season, week, team, full_name, rowid
     """
     try:
-        rows = _execute(sql, params if params else None)
-        return _with_reason({"injuries": rows, "count": len(rows)}, rows, "injuries",
+        rows, page = _execute_limited(sql, params, limit, offset)
+        return _with_reason({"injuries": rows, **page}, rows, "injuries",
                             season=season, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -1549,11 +1688,14 @@ def nfl_schedule(
     season: int | None = None,
     week: int | None = None,
     season_type: str | None = None,
+    limit: int = _DEFAULT_LIMIT,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Look up game schedules and results. Filter by team, season, week, or season type.
     Returns scores, spread lines, weather, stadium, and coaching info.
     """
+    limit, offset = _page_args(limit, offset)
     season, week = _int_arg("season", season), _int_arg("week", week)
     game_types = _game_types(season_type)
     conditions, params = [], []
@@ -1582,12 +1724,11 @@ def nfl_schedule(
                away_coach, home_coach, referee, stadium
         FROM schedules
         WHERE {where}
-        ORDER BY season, week
-        LIMIT 500
+        ORDER BY season, week, gameday, game_id
     """
     try:
-        rows = _execute(sql, params if params else None)
-        return _with_reason({"games": rows, "count": len(rows)}, rows, "schedules",
+        rows, page = _execute_limited(sql, params, limit, offset)
+        return _with_reason({"games": rows, **page}, rows, "schedules",
                             season=season, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -1602,6 +1743,8 @@ def nfl_team_records(
     season: int | None = None,
     from_season: int | None = None,
     to_season: int | None = None,
+    limit: int = _DEFAULT_LIMIT,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     PREFERRED for win-loss / standings questions. Final regular-season records per
@@ -1613,6 +1756,7 @@ def nfl_team_records(
     a franchise ESPN's archive does not cover is reported as record_not_available rather
     than estimated.
     """
+    limit, offset = _page_args(limit, offset)
     season, from_season, to_season = (_int_arg(n, v) for n, v in (
         ("season", season), ("from_season", from_season), ("to_season", to_season)))
     if team is None and season is None and from_season is None and to_season is None:
@@ -1624,7 +1768,8 @@ def nfl_team_records(
     if key and season is not None:
         note = availability(key, season)
         if note:
-            return {"team": key, "season": season, "records": [], "count": 0, **note}
+            return {"team": key, "season": season, "records": [], "count": 0,
+                    "truncated": False, **note}
 
     conditions: list[str] = []
     params: list[Any] = []
@@ -1646,11 +1791,10 @@ def nfl_team_records(
         SELECT season, team, source_team, games, wins, losses, ties, source
         FROM team_records
         WHERE {where}
-        ORDER BY season DESC, team
-        LIMIT 500
+        ORDER BY season DESC, team, rowid
     """
     try:
-        rows = _execute(sql, params if params else None)
+        rows, page = _execute_limited(sql, params, limit, offset)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1658,7 +1802,7 @@ def nfl_team_records(
     for row in rows:
         row["club"] = era_name(row["season"], row["team"])
 
-    result: Dict[str, Any] = {"records": rows, "count": len(rows)}
+    result: Dict[str, Any] = {"records": rows, **page}
     if key and not rows:
         result["status"] = "record_not_available"
         if season is not None and season < RECORDS_FIRST_NFLVERSE_SEASON:
@@ -1681,6 +1825,8 @@ def nfl_snap_counts(
     position: str | None = None,
     player_id: str | None = None,
     season_type: str | None = None,
+    limit: int = _DEFAULT_LIMIT,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Look up snap count data — how many snaps a player or team unit played.
@@ -1688,8 +1834,9 @@ def nfl_snap_counts(
     player matches the full names stored in snap_counts ('Travis Kelce' or 'Kelce'),
     ignoring case, accents and punctuation. player_id (gsis_id) maps through
     players.pfr_id to snap_counts.pfr_player_id. season_type is REG, POST, WC, DIV, CON or SB
-    (POST is the four playoff rounds).
+    (POST is the four playoff rounds). Without season_type every game type is included.
     """
+    limit, offset = _page_args(limit, offset)
     season, week = _int_arg("season", season), _int_arg("week", week)
     game_types = _game_types(season_type)
     conditions, params = [], []
@@ -1699,7 +1846,8 @@ def nfl_snap_counts(
             if not found:
                 return {"error": f"Unknown player_id '{player_id}'", "code": "UNKNOWN_PLAYER_ID"}
             if not found[0]["pfr_id"]:
-                return {"snap_counts": [], "count": 0, "player_id": found[0]["gsis_id"],
+                return {"snap_counts": [], "count": 0, "truncated": False,
+                        "player_id": found[0]["gsis_id"],
                         "reason": f"No PFR id on file for {found[0]['display_name']}, "
                                   "so snap counts cannot be matched by id."}
             conditions.append("pfr_player_id = ?")
@@ -1728,16 +1876,15 @@ def nfl_snap_counts(
 
         where = " AND ".join(conditions) if conditions else "1=1"
         sql = f"""
-            SELECT player, position, team, opponent, season, week, game_type,
+            SELECT player, pfr_player_id, position, team, opponent, season, week, game_type,
                    offense_snaps, offense_pct, defense_snaps, defense_pct,
                    st_snaps, st_pct
             FROM snap_counts
             WHERE {where}
-            ORDER BY season, week, team, offense_snaps DESC NULLS LAST
-            LIMIT 500
+            ORDER BY season, week, team, offense_snaps DESC NULLS LAST, player, pfr_player_id, rowid
         """
-        rows = _execute(sql, params if params else None)
-        return _with_reason({"snap_counts": rows, "count": len(rows)}, rows, "snap_counts",
+        rows, page = _execute_limited(sql, params, limit, offset)
+        return _with_reason({"snap_counts": rows, **page}, rows, "snap_counts",
                             season=season, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -1752,11 +1899,14 @@ def nfl_fantasy_opportunity(
     week: int | None = None,
     position: str | None = None,
     player_id: str | None = None,
+    limit: int = _DEFAULT_LIMIT,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Look up fantasy football opportunity data — target share, air yards share,
     carry share, and opportunity scores per player per week. Available 2006–present.
     """
+    limit, offset = _page_args(limit, offset)
     season, week = _int_arg("season", season), _int_arg("week", week)
     team_clause = _team_filter("posteam", team)
     team = _team_codes(team)  # codes for the player resolver
@@ -1791,12 +1941,11 @@ def nfl_fantasy_opportunity(
                rec_attempt_team, rush_attempt_team
         FROM ff_opportunity
         WHERE {where}
-        ORDER BY season DESC, week DESC, total_fantasy_points_exp DESC NULLS LAST
-        LIMIT 500
+        ORDER BY season DESC, week DESC, total_fantasy_points_exp DESC NULLS LAST, player_id, rowid
     """
     try:
-        rows = _execute(sql, params if params else None)
-        return _with_reason(_with_player({"fantasy_opportunity": rows, "count": len(rows)}, resolved),
+        rows, page = _execute_limited(sql, params, limit, offset)
+        return _with_reason(_with_player({"fantasy_opportunity": rows, **page}, resolved),
                             rows, "ff_opportunity", season=season, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -1810,7 +1959,8 @@ def nfl_fantasy_rankings(
     team: str | None = None,
     scope: str = "draft",
     ranking_set: str | None = None,
-    limit: int = 50,
+    limit: int = _DEFAULT_LIMIT,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Look up fantasy football expert consensus rankings (ECR). Two snapshots:
@@ -1818,14 +1968,10 @@ def nfl_fantasy_rankings(
     scope='week' (current-week start/sit rankings, ff_rankings_week). Both reflect the
     latest scrape — they are not historical/seasonal. Lower ECR = ranked higher.
     """
+    limit, offset = _page_args(limit, offset)
     scope = (scope or "draft").lower()
     if scope not in ("draft", "week"):
         return {"error": "scope must be 'draft' or 'week'"}
-
-    try:
-        limit = max(1, min(int(limit), _MAX_ROWS))
-    except (TypeError, ValueError):
-        limit = 50
 
     conditions, params = [], []
     if scope == "draft":
@@ -1865,12 +2011,11 @@ def nfl_fantasy_rankings(
         SELECT {select}
         FROM {table}
         WHERE {where}
-        ORDER BY ecr ASC NULLS LAST
-        LIMIT {limit}
+        ORDER BY ecr ASC NULLS LAST, {player_col}, rowid
     """
     try:
-        rows = _execute(sql, params if params else None)
-        return {"fantasy_rankings": rows, "scope": scope, "count": len(rows)}
+        rows, page = _execute_limited(sql, params, limit, offset)
+        return {"fantasy_rankings": rows, "scope": scope, **page}
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -2000,8 +2145,9 @@ def nfl_td_luck(
     position: str | None = None,
     team: str | None = None,
     season: int | None = None,
-    limit: int = 50,
+    limit: int = _DEFAULT_LIMIT,
     player_id: str | None = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Touchdown luck — actual vs expected TDs per player-season from the
@@ -2009,11 +2155,7 @@ def nfl_td_luck(
     expected (positive-regression / "unlucky" candidate); positive = over-performed.
     Default sort is most unlucky first (total_td_luck_score ASC).
     """
-    try:
-        limit = max(1, min(int(limit), _MAX_ROWS))
-    except (TypeError, ValueError):
-        limit = 50
-
+    limit, offset = _page_args(limit, offset)
     season = _int_arg("season", season)
     team_clause = _team_filter("team", team)
     team = _team_codes(team)  # codes for the player resolver
@@ -2043,12 +2185,11 @@ def nfl_td_luck(
                total_td_luck_score
         FROM player_td_luck
         WHERE {where}
-        ORDER BY total_td_luck_score ASC NULLS LAST
-        LIMIT {limit}
+        ORDER BY total_td_luck_score ASC NULLS LAST, player_id, season, rowid
     """
     try:
-        rows = _execute(sql, params if params else None)
-        return _with_reason(_with_player({"td_luck": rows, "count": len(rows)}, resolved),
+        rows, page = _execute_limited(sql, params, limit, offset)
+        return _with_reason(_with_player({"td_luck": rows, **page}, resolved),
                             rows, "player_td_luck", season=season)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -2063,8 +2204,9 @@ def nfl_role_trend(
     season: int | None = None,
     week: int | None = None,
     min_snap_pct: float | None = None,
-    limit: int = 50,
+    limit: int = _DEFAULT_LIMIT,
     player_id: str | None = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Rolling 3-week role trend — weekly snap %, target/carry/air-yards share with a
@@ -2072,11 +2214,7 @@ def nfl_role_trend(
     player_role_trend). Surfaces players whose usage is rising or fading. Default
     sort is biggest snap-share gain first (snap_pct_delta DESC).
     """
-    try:
-        limit = max(1, min(int(limit), _MAX_ROWS))
-    except (TypeError, ValueError):
-        limit = 50
-
+    limit, offset = _page_args(limit, offset)
     season, week = _int_arg("season", season), _int_arg("week", week)
     min_snap_pct = _num_arg("min_snap_pct", min_snap_pct)
     team_clause = _team_filter("team", team)
@@ -2113,12 +2251,11 @@ def nfl_role_trend(
                snap_pct_delta, target_share_pct_delta, carry_share_pct_delta, air_yards_share_pct_delta
         FROM player_role_trend
         WHERE {where}
-        ORDER BY snap_pct_delta DESC NULLS LAST
-        LIMIT {limit}
+        ORDER BY snap_pct_delta DESC NULLS LAST, player_id, season, week, rowid
     """
     try:
-        rows = _execute(sql, params if params else None)
-        return _with_reason(_with_player({"role_trend": rows, "count": len(rows)}, resolved),
+        rows, page = _execute_limited(sql, params, limit, offset)
+        return _with_reason(_with_player({"role_trend": rows, **page}, resolved),
                             rows, "player_role_trend", season=season, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -2132,8 +2269,9 @@ def nfl_separation_opportunity(
     team: str | None = None,
     season: int | None = None,
     regression_candidate: bool | None = None,
-    limit: int = 50,
+    limit: int = _DEFAULT_LIMIT,
     player_id: str | None = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Separation-adjusted opportunity — joins Next Gen Stats receiving separation/YAC
@@ -2143,11 +2281,7 @@ def nfl_separation_opportunity(
     Stats only goes back to 2016. Default sort is most under-producing first
     (fp_diff_per_game ASC).
     """
-    try:
-        limit = max(1, min(int(limit), _MAX_ROWS))
-    except (TypeError, ValueError):
-        limit = 50
-
+    limit, offset = _page_args(limit, offset)
     season = _int_arg("season", season)
     if season is not None and season < 2016:
         return {"error": "Next Gen Stats receiving data is only available from 2016 onward"}
@@ -2185,12 +2319,11 @@ def nfl_separation_opportunity(
                regression_candidate
         FROM player_separation_opportunity
         WHERE {where}
-        ORDER BY fp_diff_per_game ASC NULLS LAST
-        LIMIT {limit}
+        ORDER BY fp_diff_per_game ASC NULLS LAST, player_id, season, rowid
     """
     try:
-        rows = _execute(sql, params if params else None)
-        return _with_reason(_with_player({"separation_opportunity": rows, "count": len(rows)}, resolved),
+        rows, page = _execute_limited(sql, params, limit, offset)
+        return _with_reason(_with_player({"separation_opportunity": rows, **page}, resolved),
                             rows, "player_separation_opportunity", season=season)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -2203,8 +2336,9 @@ def nfl_drop_rate(
     team: str | None = None,
     season: int | None = None,
     min_targets: int | None = None,
-    limit: int = 50,
+    limit: int = _DEFAULT_LIMIT,
     player_id: str | None = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Drop rate — share of catchable targets dropped per receiver-season from FTN
@@ -2213,11 +2347,7 @@ def nfl_drop_rate(
     ('J.Jefferson'); a full name in `player` resolves through players and filters by id.
     Default sort is highest drop rate first (drop_rate_pct DESC).
     """
-    try:
-        limit = max(1, min(int(limit), _MAX_ROWS))
-    except (TypeError, ValueError):
-        limit = 50
-
+    limit, offset = _page_args(limit, offset)
     season = _int_arg("season", season)
     if season is not None and season < 2022:
         return {"error": "FTN charting (drop) data is only available from 2022 onward"}
@@ -2250,12 +2380,11 @@ def nfl_drop_rate(
                contested_targets, created_receptions
         FROM player_drop_rate
         WHERE {where}
-        ORDER BY drop_rate_pct DESC NULLS LAST
-        LIMIT {limit}
+        ORDER BY drop_rate_pct DESC NULLS LAST, player_id, season, rowid
     """
     try:
-        rows = _execute(sql, params if params else None)
-        return _with_reason(_with_player({"drop_rate": rows, "count": len(rows)}, resolved),
+        rows, page = _execute_limited(sql, params, limit, offset)
+        return _with_reason(_with_player({"drop_rate": rows, **page}, resolved),
                             rows, "player_drop_rate", season=season)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -2270,8 +2399,9 @@ def nfl_contract_value(
     season: int | None = None,
     min_apy: float | None = None,
     max_apy: float | None = None,
-    limit: int = 50,
+    limit: int = _DEFAULT_LIMIT,
     player_id: str | None = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Contract value efficiency — fantasy points per $M of average per year (APY),
@@ -2279,11 +2409,7 @@ def nfl_contract_value(
     (player_contract_value). apy and cap_pct reflect the current active contract.
     Default sort is best value first (fp_per_million DESC).
     """
-    try:
-        limit = max(1, min(int(limit), _MAX_ROWS))
-    except (TypeError, ValueError):
-        limit = 50
-
+    limit, offset = _page_args(limit, offset)
     season = _int_arg("season", season)
     min_apy, max_apy = _num_arg("min_apy", min_apy), _num_arg("max_apy", max_apy)
     team_clause = _team_filter("team", team)
@@ -2318,12 +2444,11 @@ def nfl_contract_value(
                apy, cap_pct, total_fp, total_fp_exp, fp_per_million
         FROM player_contract_value
         WHERE {where}
-        ORDER BY fp_per_million DESC NULLS LAST
-        LIMIT {limit}
+        ORDER BY fp_per_million DESC NULLS LAST, player_id, season, rowid
     """
     try:
-        rows = _execute(sql, params if params else None)
-        return _with_reason(_with_player({"contract_value": rows, "count": len(rows)}, resolved),
+        rows, page = _execute_limited(sql, params, limit, offset)
+        return _with_reason(_with_player({"contract_value": rows, **page}, resolved),
                             rows, "player_contract_value", season=season)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -2335,7 +2460,8 @@ def nfl_injury_return(
     injury_type: str | None = None,
     position: str | None = None,
     week_post_return: int | None = None,
-    limit: int = 50,
+    limit: int = _DEFAULT_LIMIT,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Injury return curve — post-return snap-share recovery, expressed as a percent of
@@ -2344,11 +2470,7 @@ def nfl_injury_return(
     100 means fully back to baseline usage. Default sort is by weeks since return
     (week_post_return ASC). sample_size shows how many player-spells back each point.
     """
-    try:
-        limit = max(1, min(int(limit), _MAX_ROWS))
-    except (TypeError, ValueError):
-        limit = 50
-
+    limit, offset = _page_args(limit, offset)
     week_post_return = _int_arg("week_post_return", week_post_return)
     conditions, params = [], []
     if injury_type:
@@ -2367,12 +2489,11 @@ def nfl_injury_return(
                avg_snap_pct_recovery, median_snap_pct_recovery, sample_size
         FROM injury_return_curve
         WHERE {where}
-        ORDER BY week_post_return ASC, injury_type, position
-        LIMIT {limit}
+        ORDER BY week_post_return ASC, injury_type, position, rowid
     """
     try:
-        rows = _execute(sql, params if params else None)
-        return {"injury_return": rows, "count": len(rows)}
+        rows, page = _execute_limited(sql, params, limit, offset)
+        return {"injury_return": rows, **page}
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}

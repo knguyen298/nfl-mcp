@@ -132,7 +132,8 @@ def test_create_app_lifespan_runs(monkeypatch):
 
 def test_team_records_is_exposed_with_its_arguments():
     tool = next(tool for tool in server_module.TOOLS if tool.name == "nfl_team_records")
-    assert set(tool.inputSchema["properties"]) == {"team", "season", "from_season", "to_season"}
+    assert set(tool.inputSchema["properties"]) == {
+        "team", "season", "from_season", "to_season", "limit", "offset"}
 
 
 def test_call_tool_dispatches_team_records(monkeypatch):

@@ -14,6 +14,18 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
         "passer_player_name", "rusher_player_name", "receiver_player_name",
         "complete_pass", "pass_touchdown", "rush_touchdown", "passing_yards",
         "rushing_yards", "receiving_yards", "yards_after_catch", "air_yards", "cpoe",
+        # nfl_search_plays: filters, sort keys and the role id columns of player_role
+        "shotgun", "no_huddle", "goal_to_go", "score_differential", "wp", "wpa",
+        "passer_player_id", "rusher_player_id", "receiver_player_id", "kicker_player_id",
+        "punter_player_id", "kickoff_returner_player_id", "punt_returner_player_id",
+        "sack_player_id", "half_sack_1_player_id", "half_sack_2_player_id",
+        "solo_tackle_1_player_id", "solo_tackle_2_player_id", "assist_tackle_1_player_id",
+        "assist_tackle_2_player_id", "assist_tackle_3_player_id", "assist_tackle_4_player_id",
+        "tackle_with_assist_1_player_id", "tackle_with_assist_2_player_id",
+        "interception_player_id", "pass_defense_1_player_id", "pass_defense_2_player_id",
+        "forced_fumble_player_1_player_id", "forced_fumble_player_2_player_id",
+        "qb_hit_1_player_id", "qb_hit_2_player_id", "tackle_for_loss_1_player_id",
+        "tackle_for_loss_2_player_id",
     ],
     # nfl_schedule
     "schedules": [
@@ -37,7 +49,7 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
     "snap_counts": [
         "player", "position", "team", "opponent", "season", "week", "game_type",
         "offense_snaps", "offense_pct", "defense_snaps", "defense_pct", "st_snaps",
-        "st_pct",
+        "st_pct", "pfr_player_id",
     ],
     # nfl_team_records
     "team_records": [
