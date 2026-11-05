@@ -430,6 +430,9 @@ def test_timeout_enforced(db, monkeypatch):
     "EXPLAIN SELECT count(*) FROM plays",
     "EXPLAIN ANALYZE SELECT count(*) FROM plays",
     "/* c */ explain analyze SELECT count(*) FROM plays;",
+    "EXPLAIN ANALYZE (SELECT 1)",
+    "EXPLAIN (SELECT 1) UNION ALL SELECT 2",
+    "EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1",
 ])
 def test_explain_of_select_allowed(db, sql):
     assert "error" not in nfl_query(sql)
@@ -440,6 +443,10 @@ def test_explain_of_select_allowed(db, sql):
     ("EXPLAIN ANALYZE COPY (SELECT 1) TO '{tmp}/out.csv'", "COPY"),
     ("EXPLAIN ANALYZE CREATE TEMP TABLE z AS SELECT 1", "CREATE"),
     ("explain (analyze) INSERT INTO plays SELECT * FROM plays", "INSERT"),
+    ("EXPLAIN (ANALYZE) COPY (SELECT 1) TO '{tmp}/out.csv'", "COPY"),
+    ("EXPLAIN (ANALYZE, FORMAT JSON) COPY (SELECT 1) TO '{tmp}/out.csv'", "COPY"),
+    ("EXPLAIN(FORMAT JSON) COPY (SELECT 1) TO '{tmp}/out.csv'", "COPY"),
+    ("EXPLAIN /* x */ ANALYZE COPY (SELECT 1) TO '{tmp}/out.csv'", "COPY"),
 ])
 def test_explain_of_write_rejected(db, tmp_path, sql, stype):
     result = nfl_query(sql.format(tmp=tmp_path))

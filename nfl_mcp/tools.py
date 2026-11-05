@@ -307,8 +307,15 @@ def _fetch_capped(sql: str, limit: int) -> tuple[list[dict], list[dict]]:
         pool.shutdown(wait=False)
 
 
+# Whitespace or comments, and an EXPLAIN option list such as (ANALYZE, FORMAT JSON).
+# The option list never matches a parenthesized query: it cannot start with a
+# query keyword or a nested paren.
+_GAP = r"(?:\s|--[^\n]*(?:\n|\Z)|/\*.*?\*/)*"
+_EXPLAIN_OPTION = r"[A-Za-z_]\w*(?:\s+[^,()]+)?"
 _EXPLAIN_PREFIX = re.compile(
-    r"\A(?:\s+|--[^\n]*(?:\n|\Z)|/\*.*?\*/)*EXPLAIN\b(?:\s+ANALYZE\b)?\s*(?:\([^)]*\))?",
+    rf"\A{_GAP}EXPLAIN\b(?:{_GAP}ANALYZE\b)?"
+    rf"(?:{_GAP}\(\s*(?!(?:SELECT|WITH|FROM|VALUES|TABLE|PIVOT|UNPIVOT|DESCRIBE|SUMMARIZE|SHOW)\b)"
+    rf"{_EXPLAIN_OPTION}(?:\s*,\s*{_EXPLAIN_OPTION})*\s*\))?",
     re.IGNORECASE | re.DOTALL,
 )
 
