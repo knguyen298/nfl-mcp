@@ -22,7 +22,9 @@ TABLE_INFO: dict[str, tuple[str, list[str]]] = {
     "teams": ("one row per team abbreviation", ["team_abbr"]),
     "rosters": ("one row per player per team per season", ["gsis_id", "pfr_id"]),
     "rosters_weekly": ("one row per player per team per week", ["gsis_id"]),
-    "injuries": ("one row per player per team per week (the weekly injury report)", ["gsis_id"]),
+    "injuries": (("one row per player per team per week (the weekly injury report). season_type is "
+                  "empty in some rows (every 2024 row when measured), so use game_type "
+                  "(REG, WC, DIV, CON, SB) in SQL"), ["gsis_id"]),
     "snap_counts": ("one row per player per game (Pro Football Reference)", ["game_id", "pfr_player_id"]),
     "depth_charts": ("one row per depth chart entry: team, position slot and week or snapshot date",
                      ["gsis_id"]),
@@ -157,7 +159,12 @@ DATA_NOTES: list[str] = [
     "Playoff weeks continue the regular-season numbering."),
     ("The derived tables (see derived_tables) are rebuilt from the loaded data at ingest time. "
     "team_offense_stats, team_defense_stats, situational_stats and formation_effectiveness "
-    "have separate REG and POST rows, so filter season_type before you sum."),
+    "have separate REG and POST rows, so filter season_type before you sum. So do "
+    "player_td_luck and player_drop_rate: a player with a playoff game has one row per season "
+    "type, and nfl_td_luck and nfl_drop_rate return season_type on every row."),
+    ("nfl_roster and nfl_injuries return gsis_id on every row. nfl_injuries also returns "
+    "season_type. The injuries table leaves season_type empty in some rows (every 2024 row when "
+    "measured), so the tool fills it from game_type (REG stays REG, WC, DIV, CON and SB become POST)."),
     ("Two player ids appear. gsis_id is the NFL id and most tables use it (player_id in "
     "ff_opportunity and the derived player tables is a gsis_id). pfr_id is the Pro Football "
     "Reference id (snap_counts and the pfr_advstats tables). players maps one to the other."),
