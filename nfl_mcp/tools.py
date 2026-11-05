@@ -2,7 +2,7 @@
 NFL MCP Server tools:
   nfl_schema        → returns column reference so the model knows what to query
   nfl_status        → database health: row counts, loaded seasons, tables
-  nfl_query         → read-only SELECT with safety guardrails
+  nfl_query         → one read-only SELECT/EXPLAIN statement, row-capped
   nfl_search_plays  → structured play search
   nfl_team_stats    → pre-aggregated team stats
   nfl_player_stats  → player stats by season
@@ -11,9 +11,12 @@ NFL MCP Server tools:
 
 import difflib
 import logging
+import os
 import re
 import threading
 from collections.abc import Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any, Dict
 
 import duckdb
@@ -32,16 +35,11 @@ logger = logging.getLogger("nfl-mcp")
 
 # ── Safety guardrails ──────────────────────────────────────────────────────────
 
-_FORBIDDEN = re.compile(
-    r"\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|REPLACE|UPSERT"
-    r"|EXECUTE|EXEC|CALL|COPY|GRANT|REVOKE|VACUUM|ANALYZE|CLUSTER"
-    r"|REINDEX|COMMENT|SECURITY|OWNER|TABLESPACE|SCHEMA"
-    r"|SET|DO|LISTEN|NOTIFY|PREPARE|DEALLOCATE|LOAD|DISCARD|RESET"
-    r"|pg_read_file|pg_read_binary_file|pg_write_file|pg_sleep"
-    r"|lo_import|lo_export|dblink|current_setting"
-    r"|pg_terminate_backend|pg_cancel_backend)\b",
-    re.IGNORECASE,
-)
+# nfl_query allows only these DuckDB statement types (from extract_statements).
+_ALLOWED_STATEMENT_TYPES = frozenset({
+    duckdb.StatementType.SELECT,
+    duckdb.StatementType.EXPLAIN,
+})
 
 _MAX_ROWS = 500
 _QUERY_TIMEOUT_SECONDS = 10
@@ -244,51 +242,99 @@ def _sql_error_detail(exc: Exception) -> Dict[str, Any]:
     return {}
 
 
+def _query_timeout() -> float:
+    """Seconds allowed per nfl_query; NFL_MCP_QUERY_TIMEOUT_SECONDS overrides."""
+    raw = os.getenv("NFL_MCP_QUERY_TIMEOUT_SECONDS")
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    return _QUERY_TIMEOUT_SECONDS
+
+
+def _fetch_capped(sql: str, limit: int) -> tuple[list[dict], list[dict]]:
+    """Run `sql` as written and fetch at most `limit` rows, with a timeout.
+
+    Returns (columns, rows) where columns is [{"name", "type"}].
+    """
+    timeout = _query_timeout()
+    thread_conn: list[Any] = [None]
+
+    def _run():
+        with get_db_connection() as conn:
+            thread_conn[0] = conn
+            cursor = conn.execute(sql)
+            desc = cursor.description or []
+            names = [d[0] for d in desc]
+            columns = [{"name": d[0], "type": str(d[1])} for d in desc]
+            return columns, [dict(zip(names, r)) for r in cursor.fetchmany(limit)]
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(_run)
+    try:
+        return future.result(timeout=timeout)
+    except FuturesTimeout:
+        conn = thread_conn[0]
+        if conn is not None:
+            try:
+                conn.interrupt()
+            except (duckdb.Error, RuntimeError):
+                logger.warning("Failed to interrupt timed out DuckDB query", exc_info=True)
+        raise TimeoutError(f"Query exceeded {timeout:g} second timeout") from None
+    finally:
+        pool.shutdown(wait=False)
+
+
 def nfl_query(sql: str, max_rows: int = 100) -> Dict[str, Any]:
     """
-    Execute a read-only SQL SELECT against the nflread database.
+    Execute one read-only SQL statement against the nflread database.
 
-    Safety rules:
-      - Only SELECT statements allowed
-      - Forbidden mutation/system keywords are blocked
-      - Multiple statements (semicolons) blocked
-      - Results capped at max_rows (hard max 500)
-      - 10-second statement timeout
+    Rules:
+      - Exactly one statement, parsed by DuckDB (a trailing ';' is fine)
+      - Only SELECT and EXPLAIN statement types; anything else is rejected
+        with its statement_type
+      - max_rows is an int from 1 to 500; larger values are clamped to 500
+      - Query runs as written; max_rows + 1 rows are fetched to set `truncated`
+      - 10-second timeout (NFL_MCP_QUERY_TIMEOUT_SECONDS overrides)
 
+    Returns columns ([{name, type}]), rows, row_count and truncated.
     Unknown column/table failures also return `code`, the offending name,
     `did_you_mean` (ranked against the live schema) and a `hint`.
     """
-    sql = sql.strip()
-
-    if not re.match(r"^\s*SELECT\b", sql, re.IGNORECASE):
-        return {"error": "Only SELECT queries are allowed."}
-
-    match = _FORBIDDEN.search(sql)
-    if match:
-        return {"error": f"Forbidden keyword: '{match.group()}'"}
-
-    sql_no_trailing = sql.rstrip(";")
-    if ";" in sql_no_trailing:
-        return {"error": "Multiple statements are not allowed."}
-
+    if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 1:
+        return {"error": "max_rows must be an integer from 1 to 500."}
     max_rows = min(max_rows, _MAX_ROWS)
-    safe_sql = f"SELECT * FROM ({sql_no_trailing}) AS _q LIMIT {max_rows + 1}"
 
     try:
-        rows = _execute(safe_sql)
-
-        truncated = len(rows) > max_rows
-        rows = rows[:max_rows]
-
+        statements = duckdb.extract_statements(sql)
+    except (duckdb.Error, TypeError) as e:
+        return {"error": f"Could not parse SQL: {e}"}
+    if len(statements) != 1:
+        return {"error": "Send exactly one statement per call."}
+    stype = statements[0].type
+    if stype not in _ALLOWED_STATEMENT_TYPES:
         return {
-            "rows":      rows,
-            "row_count": len(rows),
-            "truncated": truncated,
+            "error": f"Only SELECT and EXPLAIN statements are allowed; got {stype.name}.",
+            "statement_type": stype.name,
         }
 
+    try:
+        columns, rows = _fetch_capped(sql, max_rows + 1)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e), **_sql_error_detail(e)}
+
+    truncated = len(rows) > max_rows
+    rows = rows[:max_rows]
+    return {
+        "columns":   columns,
+        "rows":      rows,
+        "row_count": len(rows),
+        "truncated": truncated,
+    }
 
 
 def nfl_search_plays(

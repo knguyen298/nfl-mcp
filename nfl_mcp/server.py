@@ -97,20 +97,22 @@ TOOLS = [
             "nfl_player_stats, and nfl_compare cannot answer the question. "
             "Requires calling nfl_schema first, and column names must be copied from it, "
             "never guessed (per-play EPA is `epa`, not `play_epa`). "
-            "Read-only SELECT only. "
-            "500 row cap. 10s timeout."
+            "One read-only statement per call: SELECT (including WITH, DESCRIBE, "
+            "SUMMARIZE) or EXPLAIN. Other statement types are rejected. "
+            "max_rows 1-500 (default 100, larger values are clamped to 500). 10s timeout."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "sql": {
                     "type": "string",
-                    "description": "A SQL SELECT query.",
+                    "description": "One SQL SELECT or EXPLAIN statement.",
                 },
                 "max_rows": {
                     "type": "integer",
                     "description": "Max rows to return (default 100, max 500)",
                     "default": 100,
+                    "minimum": 1,
                     "maximum": 500,
                 },
             },

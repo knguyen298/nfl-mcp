@@ -109,10 +109,8 @@ def _ok(result):
 
 # ── 1. Valid read SQL the old regex blocked ────────────────────────────────────
 
-XF_GATE = pytest.mark.xfail(strict=True, reason="group b: regex/SELECT-prefix gate blocks valid read SQL")
 
 
-@XF_GATE
 def test_cte_runs(db):
     rows = _ok(nfl_query(
         "WITH t AS (SELECT posteam, sum(yards_gained) AS y FROM plays GROUP BY posteam) "
@@ -134,7 +132,6 @@ def test_window_row_number_per_posteam(db):
     }
 
 
-@XF_GATE
 def test_replace_function_runs(db):
     rows = _ok(nfl_query(
         "SELECT replace(posteam, 'OAK', 'LV') AS team, count(*) AS n FROM plays "
@@ -143,7 +140,6 @@ def test_replace_function_runs(db):
     assert rows == [{"team": "LV", "n": 4}]  # 2 OAK + 2 LV
 
 
-@XF_GATE
 def test_ilike_set_pattern_runs(db):
     rows = _ok(nfl_query(
         "SELECT game_id, play_id FROM plays WHERE \"desc\" ILIKE '%set%' ORDER BY game_id"
@@ -151,19 +147,16 @@ def test_ilike_set_pattern_runs(db):
     assert [(r["game_id"], r["play_id"]) for r in rows] == [("G1", 4), ("G2", 3)]  # 2 rows
 
 
-@XF_GATE
 def test_last_name_do_runs(db):
     rows = _ok(nfl_query("SELECT gsis_id FROM players WHERE last_name = 'Do'"))
     assert rows == [{"gsis_id": "00-0000001"}]  # only Alex Do; Doe/Dorsett excluded
 
 
-@XF_GATE
 def test_alias_named_load_runs(db):
     rows = _ok(nfl_query("SELECT COUNT(*) AS load FROM plays WHERE season = 2024"))
     assert rows == [{"load": 8}]  # 8 rows in 2024
 
 
-@XF_GATE
 @pytest.mark.parametrize("sql,expected", [
     ("SELECT 'a;b' AS x", [{"x": "a;b"}]),
     ("SELECT count(*) AS n FROM plays WHERE \"desc\" <> 'drop; table'", [{"n": 12}]),  # no desc matches
@@ -172,7 +165,6 @@ def test_semicolon_inside_string_literal(db, sql, expected):
     assert _ok(nfl_query(sql)) == expected
 
 
-@XF_GATE
 @pytest.mark.parametrize("sql,expected", [
     ("SELECT count(*) AS n FROM plays -- all plays", [{"n": 12}]),
     ("SELECT 1 AS x -- note", [{"x": 1}]),
@@ -181,20 +173,17 @@ def test_trailing_line_comment(db, sql, expected):
     assert _ok(nfl_query(sql)) == expected
 
 
-@XF_GATE
 def test_from_first_syntax(db):
     rows = _ok(nfl_query("FROM plays SELECT count(*) AS n WHERE season = 2025"))
     assert rows == [{"n": 4}]  # 4 rows in 2025
 
 
-@XF_GATE
 def test_values_clause(db):
     result = nfl_query("VALUES (1, 'a'), (2, 'b')")
     assert result.get("row_count") == 2, result
     assert [list(r.values()) for r in result["rows"]] == [[1, "a"], [2, "b"]]
 
 
-@XF_GATE
 @pytest.mark.parametrize("sql", [
     "-- leading comment\nSELECT count(*) AS n FROM plays WHERE posteam = 'MIN'",
     "/* block comment */ SELECT count(*) AS n FROM plays WHERE posteam = 'MIN'",
@@ -206,7 +195,7 @@ def test_leading_comment(db, sql):
 @pytest.mark.parametrize("sql", [
     pytest.param("PIVOT (SELECT posteam, yards_gained FROM plays) ON posteam IN ('MIN', 'OAK') "
                  "USING sum(yards_gained)",
-                 marks=XF_GATE, id="pivot_statement"),
+                 id="pivot_statement"),
     pytest.param("SELECT * FROM (SELECT posteam, yards_gained FROM plays) "
                  "PIVOT (sum(yards_gained) FOR posteam IN ('MIN', 'OAK'))", id="pivot_sql_standard"),
 ])
@@ -216,25 +205,21 @@ def test_pivot_with_in_list(db, sql):
     assert (rows[0]["MIN"], rows[0]["OAK"]) == (9, 37)  # MIN 8+1, OAK 40-3
 
 
-@XF_GATE
 def test_describe_plays(db):
     rows = _ok(nfl_query("DESCRIBE plays"))
     assert [r["column_name"] for r in rows] == PLAYS_COLUMNS
 
 
-@XF_GATE
 def test_summarize_plays(db):
     rows = _ok(nfl_query("SUMMARIZE plays"))
     assert sorted(r["column_name"] for r in rows) == sorted(PLAYS_COLUMNS)  # one row per column
 
 
-@XF_GATE
 def test_show_tables(db):
     rows = _ok(nfl_query("SHOW TABLES"))
     assert {r["name"] for r in rows} == {"plays", "players", "plays150"}
 
 
-@XF_GATE
 def test_explain_select_runs(db):
     result = nfl_query("EXPLAIN SELECT 1")
     assert "error" not in result, result
@@ -264,7 +249,6 @@ REJECTED = [
 REJECTED_IDS = [s.split()[0] + "_" + t for s, t in REJECTED]
 
 
-@pytest.mark.xfail(strict=True, reason="group b: reject by duckdb statement type with statement_type key")
 @pytest.mark.parametrize("sql,stype", REJECTED, ids=REJECTED_IDS)
 def test_rejected_statement_names_type(db, tmp_path, sql, stype):
     result = nfl_query(sql.format(tmp=tmp_path))
@@ -285,7 +269,6 @@ def test_rejected_statement_changes_nothing(db, tmp_path, sql, stype):
 
 # ── 3. One statement only ──────────────────────────────────────────────────────
 
-@pytest.mark.xfail(strict=True, reason="group b: multi-statement error must say 'one statement'")
 @pytest.mark.parametrize("sql", ["SELECT 1; SELECT 2", "SELECT 1; DROP TABLE plays"])
 def test_two_statements_rejected_mentions_one_statement(db, sql):
     result = nfl_query(sql)
@@ -306,7 +289,6 @@ def test_single_trailing_semicolon_runs(db, sql):
     assert _ok(nfl_query(sql)) == [{"n": 12}]
 
 
-@pytest.mark.xfail(strict=True, reason="group b: semicolon check runs before comment handling")
 def test_trailing_semicolon_then_comment_runs(db):
     assert _ok(nfl_query("SELECT count(*) AS n FROM plays; -- done")) == [{"n": 12}]
 
@@ -349,7 +331,6 @@ def test_max_rows_above_500_clamped(db, n):
     assert (result["row_count"], result["truncated"]) == (500, True)  # 700 rows, clamp 500
 
 
-@pytest.mark.xfail(strict=True, reason="group b: max_rows not validated")
 @pytest.mark.parametrize("bad", [0, -5, "7", None, 2.5], ids=["zero", "neg", "str", "none", "float"])
 def test_invalid_max_rows_returns_error(db, bad):
     result = nfl_query("SELECT * FROM plays", max_rows=bad)
@@ -358,10 +339,8 @@ def test_invalid_max_rows_returns_error(db, bad):
 
 # ── 5. columns metadata ────────────────────────────────────────────────────────
 
-XF_COLS = pytest.mark.xfail(strict=True, reason="group b: response has no columns metadata")
 
 
-@XF_COLS
 def test_columns_names_and_types(db):
     result = nfl_query("SELECT game_id, play_id, epa FROM plays LIMIT 2")
     assert result["columns"] == [
@@ -371,14 +350,12 @@ def test_columns_names_and_types(db):
     ]
 
 
-@XF_COLS
 def test_columns_present_on_zero_rows(db):
     result = nfl_query("SELECT posteam, epa FROM plays WHERE season = 1999")
     assert result["rows"] == [] and result["row_count"] == 0  # no 1999 rows
     assert [c["name"] for c in result["columns"]] == ["posteam", "epa"]
 
 
-@XF_COLS
 @pytest.mark.parametrize("sql", [
     "SELECT * FROM plays",
     "SELECT season, count(*) AS n FROM plays GROUP BY season",
@@ -412,7 +389,6 @@ def test_bad_table_did_you_mean(db):
     assert "players" in result["did_you_mean"]
 
 
-@pytest.mark.xfail(strict=True, reason="group b: outer LIMIT wrapper leaks into error text")
 def test_error_text_has_no_wrapper(db):
     result = nfl_query("SELECT epaa FROM plays")
     assert "error" in result
