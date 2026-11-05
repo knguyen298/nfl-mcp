@@ -10,7 +10,7 @@ from pathlib import Path
 import duckdb
 
 from .database import _connection_config
-from .required_columns import REQUIRED_COLUMNS
+from .required_columns import REQUIRED_COLUMNS, SNAPSHOT_TABLES
 
 # A new slot may hold up to 1 percent fewer rows than the active one before it fails.
 ROW_TOLERANCE = 0.99
@@ -81,12 +81,20 @@ def _check_schema(columns: dict[str, set[str]]) -> list[CheckResult]:
 def _check_row_counts(new, new_cols, current, current_cols) -> CheckResult:
     low = []
     for table in sorted(set(new_cols) & set(current_cols)):
-        new_n, current_n = _row_count(new, table), _row_count(current, table)
+        new_n = _row_count(new, table)
+        if table in SNAPSHOT_TABLES:
+            if new_n == 0:
+                low.append(f"{table} is empty (snapshot table, current slot has "
+                           f"{_row_count(current, table)} rows)")
+            continue
+        current_n = _row_count(current, table)
         if new_n < current_n * ROW_TOLERANCE:
             low.append(f"{table} has {new_n} rows, current slot has {current_n}")
     if low:
         return CheckResult("row_count_floor", False, "; ".join(low))
-    return CheckResult("row_count_floor", True, "no table shrank beyond the 1 percent tolerance")
+    return CheckResult("row_count_floor", True,
+                       "no table shrank beyond the 1 percent tolerance; snapshot tables "
+                       f"({', '.join(sorted(SNAPSHOT_TABLES))}) only need to be non-empty")
 
 
 def _check_duplicates(conn, columns) -> CheckResult:

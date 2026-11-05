@@ -230,9 +230,16 @@ def _sim(tmp_path, *, with_seed=True, existing_baked=False):
     return entrypoint_path, updater_path, data, bin_dir
 
 
+def _env(bin_dir, **extra_env):
+    """Inherited environment minus NFL_MCP_DB_PATH, so a stub can never write to a path the
+    outer test run exported."""
+    env = {k: v for k, v in os.environ.items() if k != "NFL_MCP_DB_PATH"}
+    return {**env, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", **extra_env}
+
+
 def _run(script, bin_dir, **extra_env):
-    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", **extra_env}
-    result = subprocess.run(["sh", str(script)], capture_output=True, text=True, env=env)
+    result = subprocess.run(["sh", str(script)], capture_output=True, text=True,
+                            env=_env(bin_dir, **extra_env))
     assert result.returncode == 0, result.stderr
     return result.stdout
 
@@ -299,8 +306,8 @@ class TestContainerLifecycle:
     def test_updater_keeps_the_active_slot_when_validation_fails(self, tmp_path):
         entrypoint, updater, data, bin_dir = _sim(tmp_path)
         _run(entrypoint, bin_dir)
-        env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "STUB_VALIDATE_EXIT": "1"}
-        result = subprocess.run(["sh", str(updater)], capture_output=True, text=True, env=env)
+        result = subprocess.run(["sh", str(updater)], capture_output=True, text=True,
+                                env=_env(bin_dir, STUB_VALIDATE_EXIT="1"))
 
         assert result.returncode != 0
         assert "validation failed" in result.stdout
@@ -321,8 +328,8 @@ class TestContainerLifecycle:
 
     def test_updater_refuses_to_run_without_the_symlink(self, tmp_path):
         _, updater, data, bin_dir = _sim(tmp_path)
-        env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
-        result = subprocess.run(["sh", str(updater)], capture_output=True, text=True, env=env)
+        result = subprocess.run(["sh", str(updater)], capture_output=True, text=True,
+                                env=_env(bin_dir))
 
         assert result.returncode != 0
         assert "is not a symlink" in result.stdout

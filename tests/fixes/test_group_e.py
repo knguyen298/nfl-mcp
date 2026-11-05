@@ -15,9 +15,10 @@ Interface contract (shared contract plus the choices made here)
 - Tests locate a failure by text: a failing result whose f"{name} {detail}" contains the
   expected words. Suggested names: required_tables, required_columns, row_count_floor,
   duplicate_plays, newest_week, null_keys.
-- Row-count floor: for every table present in BOTH slots, new rows >= current rows * 0.99
-  (1 percent tolerance). Tests use 199/200 (ok) and 190/200 (fail), so any tolerance in
-  [0.5%, 5%) passes. Failure detail names the table and both counts. A table absent from
+- Row-count floor: for every table present in BOTH slots except the snapshot tables
+  (SNAPSHOT_TABLES: ff_rankings_draft, ff_rankings_week, which need only be non-empty),
+  new rows >= current rows * 0.99 (1 percent tolerance). Tests use 199/200 (ok) and
+  190/200 (fail), so any tolerance in [0.5%, 5%) passes. Failure detail names the table and both counts. A table absent from
   the current slot is not checked. current_db=None -> floor check absent or ok.
 - Duplicate check on plays (game_id, play_id). Count = COUNT(*) - COUNT(DISTINCT key), i.e.
   the rows that would have to be removed; the detail contains that number.
@@ -383,6 +384,26 @@ def test_row_floor_within_tolerance_or_growth_ok(slots, new_n):
 def test_row_floor_ignores_table_missing_from_current(slots, table):
     new, current = slots("new"), slots("current", drop_tables={table})
     assert_all_ok(run_checks(new, current))
+
+
+@pytest.mark.parametrize("table", ["ff_rankings_draft", "ff_rankings_week"])
+def test_row_floor_snapshot_table_may_shrink_by_20_percent(slots, table):
+    new = slots("new", row_counts={table: 80})
+    current = slots("current", row_counts={table: 100})
+    assert_all_ok(run_checks(new, current))
+
+
+@pytest.mark.parametrize("table", ["ff_rankings_draft", "ff_rankings_week"])
+def test_row_floor_empty_snapshot_table_fails_naming_table(slots, table):
+    new = slots("new", row_counts={table: 0})
+    current = slots("current", row_counts={table: 100})
+    assert_fails_with(run_checks(new, current), table)
+
+
+def test_row_floor_non_snapshot_table_shrinking_5_percent_fails(slots):
+    new = slots("new", row_counts={"injuries": 95})
+    current = slots("current", row_counts={"injuries": 100})
+    assert_fails_with(run_checks(new, current), "injuries", 95, 100)
 
 
 # ── 5. duplicate (game_id, play_id) ────────────────────────────────────────────

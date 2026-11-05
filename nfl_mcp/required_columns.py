@@ -119,3 +119,7 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
         "season_type",
     ],
 }
+
+# Full snapshots replaced on every run: a smaller one is normal (rankings change week to
+# week), so validate requires them non-empty instead of holding them to the row-count floor.
+SNAPSHOT_TABLES: frozenset[str] = frozenset({"ff_rankings_draft", "ff_rankings_week"})
