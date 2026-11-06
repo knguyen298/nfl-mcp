@@ -821,9 +821,10 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "player": _player_property(
-                    ". The rankings carry names only, so a row belongs to the player when its "
-                    "name, folded the same way, equals the player's full name; a name no player "
-                    "has (a team defense such as 'Kansas City Chiefs') must equal a stored name"),
+                    ". The player's rows are those of his FantasyPros id in ff_playerids, so a "
+                    "namesake's rows never mix in; a row with no id link counts when its name and "
+                    "position group match. A name no player has (a team defense such as 'Kansas "
+                    "City Chiefs') must equal a stored name"),
                 "player_id": _PLAYER_ID_PROPERTY,
                 "position": _position_property("QB, RB, WR, TE, K, DST, DL, LB, DB"),
                 "team": {
@@ -1005,10 +1006,11 @@ TOOLS = [
         name="nfl_contract_value",
         description=(
             "PREFERRED for contract value / cost-efficiency questions. Returns fantasy points "
-            "per $M of average per year (APY) using each player's active contract joined to "
+            "per $M of average per year (APY) using each player's contract joined to "
             "seasonal fantasy production. Use for 'best fantasy value per dollar' or 'is player "
-            "X worth his contract'. apy and cap_pct reflect the current active contract. Default "
-            "sort is best value first (fp_per_million DESC)."
+            "X worth his contract'. apy and cap_pct are those of the contract in force that "
+            "season (the latest signed in or before it). Default sort is best value first "
+            "(fp_per_million DESC)."
         ),
         inputSchema={
             "type": "object",
@@ -1096,6 +1098,15 @@ TOOLS = [
 ]
 
 
+# Every tool with season-type data says which season_type values it takes (spec decision 5).
+for _tool in TOOLS:
+    _season_type = _tool.inputSchema.get("properties", {}).get("season_type")
+    if _season_type:
+        _tool.description += (
+            " season_type is required: REG, POST, ALL or one playoff round (WC, DIV, CON, SB)."
+            if "WC" in _season_type["enum"] else " season_type is required: REG, POST or ALL.")
+
+
 # Every list tool pages the same way. The tool returns count, truncated and, when more
 # rows match, a hint that names offset and nfl_query.
 _PAGED_TOOLS = frozenset({
@@ -1115,8 +1126,9 @@ _GRAIN_SENTENCE = {
                        "Pro Football Reference id, which is not the gsis_id (players maps one to "
                        "the other).",
     "nfl_fantasy_opportunity": " Returns one row per player per game. player_id is the gsis_id.",
-    "nfl_fantasy_rankings": " Returns one row per player per ranking set. The weekly source table "
-                            "has fantasypros_id; rows do not carry it, so match players by name.",
+    "nfl_fantasy_rankings": " Returns one row per player per ranking set. The source tables have "
+                            "the FantasyPros id (fantasypros_id) that the player filter matches "
+                            "on; rows do not carry it.",
     "nfl_td_luck": " Returns one row per player per season per season type. Both REG and POST rows "
                    "appear unless season_type filters, and each row has a season_type. "
                    "player_id is the gsis_id.",

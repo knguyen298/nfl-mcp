@@ -8,7 +8,7 @@ Every expected value comes from SQL on the raw tables (plays, schedules, snap_co
 injuries, ff_opportunity, ftn_charting, contracts), never from a tool or a derived table. The
 SQL sits in a comment next to the value. Values were measured on a 2024-only database (the
 shape GitHub CI ingests). The integration tests read the database at NFL_MCP_DB_PATH (default
-/tmp/ci2024/duck2.duckdb) read-only and skip when it is missing or has no 2024 playoff plays.
+/tmp/ci2024/v070.duckdb) read-only and skip when it is missing or has no 2024 playoff plays.
 They do not skip on derived tables built by an older nfl-mcp: those must be upgraded first.
 
 Interface contract tested here
@@ -59,7 +59,7 @@ from nfl_mcp.database import get_db_connection
 from nfl_mcp.required_columns import REQUIRED_COLUMNS
 from nfl_mcp.validate import run_checks
 
-REAL_DB = Path(os.environ.get("NFL_MCP_DB_PATH", "/tmp/ci2024/duck2.duckdb"))
+REAL_DB = Path(os.environ.get("NFL_MCP_DB_PATH", "/tmp/ci2024/v070.duckdb"))
 
 SEASON_TOTAL = ["nfl_team_stats", "nfl_player_stats", "nfl_compare", "nfl_td_luck",
                 "nfl_drop_rate", "nfl_separation_opportunity", "nfl_contract_value"]
@@ -540,6 +540,22 @@ def test_per_game_all_is_union_of_reg_and_post(real, name, key, args):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("name,key,args", [
+    ("nfl_schedule", "games", {"team": "PHI", "season": 2024}),
+    ("nfl_snap_counts", "snap_counts", {"player_id": KELCE, "season": 2024}),
+])
+def test_schedule_and_snap_count_rows_carry_season_type(real, name, key, args):
+    # Decision 5: every row is labeled with season_type. game_type REG -> REG; WC, DIV, CON
+    # and SB -> POST. SELECT DISTINCT game_type FROM schedules -> REG, WC, DIV, CON, SB.
+    rows = _all(name, key, {**args, "season_type": "ALL"})
+    assert rows
+    assert all(r["season_type"] == ("REG" if r["game_type"] == "REG" else "POST") for r in rows)
+    assert {r["season_type"] for r in rows} == {"REG", "POST"}
+    post = _all(name, key, {**args, "season_type": "DIV"})
+    assert post and {r["season_type"] for r in post} == {"POST"}
+
+
+@pytest.mark.integration
 def test_per_game_all_counts_match_raw_tables(real):
     # SELECT count(*) FROM schedules WHERE season=2024 AND (home_team='PHI' OR away_team='PHI') -> 21
     assert _q(real, "SELECT count(*) FROM schedules WHERE season=2024 AND "
@@ -830,8 +846,9 @@ SOURCES = {
                                "catch_percentage:D yards:I avg_yac_above_expectation:D "
                                "player_gsis_id:V",
     "contracts": "player:V position:V team:V year_signed:I value:D apy:D apy_cap_pct:D gsis_id:V",
+    "ff_playerids": "fantasypros_id:L gsis_id:V",
 }
-STATIC = {"players", "contracts", "ff_rankings_draft", "ff_rankings_week"}
+STATIC = {"players", "contracts", "ff_rankings_draft", "ff_rankings_week", "ff_playerids"}
 SQL_TYPES = {"V": "VARCHAR", "I": "INTEGER", "D": "DOUBLE", "B": "BOOLEAN", "L": "BIGINT"}
 GAMES = [{"game_id": "2024_01_BUF_KC", "week": 1, "game_type": "REG", "season_type": "REG"},
          {"game_id": "2024_19_BUF_KC", "week": 19, "game_type": "WC", "season_type": "POST"}]

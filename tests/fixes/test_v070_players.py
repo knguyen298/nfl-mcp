@@ -7,7 +7,7 @@ Every expected value comes from SQL run on raw tables (plays, rosters, players, 
 injuries, schedules), never from a tool call. The SQL sits in a comment next to each value.
 Values were measured on a 2024-only database (the same kind CI builds with
 `nfl-mcp ingest --dataset all --start 2024 --end 2024`). The integration tests read the
-database at NFL_MCP_DB_PATH (default /tmp/ci2024/duck2.duckdb) and skip when it is missing or
+database at NFL_MCP_DB_PATH (default /tmp/ci2024/v070.duckdb) and skip when it is missing or
 has no 2024 plays. The fantasy ranking tables are a snapshot of the latest scrape, not season
 data, so their expected counts are computed by SQL at run time rather than hard-coded.
 
@@ -27,8 +27,9 @@ Interface contract (assumptions where the spec is silent)
   resolved player_id.
 - Name rule: folded full name, last name or short name ('P.Mahomes'), compared exactly. A
   strict substring ('Mahom', 'Kelc', 'Johnso') matches nobody.
-- nfl_fantasy_rankings rows only carry a name, so a row belongs to the player when its folded
-  name (generational suffix dropped) equals the player's folded full name.
+- nfl_fantasy_rankings rows carry a FantasyPros id and a name. A row belongs to the player when
+  ff_playerids maps its id to his gsis_id; a row with no mapping counts when its folded name
+  (generational suffix dropped) is one of his names and its position is in his group.
 - Tools that need season_type under decision 5 get season_type="REG" here.
 """
 
@@ -47,7 +48,7 @@ from mcp import types
 from nfl_mcp import server, tools
 from nfl_mcp.database import get_db_connection
 
-REAL_DB = Path(os.environ.get("NFL_MCP_DB_PATH", "/tmp/ci2024/duck2.duckdb"))
+REAL_DB = Path(os.environ.get("NFL_MCP_DB_PATH", "/tmp/ci2024/v070.duckdb"))
 
 # Players used below (SELECT gsis_id, display_name, short_name, pfr_id FROM players WHERE ...)
 MAHOMES = "00-0033873"   # Patrick Mahomes, P.Mahomes, MahoPa00; only 'Mahomes' in players
@@ -413,9 +414,11 @@ def _ambiguity_args(tool: str, name: str) -> dict:
 @pytest.mark.parametrize("tool", AMBIGUITY_TOOLS + ["nfl_compare"])
 def test_ambiguous_last_name_returns_candidates_and_own_hint(real, tool):
     # SELECT count(DISTINCT gsis_id) FROM rosters WHERE season=2024 AND full_name LIKE '% Johnson'
-    #   -> 53 (more than one player in every player table; see _johnson_ids)
-    assert _one(real, "SELECT count(DISTINCT gsis_id) FROM rosters "
-                      "WHERE season=2024 AND full_name LIKE '% Johnson'") == (53,)
+    #   -> 53 on the 2024 database; counted at run time, since a re-ingest of 2024 rosters can
+    #   change it. More than one is what the test needs (see _johnson_ids).
+    (n,) = _one(real, "SELECT count(DISTINCT gsis_id) FROM rosters "
+                      "WHERE season=2024 AND full_name LIKE '% Johnson'")
+    assert n > 1, n
     oracle = _johnson_ids(real)
     is_error, res = _call(tool, _ambiguity_args(tool, "Johnson"))
     assert not is_error, res
@@ -609,6 +612,156 @@ def test_fantasy_rankings_substring_matches_nothing(real, scope, player):
     assert "error" not in res, res
     assert not res.get("ambiguous"), res
     assert res["fantasy_rankings"] == [], res
+
+
+# A player's ranking rows are those of his FantasyPros ids (ff_playerids.fantasypros_id ->
+# gsis_id): ff_rankings_draft.id and ff_rankings_week.fantasypros_id. On the 2024 database:
+# SELECT fantasypros_id, gsis_id, name FROM ff_playerids WHERE fantasypros_id IN (18220, 26221)
+#   -> (18220, '00-0035236', 'Byron Murphy') CB MIN; (26221, '00-0039309', 'Byron Murphy') DT SEA
+# SELECT DISTINCT player, id, pos, team FROM ff_rankings_draft WHERE player ILIKE 'byron murphy%'
+#   -> ('Byron Murphy Jr.', 18220, 'DB', 'MIN'), ('Byron Murphy II', 26221, 'DL', 'SEA')
+# Folded with the suffix dropped, both are 'byron murphy'.
+BYRON_MURPHY_CB = "00-0035236"
+_RANKING_TABLES = {"draft": ("ff_rankings_draft", "player", "id"),
+                   "week": ("ff_rankings_week", "player_name", "fantasypros_id")}
+
+
+def _mapped_rows(conn, scope, gsis_id):
+    table, col, id_col = _RANKING_TABLES[scope]
+    _rankings_needed(conn, scope)
+    return sorted(_all(conn, f"SELECT {col}, {id_col} FROM {table} WHERE {id_col} IN "
+                             "(SELECT fantasypros_id FROM ff_playerids WHERE gsis_id = ?)", [gsis_id]))
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("scope", ["draft", "week"])
+def test_fantasy_rankings_player_id_does_not_merge_a_namesake(real, scope):
+    want = _mapped_rows(real, scope, BYRON_MURPHY_CB)
+    if not want:
+        pytest.skip(f"no {scope} rows for Byron Murphy (CB) in this scrape")
+    res = tools.nfl_fantasy_rankings(player_id=BYRON_MURPHY_CB, scope=scope, limit=500)
+    assert res["player_id"] == BYRON_MURPHY_CB
+    rows = res["fantasy_rankings"]
+    assert sorted((r["player"], ) for r in rows) == sorted((n, ) for n, _ in want)
+    assert {r["position"] for r in rows} == {"DB"}, rows  # never 'Byron Murphy II' (DL, SEA)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("scope", ["draft", "week"])
+@pytest.mark.parametrize("player,gsis_id", [
+    # players: 'Josh Palmer' (first_name Joshua); FantasyPros stores 'Joshua Palmer' (22845).
+    ("Joshua Palmer", "00-0036988"),
+    # players: 'Marquise Brown'; FantasyPros stores 'Hollywood Brown' (18226).
+    ("Marquise Brown", "00-0035662"),
+])
+def test_fantasy_rankings_finds_a_player_stored_under_another_name(real, scope, player, gsis_id):
+    want = _mapped_rows(real, scope, gsis_id)
+    if not want:
+        pytest.skip(f"no {scope} rows for {player} in this scrape")
+    res = tools.nfl_fantasy_rankings(player=player, scope=scope, limit=500)
+    assert res["player_id"] == gsis_id, res
+    assert sorted(r["player"] for r in res["fantasy_rankings"]) == sorted(n for n, _ in want)
+
+
+@pytest.mark.integration
+def test_fantasy_rankings_player_without_rows_gets_a_reason(real):
+    _rankings_needed(real, "draft")
+    # SELECT gsis_id FROM players WHERE display_name='Tom Brady' -> '00-0019596' (retired, unranked)
+    assert _mapped_rows(real, "draft", "00-0019596") == []
+    res = tools.nfl_fantasy_rankings(player="Tom Brady")
+    assert res["fantasy_rankings"] == [] and res["player_id"] == "00-0019596"
+    assert "Tom Brady" in res["reason"], res
+
+
+# Synthetic ranking database: every branch of the id match, independent of the scrape.
+RK = {"murphy_cb": "00-0000001", "murphy_dt": "00-0000002", "rubio": "00-0000003",
+      "ponder_ne": "00-0000004", "ponder_tb": "00-0000005", "oldman": "00-0000006"}
+
+
+@pytest.fixture
+def rankings_db(tmp_path, monkeypatch):
+    path = tmp_path / "rankings.duckdb"
+    con = duckdb.connect(str(path))
+    con.execute("CREATE TABLE players (gsis_id VARCHAR, display_name VARCHAR, short_name VARCHAR, "
+                "first_name VARCHAR, common_first_name VARCHAR, last_name VARCHAR, position VARCHAR, "
+                "latest_team VARCHAR, rookie_season INTEGER, last_season INTEGER, pfr_id VARCHAR)")
+    con.executemany("INSERT INTO players VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2020, 2024, NULL)", [
+        (RK["murphy_cb"], "Byron Murphy", "B.Murphy", "Byron", "Byron", "Murphy", "CB", "MIN"),
+        (RK["murphy_dt"], "Byron Murphy II", "B.Murphy", "Byron", "Byron", "Murphy", "DT", "SEA"),
+        (RK["rubio"], "Gabe Rubio", "G.Rubio", "Gabriel", "Gabe", "Rubio", "DE", "PIT"),
+        (RK["ponder_ne"], "Eli Ponder", "E.Ponder", "Eli", "Eli", "Ponder", "LB", "NE"),
+        (RK["ponder_tb"], "Eli Ponder", "E.Ponder", "Eli", "Eli", "Ponder", "LB", "TB"),
+        (RK["oldman"], "Tom Oldman", "T.Oldman", "Tom", "Tom", "Oldman", "QB", "NE"),
+    ])
+    con.execute("CREATE TABLE rosters (gsis_id VARCHAR, team VARCHAR, season INTEGER)")
+    con.executemany("INSERT INTO rosters VALUES (?, ?, 2024)", [
+        (RK["murphy_cb"], "MIN"), (RK["murphy_dt"], "SEA"), (RK["rubio"], "PIT"),
+        (RK["ponder_ne"], "NE"), (RK["ponder_tb"], "TB"), (RK["oldman"], "NE")])
+    con.execute("CREATE TABLE ff_playerids (fantasypros_id BIGINT, gsis_id VARCHAR)")
+    con.executemany("INSERT INTO ff_playerids VALUES (?, ?)", [
+        (101, RK["murphy_cb"]), (102, RK["murphy_dt"]), (601, RK["oldman"]), (None, RK["rubio"])])
+    con.execute("CREATE TABLE ff_rankings_draft (page_type VARCHAR, ecr_type VARCHAR, player VARCHAR, "
+                "id BIGINT, pos VARCHAR, team VARCHAR, ecr DOUBLE, sd DOUBLE, best BIGINT, "
+                "worst BIGINT, bye BIGINT, scrape_date VARCHAR)")
+    con.executemany("INSERT INTO ff_rankings_draft VALUES "
+                    "('redraft-idp', 'ro', ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)", [
+        ("Byron Murphy Jr.", 101, "DB", "MIN", 10.0), ("Byron Murphy II", 102, "DL", "SEA", 11.0),
+        ("Gabriel Rubio", 201, "DL", "PIT", 12.0), ("Gabriel Rubio", 202, "WR", "FA", 13.0),
+        ("Eli Ponder", 301, "DL", "NE", 14.0), ("Eli Ponder", 302, "DL", "FA", 15.0),
+        ("Kansas City Chiefs", 401, "DST", "KC", 16.0)])
+    con.execute("CREATE TABLE ff_rankings_week (page VARCHAR, fantasypros_id BIGINT, "
+                "player_name VARCHAR, pos VARCHAR, team VARCHAR, rank BIGINT, ecr DOUBLE, sd DOUBLE, "
+                "best BIGINT, worst BIGINT, pos_rank VARCHAR, player_opponent VARCHAR, "
+                "player_bye_week BIGINT, start_sit_grade VARCHAR, note VARCHAR, scrape_date VARCHAR)")
+    con.execute("INSERT INTO ff_rankings_week (page, fantasypros_id, player_name, pos, team, ecr) "
+                "VALUES ('dl', 102, 'Byron Murphy II', 'DL', 'SEA', 3.0)")
+    con.close()
+    monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))
+    return path
+
+
+def _ranked(**kwargs):
+    res = tools.nfl_fantasy_rankings(limit=500, **kwargs)
+    assert "error" not in res and not res.get("ambiguous"), res
+    return res, [(r["player"], r["position"], r["team"]) for r in res["fantasy_rankings"]]
+
+
+def test_fantasy_rankings_id_link_keeps_namesakes_apart(rankings_db):
+    res, rows = _ranked(player_id=RK["murphy_cb"])
+    assert rows == [("Byron Murphy Jr.", "DB", "MIN")] and "reason" not in res
+    assert _ranked(player_id=RK["murphy_dt"])[1] == [("Byron Murphy II", "DL", "SEA")]
+    assert _ranked(player_id=RK["murphy_dt"], scope="week")[1] == [("Byron Murphy II", "DL", "SEA")]
+    assert _ranked(player_id=RK["murphy_cb"], scope="week")[1] == []
+    assert tools.nfl_fantasy_rankings(player="Byron Murphy")["ambiguous"] is True
+
+
+def test_fantasy_rankings_unlinked_row_needs_name_and_position_group(rankings_db):
+    # Gabe Rubio (first_name Gabriel, DE) has no FantasyPros id: the DL row named Gabriel Rubio
+    # is his; the WR of the same name is not.
+    res, rows = _ranked(player="Gabe Rubio")
+    assert res["player_id"] == RK["rubio"] and rows == [("Gabriel Rubio", "DL", "PIT")]
+
+
+def test_fantasy_rankings_unlinked_namesakes_narrow_to_the_players_team(rankings_db):
+    # Two unlinked DL rows named Eli Ponder (NE and FA). The NE player gets the NE row; the TB
+    # player matches neither team, so neither row is his and the reason says why.
+    assert _ranked(player_id=RK["ponder_ne"])[1] == [("Eli Ponder", "DL", "NE")]
+    res, rows = _ranked(player_id=RK["ponder_tb"])
+    assert rows == [] and "301, 302" in res["reason"], res
+
+
+def test_fantasy_rankings_reasons_for_no_rows(rankings_db):
+    res, rows = _ranked(player_id=RK["oldman"])  # linked to 601, which no ranking row has
+    assert rows == [] and "Tom Oldman" in res["reason"], res
+    res, rows = _ranked(player="Nobody Atall")
+    assert rows == [] and "no player has that name" in res["reason"], res
+    res, rows = _ranked(player_id=RK["murphy_cb"], ranking_set="dynasty")
+    assert rows == [] and "Byron Murphy" in res["reason"], res
+
+
+def test_fantasy_rankings_team_defense_matches_its_stored_name(rankings_db):
+    res, rows = _ranked(player="Kansas City Chiefs")
+    assert rows == [("Kansas City Chiefs", "DST", "KC")] and "player_id" not in res
 
 
 # ── 7. nfl_roster player and player_id ────────────────────────────────────────

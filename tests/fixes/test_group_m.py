@@ -209,18 +209,19 @@ SCHEMA = {
                     "is_no_huddle:B is_motion:B is_play_action:B is_screen_pass:B is_rpo:B "
                     "is_trick_play:B is_catchable_ball:B is_contested_ball:B "
                     "is_created_reception:B is_drop:B n_blitzers:I n_pass_rushers:I",
-    "ff_rankings_draft": "page_type:V ecr_type:V player:V pos:V team:V ecr:D sd:D best:L "
+    "ff_rankings_draft": "page_type:V ecr_type:V player:V id:L pos:V team:V ecr:D sd:D best:L "
                          "worst:L bye:L scrape_date:V",
-    "ff_rankings_week": "page:V scrape_date:V player_name:V pos:V team:V rank:L ecr:D sd:D "
-                        "best:L worst:L player_bye_week:L player_opponent:V note:V pos_rank:V "
-                        "start_sit_grade:V",
+    "ff_rankings_week": "page:V scrape_date:V fantasypros_id:L player_name:V pos:V team:V rank:L "
+                        "ecr:D sd:D best:L worst:L player_bye_week:L player_opponent:V note:V "
+                        "pos_rank:V start_sit_grade:V",
+    "ff_playerids": "fantasypros_id:L gsis_id:V",
     "nextgen_stats_receiving": "season:I season_type:V week:I avg_separation:D "
                                "catch_percentage:D yards:I avg_yac_above_expectation:D "
                                "player_gsis_id:V",
     "contracts": "player:V position:V team:V year_signed:I value:D apy:D apy_cap_pct:D gsis_id:V",
 }
 LOADER_ONLY = {"officials": "game_id:V season:I official_name:V"}
-STATIC = {"players", "contracts", "ff_rankings_draft", "ff_rankings_week"}
+STATIC = {"players", "contracts", "ff_rankings_draft", "ff_rankings_week", "ff_playerids"}
 TABLE_DS = {"plays": "pbp"}
 PL_TYPES = {"V": pl.Utf8, "I": pl.Int32, "D": pl.Float64, "B": pl.Boolean, "L": pl.Int64}
 TEAM_COLS = {"posteam", "defteam", "team", "home_team", "away_team", "td_team",
@@ -422,7 +423,8 @@ SEASONAL_LOADERS = {
     "load_ftn_charting": "ftn_charting", "load_nextgen_stats": "nextgen_stats_receiving",
     "load_officials": "officials",
 }
-STATIC_LOADERS = {"load_players": "players", "load_contracts": "contracts"}
+STATIC_LOADERS = {"load_players": "players", "load_contracts": "contracts",
+                  "load_ff_playerids": "ff_playerids"}
 
 
 class FakeNfl:
@@ -1353,7 +1355,7 @@ def test_grpE_v3_second_no_fetch_run_is_a_no_op(v0_upgraded):
 
 INGEST_DATASETS = ["pbp", "schedules", "rosters", "injuries", "snap_counts", "player_stats",
                    "players", "ff_opportunity", "ftn_charting", "ff_rankings_draft",
-                   "ff_rankings_week", "nextgen_stats_receiving", "contracts"]
+                   "ff_rankings_week", "nextgen_stats_receiving", "contracts", "ff_playerids"]
 
 
 def _ingest(path, datasets=INGEST_DATASETS):

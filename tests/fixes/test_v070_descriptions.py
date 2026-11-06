@@ -6,7 +6,7 @@ Behavior first, wording second:
   unquoted "desc", did_you_mean ranked against the queried tables, a practice_status filter
   on nfl_injuries), the test calls the tool on a real database. Expected values come from raw
   SQL, quoted next to each value, measured on the CI-style 2024-only database
-  (/tmp/ci2024/duck2.duckdb, built by `nfl-mcp ingest --dataset all --start 2024 --end 2024`).
+  (/tmp/ci2024/v070.duckdb, built by `nfl-mcp ingest --dataset all --start 2024 --end 2024`).
   These tests skip when the database is missing (the unit CI job has none).
 - Where the fix is wording, the test checks that the false claim is gone and that a few
   required facts appear, with loose matching. No test pins a sentence.
@@ -35,7 +35,7 @@ from nfl_mcp import server, tools
 from nfl_mcp.database import get_db_connection
 from nfl_mcp.schema_pbp import _SCHEMA_CATEGORIES, _SCHEMA_SUMMARY
 
-REAL_DB = Path(os.environ.get("NFL_MCP_DB_PATH", "/tmp/ci2024/duck2.duckdb"))
+REAL_DB = Path(os.environ.get("NFL_MCP_DB_PATH", "/tmp/ci2024/v070.duckdb"))
 TOOLS_BY_NAME = {t.name: t for t in server.TOOLS}
 
 # Spec decision 5: tools with season-type data and their valid season_type values.
@@ -279,6 +279,26 @@ def test_did_you_mean_includes_synonym_and_stays_in_queried_tables(real_db, sql,
     assert set(dym) <= allowed, sorted(set(dym) - allowed)
 
 
+@pytest.mark.parametrize("sql,table,expected", [
+    # DuckDB: Table "p" does not have a column named "description". p is plays.
+    ("SELECT p.description FROM plays p", "plays", "desc"),
+    ("SELECT plays.description FROM plays", "plays", "desc"),
+    # s is players in a join: only players columns, and display_name first.
+    ("SELECT s.full_name FROM plays p JOIN players s ON p.passer_player_id = s.gsis_id",
+     "players", "display_name"),
+    # c is a CTE, not a live table: the tables the statement reads are the scope.
+    ("WITH c AS (SELECT * FROM plays) SELECT c.description FROM c", "plays", "desc"),
+])
+def test_did_you_mean_for_a_qualified_column(real_db, sql, table, expected):
+    r = tools.nfl_query(sql)
+    assert r.get("unknown_column") == sql.split(".")[1].split()[0], r
+    assert "nfl_schema" in r.get("hint", ""), r
+    dym = _dym(sql)
+    cols = _columns(real_db, table)
+    assert dym[0] == expected, dym
+    assert set(dym) <= cols, sorted(set(dym) - cols)
+
+
 @pytest.mark.parametrize("table", ["schedules", "snap_counts"])
 def test_did_you_mean_season_type_suggests_game_type_first(real_db, table):
     cols = _columns(real_db, table)
@@ -360,16 +380,56 @@ def test_fantasy_rankings_ranking_set_drops_best_example():
     assert "'best'" not in _prop_desc("nfl_fantasy_rankings", "ranking_set")
 
 
+# The ranking-set families a FantasyPros scrape can hold. An offseason scrape can lack one (no
+# weekly sets, or no ff_rankings_week rows), so an example of a family the database lacks
+# cannot be checked; an example that matches no stored set of a family it has is wrong.
+RANKING_SET_FAMILIES = ("redraft", "dynasty", "weekly", "ppr")
+
+
 def test_fantasy_rankings_ranking_set_examples_exist(real_db):
-    # Every quoted example must match a stored ranking set:
-    # SELECT page_type FROM ff_rankings_draft UNION ALL SELECT page FROM ff_rankings_week
+    # Every quoted example must match (partial, ignoring case) a stored ranking set:
+    # SELECT DISTINCT page_type FROM ff_rankings_draft UNION SELECT DISTINCT page FROM ff_rankings_week
+    stored = [r[0].lower() for r in real_db.execute(
+        "SELECT DISTINCT page_type FROM ff_rankings_draft WHERE page_type IS NOT NULL "
+        "UNION SELECT DISTINCT page FROM ff_rankings_week WHERE page IS NOT NULL").fetchall()]
+    if not stored:
+        pytest.skip("ff_rankings_draft and ff_rankings_week hold no ranking sets")
     examples = re.findall(r"'([^']+)'", _prop_desc("nfl_fantasy_rankings", "ranking_set"))
     assert examples
+    checked = 0
     for ex in examples:
-        n = real_db.execute(
-            "SELECT COUNT(*) FROM (SELECT page_type AS s FROM ff_rankings_draft "
-            "UNION ALL SELECT page FROM ff_rankings_week) WHERE s ILIKE ?", [f"%{ex}%"]).fetchone()[0]
-        assert n > 0, ex
+        family = ex.lower().split("-")[0]
+        if family in RANKING_SET_FAMILIES and not any(family in s for s in stored):
+            continue  # a real family this scrape lacks
+        assert any(ex.lower() in s for s in stored), (ex, sorted(stored))
+        checked += 1
+    if not checked:
+        pytest.skip(f"the stored sets {sorted(stored)} cover none of the quoted families")
+
+
+@pytest.mark.parametrize("tool,column", [("nfl_fantasy_rankings", "page_type"),
+                                         ("nfl_injury_return", "injury_type")])
+@pytest.mark.parametrize("value,pattern", [("redraft_qb", "%redraft\\_qb%"), ("100%", "%100\\%%")])
+def test_partial_match_takes_like_wildcards_literally(monkeypatch, tool, column, value, pattern):
+    # % and _ in the value are escaped, so 'redraft_qb' does not match 'redraft-qb'.
+    captured = []
+    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: captured.append((sql, params)) or [])
+    arg = "ranking_set" if tool == "nfl_fantasy_rankings" else "injury_type"
+    getattr(tools, tool)(**{arg: value})
+    sql, params = captured[0]
+    assert f"{column} ILIKE ? ESCAPE '\\'" in sql, sql
+    assert pattern in params, params
+
+
+def test_fantasy_rankings_ranking_set_wildcard_matches_nothing(real_db):
+    # SELECT count(*) FROM ff_rankings_draft WHERE page_type ILIKE '%redraft_qb%' -> > 0 when
+    # redraft-qb is stored ('_' is any character); the tool takes '_' literally -> 0 rows.
+    n = real_db.execute("SELECT count(*) FROM ff_rankings_draft WHERE page_type ILIKE '%redraft_qb%'"
+                        ).fetchone()[0]
+    if not n:
+        pytest.skip("no redraft-qb set stored")
+    assert tools.nfl_fantasy_rankings(ranking_set="redraft_qb")["fantasy_rankings"] == []
+    assert tools.nfl_fantasy_rankings(ranking_set="redraft-qb", limit=1)["count"] == 1
 
 
 def test_fantasy_rankings_explains_fa_team():
@@ -509,6 +569,25 @@ def test_description_states_season_type_values(tool, values):
     text = _desc(tool) + "\n" + _prop_desc(tool, "season_type")
     missing = [v for v in values if not _word(v, text)]
     assert not missing, (tool, missing)
+
+
+@pytest.mark.parametrize("tool,values",
+                         [(t, SEASON_TOTAL_VALUES) for t in SEASON_TOTAL_TOOLS]
+                         + [(t, PER_GAME_VALUES) for t in PER_GAME_TOOLS])
+def test_tool_description_itself_states_season_type_values(tool, values):
+    # Spec: every tool description states its season_type values, not only the property.
+    text = _desc(tool)
+    missing = [v for v in values if not _word(v, text)]
+    assert not missing, (tool, missing)
+    if tool in SEASON_TOTAL_TOOLS:
+        assert not any(_word(r, text) for r in ("WC", "DIV", "CON", "SB")), text
+
+
+def test_contract_value_description_names_the_contract_in_force():
+    # ingest.py: the contract with the latest year_signed <= season, not the current one.
+    text = _desc("nfl_contract_value").lower()
+    assert "current active contract" not in text and "active contract" not in text, text
+    assert "in force" in text, text
 
 
 @pytest.mark.parametrize("tool", NAME_TOOLS)

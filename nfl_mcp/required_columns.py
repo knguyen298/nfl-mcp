@@ -74,16 +74,17 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
         "total_fantasy_points", "total_fantasy_points_exp", "total_fantasy_points_diff",
         "rec_attempt_team", "rush_attempt_team",
     ],
-    # nfl_fantasy_rankings (table picked by scope)
+    # nfl_fantasy_rankings (table picked by scope; a player's rows by FantasyPros id)
     "ff_rankings_draft": [
-        "player", "pos", "team", "ecr", "sd", "best", "worst", "bye", "page_type",
+        "player", "id", "pos", "team", "ecr", "sd", "best", "worst", "bye", "page_type",
         "ecr_type", "scrape_date",
     ],
     "ff_rankings_week": [
-        "player_name", "pos", "team", "rank", "ecr", "sd", "best", "worst", "pos_rank",
-        "player_opponent", "player_bye_week", "start_sit_grade", "note", "page",
+        "player_name", "fantasypros_id", "pos", "team", "rank", "ecr", "sd", "best", "worst",
+        "pos_rank", "player_opponent", "player_bye_week", "start_sit_grade", "note", "page",
         "scrape_date",
     ],
+    "ff_playerids": ["fantasypros_id", "gsis_id"],
     # nfl_ftn_charting (joined to plays on game_id, play_id)
     "ftn_charting": [
         "nflverse_game_id", "nflverse_play_id", "is_play_action", "is_rpo",

@@ -52,8 +52,9 @@ nfl_fantasy_opportunity(player=None, player_id=None, ..., season_type required):
     table's player_id column; a name resolves through players first (so "Ja'Marr Chase"
     finds the short-form "J.Chase" drop-rate row); several matches -> ambiguous; no
     match -> no rows and a reason (part of a name matches nobody).
-nfl_fantasy_rankings(player=...): ff_rankings_* have no gsis id; the name match ignores
-    apostrophes and periods on both sides ("Ja'Marr Chase" finds "JaMarr Chase").
+nfl_fantasy_rankings(player=...): ff_rankings_* have no gsis id; for a row ff_playerids does not
+    link to one, the name match ignores apostrophes and periods on both sides ("Ja'Marr Chase"
+    finds "JaMarr Chase").
 """
 
 from __future__ import annotations
@@ -301,22 +302,24 @@ def _build_db(path: Path) -> None:
     _table(con, "ff_opportunity", ffo_cols,
            [dict(season="2024", week=1.0, posteam=t, full_name=n, position=p, player_id=g,
                  game_id="2024_01_KC_BAL", total_fantasy_points_exp=10.0) for g, n, p, t in who])
+    # No FantasyPros id is linked to a gsis_id, so the rows match by name and position.
+    _table(con, "ff_playerids", {"fantasypros_id": "BIGINT", "gsis_id": "VARCHAR"}, [])
     _table(con, "ff_rankings_week", dict(
-        page="VARCHAR", player_name="VARCHAR", pos="VARCHAR", team="VARCHAR", rank="BIGINT",
+        page="VARCHAR", fantasypros_id="BIGINT", player_name="VARCHAR", pos="VARCHAR", team="VARCHAR", rank="BIGINT",
         ecr="DOUBLE", sd="DOUBLE", best="BIGINT", worst="BIGINT", pos_rank="VARCHAR",
         player_opponent="VARCHAR", player_bye_week="BIGINT", start_sit_grade="VARCHAR",
         note="VARCHAR", scrape_date="VARCHAR"),
-        [dict(page="ppr-wr", player_name=n, pos=p, team=t, ecr=e)
-         for n, p, t, e in [("JaMarr Chase", "WR", "CIN", 1.0),
-                            ("Amon-Ra St Brown", "WR", "DET", 3.0),
-                            ("Keenan Allen", "WR", "CHI", 30.0)]])
+        [dict(page="ppr-wr", fantasypros_id=i, player_name=n, pos=p, team=t, ecr=e)
+         for i, n, p, t, e in [(1, "JaMarr Chase", "WR", "CIN", 1.0),
+                               (2, "Amon-Ra St Brown", "WR", "DET", 3.0),
+                               (3, "Keenan Allen", "WR", "CHI", 30.0)]])
     _table(con, "ff_rankings_draft", dict(
-        page_type="VARCHAR", ecr_type="VARCHAR", player="VARCHAR", pos="VARCHAR",
+        page_type="VARCHAR", ecr_type="VARCHAR", player="VARCHAR", id="BIGINT", pos="VARCHAR",
         team="VARCHAR", ecr="DOUBLE", sd="DOUBLE", best="BIGINT", worst="BIGINT", bye="BIGINT",
         scrape_date="VARCHAR"),
-        [dict(page_type="redraft-overall", player=n, pos=p, team=t, ecr=e)
-         for n, p, t, e in [("Ja'Marr Chase", "WR", "CIN", 1.0),
-                            ("Amon-Ra St. Brown", "WR", "DET", 5.0)]])
+        [dict(page_type="redraft-overall", player=n, id=i, pos=p, team=t, ecr=e)
+         for i, n, p, t, e in [(1, "Ja'Marr Chase", "WR", "CIN", 1.0),
+                               (2, "Amon-Ra St. Brown", "WR", "DET", 5.0)]])
     con.close()
 
 

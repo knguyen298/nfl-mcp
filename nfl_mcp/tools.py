@@ -703,6 +703,10 @@ def nfl_status() -> Dict[str, Any]:
 # name the last word is the metric and earlier words qualify it.
 
 _COLUMN_NOT_FOUND = re.compile(r'Referenced column "(?P<name>[^"]+)" not found', re.IGNORECASE)
+# A qualified reference (p.description) names the table, alias or CTE ('Table "p"', 'Values
+# list "c"') the column is missing from.
+_QUALIFIED_COLUMN_NOT_FOUND = re.compile(
+    r'"(?P<table>[^"]+)" does not have a column named "(?P<name>[^"]+)"', re.IGNORECASE)
 _TABLE_NOT_FOUND = re.compile(r"Table with name (?P<name>\S+) does not exist", re.IGNORECASE)
 _QUOTED_NAMES = re.compile(r'"(?P<name>[^"]+)"')
 _WORDS = re.compile(r"[^a-z0-9]+")
@@ -738,11 +742,11 @@ def _live_names(sql: str, params: Sequence[Any] | None = None) -> list[str]:
         return []
 
 
-def _base_tables(node: Any) -> Iterable[str]:
-    """table_name of every BASE_TABLE reference in a json_serialize_sql tree."""
+def _base_tables(node: Any) -> Iterable[tuple[str, str]]:
+    """(table_name, alias) of every BASE_TABLE reference in a json_serialize_sql tree."""
     if isinstance(node, dict):
         if node.get("type") == "BASE_TABLE" and node.get("table_name"):
-            yield node["table_name"]
+            yield node["table_name"], node.get("alias") or ""
         for value in node.values():
             yield from _base_tables(value)
     elif isinstance(node, list):
@@ -750,11 +754,13 @@ def _base_tables(node: Any) -> Iterable[str]:
             yield from _base_tables(value)
 
 
-def _queried_tables(sql: str) -> list[str] | None:
-    """Live tables the statement reads (its FROM and JOIN clauses, CTEs included).
+def _queried_tables(sql: str, qualifier: str | None = None) -> list[str] | None:
+    """Live tables the statement reads, joined tables and the tables inside CTEs included.
 
     DuckDB parses the statement (json_serialize_sql); a CTE name is not a live table, so it
-    drops out. None when the statement cannot be parsed that way.
+    drops out. qualifier is the table or alias of a qualified column (p in p.description):
+    when it names one live table, only that table is returned. None when the statement cannot
+    be parsed that way.
     """
     match = _EXPLAIN_PREFIX.match(sql)
     body = sql[match.end():] if match else sql
@@ -766,7 +772,13 @@ def _queried_tables(sql: str) -> list[str] | None:
     if tree.get("error"):
         return None
     live = {t.lower(): t for t in _live_names(_TABLE_NAMES_SQL)}
-    return list(dict.fromkeys(live[t.lower()] for t in _base_tables(tree) if t.lower() in live))
+    refs = [(live[t.lower()], alias.lower()) for t, alias in _base_tables(tree) if t.lower() in live]
+    if qualifier:
+        q = qualifier.lower()
+        named = [t for t, alias in refs if alias == q or (not alias and t.lower() == q)]
+        if named:
+            return named[:1]
+    return list(dict.fromkeys(t for t, _ in refs))
 
 
 def _suggest(unknown: str, candidates: Iterable[str], limit: int = 5) -> list[str]:
@@ -820,10 +832,11 @@ def _sql_error_detail(exc: Exception, sql: str | None = None) -> Dict[str, Any]:
     if _NEAR_DESC.search(message):
         return {"hint": _DESC_HINT}
 
-    guessed_column = _COLUMN_NOT_FOUND.search(message)
+    guessed_column = _COLUMN_NOT_FOUND.search(message) or _QUALIFIED_COLUMN_NOT_FOUND.search(message)
     if guessed_column:
         unknown = guessed_column.group("name")
-        tables = _queried_tables(sql) if sql else None
+        qualifier = guessed_column.groupdict().get("table")
+        tables = _queried_tables(sql, qualifier) if sql else None
         if tables is None:
             pool = _live_names(_COLUMN_NAMES_SQL)
         elif tables:
@@ -1899,6 +1912,14 @@ def nfl_roster(
         return {"error": str(e)}
 
 
+# season_type of a row keyed on game_type (injuries, schedules, snap_counts): REG for a
+# regular-season game, POST for any of the four playoff rounds.
+_SEASON_TYPE_OF_GAME = (
+    "CASE game_type WHEN 'REG' THEN 'REG' WHEN 'WC' THEN 'POST' WHEN 'DIV' THEN 'POST' "
+    "WHEN 'CON' THEN 'POST' WHEN 'SB' THEN 'POST' END"
+)
+
+
 @_checked
 def nfl_injuries(
     team: str | None = None,
@@ -1950,9 +1971,7 @@ def nfl_injuries(
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
         SELECT full_name, gsis_id, position, team, season, week,
-               CASE game_type WHEN 'REG' THEN 'REG'
-                    WHEN 'WC' THEN 'POST' WHEN 'DIV' THEN 'POST'
-                    WHEN 'CON' THEN 'POST' WHEN 'SB' THEN 'POST' END AS season_type,
+               {_SEASON_TYPE_OF_GAME} AS season_type,
                report_primary_injury, report_secondary_injury, report_status,
                practice_primary_injury, practice_secondary_injury, practice_status
         FROM injuries
@@ -1979,7 +1998,8 @@ def nfl_schedule(
 ) -> Dict[str, Any]:
     """
     Look up game schedules and results. Filter by team, season, week, or season type
-    (required: REG, POST, ALL or one round WC, DIV, CON, SB). Each game carries its game_type.
+    (required: REG, POST, ALL or one round WC, DIV, CON, SB). Each game carries its
+    season_type (REG or POST) and its game_type (the round).
     Returns scores, spread lines, weather, stadium, and coaching info.
     """
     game_types = _game_types(season_type)
@@ -2003,7 +2023,8 @@ def nfl_schedule(
 
     where = " AND ".join(conditions)
     sql = f"""
-        SELECT game_id, season, week, game_type, gameday, gametime,
+        SELECT game_id, season, week, {_SEASON_TYPE_OF_GAME} AS season_type, game_type,
+               gameday, gametime,
                away_team, home_team, away_score, home_score, result,
                overtime, spread_line, total_line, div_game,
                roof, surface, temp, wind,
@@ -2159,7 +2180,8 @@ def nfl_snap_counts(
 
         where = " AND ".join(conditions)
         sql = f"""
-            SELECT player, pfr_player_id, position, team, opponent, season, week, game_type,
+            SELECT player, pfr_player_id, position, team, opponent, season, week,
+                   {_SEASON_TYPE_OF_GAME} AS season_type, game_type,
                    offense_snaps, ROUND(100 * offense_pct, 1) AS offense_pct, defense_snaps,
                    ROUND(100 * defense_pct, 1) AS defense_pct,
                    st_snaps, ROUND(100 * st_pct, 1) AS st_pct
@@ -2254,6 +2276,58 @@ def nfl_fantasy_opportunity(
         return {"error": str(e)}
 
 
+# FantasyPros position groups of a players.position, for ranking rows that ff_playerids does
+# not link to a gsis_id. An edge rusher is DL in one source and LB in the other.
+_RANKING_POSITIONS = {
+    "CB": ("DB",), "S": ("DB",), "SAF": ("DB",), "FS": ("DB",), "SS": ("DB",), "DB": ("DB",),
+    "DT": ("DL",), "NT": ("DL",), "DL": ("DL",), "DE": ("DL", "LB"),
+    "LB": ("LB", "DL"), "OLB": ("LB", "DL"), "ILB": ("LB", "DL"), "MLB": ("LB", "DL"),
+    "FB": ("RB",),
+}
+_PLAYER_NAME_FORMS = [
+    _fold_sql("p.display_name", True),
+    _fold_sql("(p.first_name || ' ' || p.last_name)", True),
+    _fold_sql("(p.common_first_name || ' ' || p.last_name)", True),
+]
+
+
+def _ranking_ids(found: dict, table: str, id_col: str, name_col: str) -> tuple[list[int], str | None]:
+    """FantasyPros ids of one resolved player's ranking rows. Returns (ids, reason).
+
+    ff_playerids maps fantasypros_id to gsis_id, so a player with a mapping gets the rows of
+    his ids and no other. For a player with none, a row counts when it has no mapping either,
+    its folded name (suffix dropped) is one of his names and its position is in his position
+    group ("Byron Murphy II" the DL is not "Byron Murphy" the CB). Rows of several ids are
+    narrowed to a team he played for; when several ids are left, none is used and the
+    reason says why.
+    """
+    mapped = sorted(r["fantasypros_id"] for r in _execute(
+        "SELECT DISTINCT fantasypros_id FROM ff_playerids "
+        "WHERE gsis_id = ? AND fantasypros_id IS NOT NULL", [found["gsis_id"]]))
+    if mapped:
+        return mapped, None
+    position = str(found.get("position") or "").upper()
+    pos_clause, pos_params = _in_clause("upper(t.pos)", _RANKING_POSITIONS.get(position, (position,)))
+    rows = _execute(f"""
+        SELECT DISTINCT t.{id_col} AS id, t.team
+        FROM {table} t
+        WHERE t.{id_col} IS NOT NULL AND {pos_clause}
+          AND NOT EXISTS (SELECT 1 FROM ff_playerids x
+                          WHERE x.fantasypros_id = t.{id_col} AND x.gsis_id IS NOT NULL)
+          AND {_fold_sql('t.' + name_col, True)} IN (
+              SELECT unnest([{', '.join(_PLAYER_NAME_FORMS)}]) FROM players p WHERE p.gsis_id = ?)
+    """, [*pos_params, found["gsis_id"]])
+    ids = sorted({r["id"] for r in rows})
+    if len(ids) > 1:
+        teams = set(found.get("teams") or [])
+        ids = sorted({r["id"] for r in rows if teams & set(team_codes(r["team"]) or ())}) or ids
+    if len(ids) > 1:
+        return [], (f"{table} ranks several players named like {found['display_name']} "
+                    "(FantasyPros ids " + ", ".join(map(str, ids)) + ") that ff_playerids does "
+                    "not link to a gsis_id, so none of them is taken to be this player.")
+    return ids, None
+
+
 @_checked
 def nfl_fantasy_rankings(
     player: str | None = None,
@@ -2280,35 +2354,43 @@ def nfl_fantasy_rankings(
     conditions, params = [], []
     if scope == "draft":
         table = "ff_rankings_draft"
-        player_col, set_col = "player", "page_type"
+        player_col, set_col, id_col = "player", "page_type", "id"
         select = (
             "player, pos AS position, team, ecr, sd, best, worst, bye, "
             "page_type AS ranking_set, ecr_type, scrape_date"
         )
     else:
         table = "ff_rankings_week"
-        player_col, set_col = "player_name", "page"
+        player_col, set_col, id_col = "player_name", "page", "fantasypros_id"
         select = (
             "player_name AS player, pos AS position, team, rank, ecr, sd, best, worst, "
             "pos_rank, player_opponent AS opponent, player_bye_week AS bye, "
             "start_sit_grade, note, page AS ranking_set, scrape_date"
         )
 
-    found = None
+    found, reason = None, None
     if player or player_id:
         # The ranking tables have no gsis id. The name resolves through players with the one
-        # name rule, and a row belongs to that player when its folded name equals the
-        # player's folded full name ("Patrick Mahomes II" is "patrick mahomes"). A name no
-        # player has (a team defense such as 'Kansas City Chiefs') must equal a stored name.
+        # name rule, and the rows are those of the player's FantasyPros ids (_ranking_ids). A
+        # name no player has (a team defense such as 'Kansas City Chiefs') must equal a
+        # stored name, folded and with the suffix dropped.
         try:
             found, early = _resolve_player(player, player_id)
+            if found is not None:
+                ids, reason = _ranking_ids(found, table, id_col, player_col)
         except (duckdb.Error, ValueError, TimeoutError) as e:
             logger.exception("Tool error")
             return {"error": str(e)}
         if early is not None:
             return early
-        conditions.append(f"{_fold_sql(player_col, True)} = ?")
-        params.append(_fold(found["display_name"] if found else str(player), strip_suffix=True))
+        if found is None:
+            conditions.append(f"{_fold_sql(player_col, True)} = ?")
+            params.append(_fold(str(player), strip_suffix=True))
+        elif ids:
+            conditions.append(_in_clause(id_col, ids)[0])
+            params.extend(ids)
+        else:
+            conditions.append("FALSE")
     if position:
         conditions.append("upper(pos) = ?")
         params.append(position.strip().upper())
@@ -2320,8 +2402,8 @@ def nfl_fantasy_rankings(
             conditions.append(team_clause[0])
             params.extend(team_clause[1])
     if ranking_set:
-        conditions.append(f"{set_col} ILIKE ?")
-        params.append(f"%{ranking_set}%")
+        conditions.append(f"{set_col} ILIKE ? ESCAPE '\\'")
+        params.append(_like_pattern(str(ranking_set)))
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
@@ -2332,7 +2414,16 @@ def nfl_fantasy_rankings(
     """
     try:
         rows, page = _execute_limited(sql, params, limit, offset)
-        return _with_player({"fantasy_rankings": rows, "scope": scope, **page}, found)
+        result = _with_player({"fantasy_rankings": rows, "scope": scope, **page}, found)
+        if not rows and (player or player_id):
+            if found is None:
+                reason = (f"No {table} row matches '{player}' with these filters, and no "
+                          "player has that name. Try nfl_player_lookup.")
+            result["reason"] = reason or (
+                f"No {table} row matches {found['display_name']} ({found['gsis_id']}) with "
+                "these filters. The rankings hold only the players FantasyPros ranks in its "
+                "latest scrape.")
+        return result
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -2777,7 +2868,7 @@ def nfl_contract_value(
 ) -> Dict[str, Any]:
     """
     Contract value efficiency — fantasy points per $M of average per year (APY),
-    using each player's active contract joined to seasonal fantasy production
+    using each player's contract joined to seasonal fantasy production
     (player_contract_value). apy and cap_pct reflect the contract in force that season.
     Default sort is best value first (fp_per_million DESC). season_type (required) is REG, POST
     or ALL; each row has a season_type, and ALL returns the REG and POST rows separately, never
@@ -2853,8 +2944,8 @@ def nfl_injury_return(
     week_post_return = _int_arg("week_post_return", week_post_return)
     conditions, params = [], []
     if injury_type:
-        conditions.append("injury_type ILIKE ?")
-        params.append(f"%{injury_type}%")
+        conditions.append("injury_type ILIKE ? ESCAPE '\\'")
+        params.append(_like_pattern(str(injury_type)))
     if position:
         conditions.append("position = ?")
         params.append(position.upper())
@@ -2893,7 +2984,8 @@ _TOOL_TABLES: dict[str, Sequence[str] | None] = {
     "nfl_schedule": ("schedules",),
     "nfl_snap_counts": ("snap_counts", *_PLAYER_TABLES),
     "nfl_fantasy_opportunity": ("ff_opportunity", *_PLAYER_TABLES),
-    "nfl_fantasy_rankings": ("ff_rankings_draft", "ff_rankings_week"),
+    "nfl_fantasy_rankings": ("ff_rankings_draft", "ff_rankings_week", "ff_playerids",
+                             *_PLAYER_TABLES),
     "nfl_ftn_charting": ("ftn_charting", "plays", *_PLAYER_TABLES),
     "nfl_td_luck": ("player_td_luck", *_PLAYER_TABLES),
     "nfl_role_trend": ("player_role_trend", *_PLAYER_TABLES),
