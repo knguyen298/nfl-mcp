@@ -734,16 +734,16 @@ def stale_db(tmp_path, monkeypatch):
 def test_stale_tables_reg_returns_error_with_code(stale_db):
     # v0.7.0: a table without season_type cannot answer REG either (its rows mix REG and
     # POST), so REG is refused like every other season type.
-    expected = {"error": "Derived team tables are stale; run `nfl-mcp rebuild`",
-                "code": "STALE_DERIVED_TABLES"}
+    # v0.7.3: the text names no command (see tests/fixes/test_v073.py); shape and code stay.
+    expected = {"error": tools._STALE_ERROR["error"], "code": "STALE_DERIVED_TABLES"}
     assert tools.nfl_team_stats("KC", 2024, side="offense", season_type="REG") == expected
     assert tools.nfl_compare(team1="KC", team2="BUF", season=2024,
                              season_type="REG") == expected
 
 
 def test_stale_tables_explicit_post_returns_error_with_code(stale_db):
-    expected = {"error": "Derived team tables are stale; run `nfl-mcp rebuild`",
-                "code": "STALE_DERIVED_TABLES"}
+    # v0.7.3: the text names no command (see tests/fixes/test_v073.py); shape and code stay.
+    expected = {"error": tools._STALE_ERROR["error"], "code": "STALE_DERIVED_TABLES"}
     assert tools.nfl_team_stats("KC", 2024, season_type="POST") == expected
     assert tools.nfl_compare(team1="KC", team2="BUF", season=2024,
                              season_type="POST") == expected

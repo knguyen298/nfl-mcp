@@ -816,4 +816,4 @@ def test_version_1_fantasy_tables_answer_stale_for_every_season_type(
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))
     res = tool(season=2024, season_type=season_type)
     assert res["code"] == "STALE_DERIVED_TABLES"
-    assert "nfl-mcp upgrade" in res["error"]
+    assert "nfl-mcp" in res["error"] and "older version" in res["error"]   # v0.7.3: no command

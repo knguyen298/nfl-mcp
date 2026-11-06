@@ -15,7 +15,7 @@ Interface contract
   season_type, exact upper case, one of REG, POST, ALL (ALL returns the REG rows and the POST
   rows, one row per type). A missing value, lower case or any other value is INVALID_ARGUMENT
   and lists the valid values. A database whose derived player tables lack season_type answers
-  STALE_DERIVED_TABLES ("run nfl-mcp upgrade") for every value.
+  STALE_DERIVED_TABLES for every value (v0.7.3: the text says the server updates the database).
 - ORDER BY has season_type DESC (REG first) before rowid.
 """
 
@@ -450,7 +450,7 @@ def test_stale_tables_refuse_every_season_type(stale_db, tool, key, value):
     # Rows without a season_type would blend REG and POST, so no rows come back at all.
     res = tool(season=2024, season_type=value)
     assert res["code"] == "STALE_DERIVED_TABLES"
-    assert "nfl-mcp upgrade" in res["error"]
+    assert "updates the database automatically" in res["error"]   # v0.7.3: no command
     assert key not in res
 
 

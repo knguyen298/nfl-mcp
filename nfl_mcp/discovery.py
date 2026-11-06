@@ -154,7 +154,8 @@ DATA_NOTES: list[str] = [
     "start in 2016. They are the NFL's tracking-data stats. The separation numbers in "
     "nfl_separation_opportunity come from them."),
     ("plays covers 1999 to the current season. Earlier seasons have no play-by-play. "
-    "team_records goes back to 1970 through the optional 'nfl-mcp ingest --pre1999' pull."),
+    "team_records goes back to 1970 through an optional ESPN data pull of the 1970-1998 "
+    "records."),
     ("First season of each dataset (nothing loads before it), by start year: "
     + _start_seasons() + "."),
     ("season_type is REG or POST in plays and in the derived team and player tables. "
@@ -169,8 +170,9 @@ DATA_NOTES: list[str] = [
     ("The tools that read season-type data require season_type, in exact upper case, with no "
     "default. Season-total tools take REG, POST or ALL. Per-game tools also take WC, DIV, CON "
     "or SB. ALL returns the REG rows and the POST rows as separate rows, never one combined "
-    "row. A database built before v0.7.0 answers STALE_DERIVED_TABLES until you run "
-    "'nfl-mcp upgrade'."),
+    "row. A database built before v0.7.0 answers STALE_DERIVED_TABLES until the server "
+    "updates it. The server does that automatically, when the container starts and in the "
+    "weekly database update."),
     ("Column names differ by table. schedules and snap_counts have game_type (REG, WC, DIV, "
     "CON, SB), not season_type. players has display_name (the full name), not full_name; "
     "rosters and injuries have full_name. The plays column \"desc\" is an SQL keyword and must "

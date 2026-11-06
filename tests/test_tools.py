@@ -772,13 +772,15 @@ class TestNflTeamRecords:
         with patch("nfl_mcp.tools._execute", return_value=[]):
             result = nfl_team_records(team="GB", season=1996)
         assert result["status"] == "record_not_available"
-        assert "--pre1999" in result["reason"]
+        # v0.7.3: names the optional ESPN pull, not a command the container user cannot run.
+        assert "optional ESPN data pull" in result["reason"]
+        assert "nfl-mcp" not in result["reason"]
 
     def test_missing_modern_record_makes_no_pull_suggestion(self):
         with patch("nfl_mcp.tools._execute", return_value=[]):
             result = nfl_team_records(team="GB", season=2024)
         assert result["status"] == "record_not_available"
-        assert "pre1999" not in result["reason"]
+        assert "ESPN" not in result["reason"]
 
     def test_database_errors_are_returned(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("no table team_records")):

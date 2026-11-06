@@ -1329,14 +1329,23 @@ class _StaleDerivedTables(Exception):
     """A season_type was asked of derived tables built before season_type existed."""
 
 
+# The model cannot run a command, and in the container nobody runs one: the server
+# upgrades an older database itself, so the message says that instead of naming a command.
+_STALE_UPDATE = ("The server updates the database automatically, when the container starts "
+                 "and in the weekly database update.")
+
 _STALE_ERROR = {
-    "error": "Derived team tables are stale; run `nfl-mcp rebuild`",
+    "error": ("The derived team tables in this database were built by an older version of "
+              f"nfl-mcp than this server. {_STALE_UPDATE} The team stats work again after "
+              "that update finishes."),
     "code": "STALE_DERIVED_TABLES",
 }
 
 
 _STALE_PLAYER_ERROR = {
-    "error": "Derived player tables are stale; run `nfl-mcp upgrade`",
+    "error": ("The derived player tables in this database were built by an older version of "
+              f"nfl-mcp than this server. {_STALE_UPDATE} These player stats work again after "
+              "that update finishes."),
     "code": "STALE_DERIVED_TABLES",
 }
 
@@ -2374,8 +2383,9 @@ def nfl_team_records(
         if season is not None and season < RECORDS_FIRST_NFLVERSE_SEASON:
             result["reason"] = (
                 "No stored record for that franchise and season. Records before "
-                f"{RECORDS_FIRST_NFLVERSE_SEASON} come from the opt-in ESPN pull: "
-                "run 'nfl-mcp ingest --pre1999'."
+                f"{RECORDS_FIRST_NFLVERSE_SEASON} come from an optional ESPN data pull. "
+                "This database was built without that pull, or ESPN's archive has no "
+                "record for this franchise and season."
             )
         else:
             result["reason"] = "No stored record for that franchise and season."

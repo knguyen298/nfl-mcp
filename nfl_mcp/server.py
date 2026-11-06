@@ -1085,8 +1085,8 @@ TOOLS = [
             "the current season (null before 1999). A playoff game's result is in "
             "nfl_schedule. Use the team's "
             "CURRENT abbreviation ('LV' for the Raiders in every era); rows include the "
-            "name the club played that season under. Pre-1999 seasons need the optional "
-            "'nfl-mcp ingest --pre1999' pull and report record_not_available if absent. "
+            "name the club played that season under. Pre-1999 seasons come from an optional "
+            "ESPN data pull and report record_not_available if absent. "
             "A call needs at least one of team, season or a season_from/season_to range."
         ),
         inputSchema={

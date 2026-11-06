@@ -30,8 +30,8 @@ filter season_type before you sum):
   formation_effectiveness (team, season_year, season_type, formation, play_type, avg_epa, ...)
   team_records        (season, team, source_team, games, wins, losses, ties, points_for,
                       points_against, point_diff, source) — final regular-season record and
-                      points per franchise, 1970+ (1970-1998 needs the optional
-                      'nfl-mcp ingest --pre1999' and has no points). `team` is the CURRENT
+                      points per franchise, 1970+ (1970-1998 comes from an optional
+                      ESPN data pull and has no points). `team` is the CURRENT
                       abbreviation, so the Raiders are 'LV' in every season and will not match
                       `posteam`='OAK' in plays.
 
