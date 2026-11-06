@@ -12,8 +12,9 @@ The SQL sits in a comment next to the value. Values were measured on a 2024-only
 (the shape GitHub CI ingests).
 
 Databases. Integration tests read NFL_MCP_DB_PATH when it is set, otherwise
-/tmp/ci2024/v072b.duckdb (a copy of v071.duckdb upgraded by this nfl-mcp; v072.duckdb holds the
-first schema-4 build, before kneels counted in the totals). The schema-3 tests
+/tmp/ci2024/v072c.duckdb (a copy of v071.duckdb upgraded by this nfl-mcp; v072.duckdb holds the
+first schema-4 build, before kneels counted in the totals, and v072b.duckdb the build where
+total_yards still summed yards_gained). The schema-3 tests
 read /tmp/ci2024/v071.duckdb only. Each skips with a reason when its file is missing. The unit
 tests build small databases in tmp_path and need no file.
 
@@ -28,7 +29,9 @@ What the gap between total_yards and rush_yards + net_pass_yards is, measured on
   yards_per_play_allowed) now count kneels. EPA, third-down, red-zone and explosive-play
   figures keep the pass and run plays only.
 - Two plays where yards_gained holds only part of a lateral play with an enforced penalty
-  (2024_02_LV_BAL 4375: -25, 2024_04_NE_SF 3004: -3). The source data differs, so they stay.
+  (2024_02_LV_BAL 4375: -25, 2024_04_NE_SF 3004: -3). The yards credited to the rusher and
+  passer on these plays are the official ones, so total_yards (and yards_allowed) is now
+  rush + net pass, built from those parts, not SUM(yards_gained).
 
 Interface contract tested here
 - team_offense_stats gains sack_yards (yards lost on sacks, positive) and net_pass_yards
@@ -37,7 +40,8 @@ Interface contract tested here
 - team_defense_stats gains rush_yards_allowed, pass_yards_allowed (gross), sack_yards (yards
   the defense gained on sacks, positive) and net_pass_yards_allowed. yards_allowed and sacks
   keep their names and meaning.
-- On both tables total = rush + net pass, except on the two plays above.
+- On both tables total = rush + net pass on every row, by construction. yards_per_play is
+  total / plays, with kneels in the play count.
 - migrate.SCHEMA_VERSION is 4. The new columns are in REQUIRED_COLUMNS, both tables are in
   DERIVED_TABLES and UPGRADE_REWRITES, and a schema-3 database is upgraded without the network
   to the same tables a fresh build makes.
@@ -69,7 +73,7 @@ from nfl_mcp.database import get_db_connection
 from nfl_mcp.required_columns import REQUIRED_COLUMNS
 
 _ENV_DB = os.environ.get("NFL_MCP_DB_PATH")
-DB4 = Path(_ENV_DB or "/tmp/ci2024/v072b.duckdb")
+DB4 = Path(_ENV_DB or "/tmp/ci2024/v072c.duckdb")
 DB3 = Path("/tmp/ci2024/v071.duckdb")
 TOOLS_BY_NAME = {t.name: t for t in server.TOOLS}
 
@@ -144,13 +148,13 @@ _PLAYS = [
 ]
 
 
-def _team_db(path=":memory:"):
+def _team_db(path=":memory:", plays=_PLAYS):
     con = duckdb.connect(str(path))
     ddl = ", ".join(f'"{c}" {t}' for c, t in _PLAY_COLS.items())
     con.execute(f"CREATE TABLE plays ({ddl})")
     marks = ", ".join("?" for _ in _PLAY_COLS)
     con.executemany(f"INSERT INTO plays VALUES ({marks})",
-                    [[r.get(c) for c in _PLAY_COLS] for r in _PLAYS])
+                    [[r.get(c) for c in _PLAY_COLS] for r in plays])
     with contextlib.redirect_stdout(io.StringIO()):
         ing._create_aggregate_tables(con)
     return con
@@ -210,6 +214,24 @@ def test_offense_total_is_rush_plus_net_with_kneels():
     assert (row["total_plays"], row["total_yards"]) == (8, 44)
     assert row["total_yards"] == row["rush_yards"] + row["net_pass_yards"]
     assert row["yards_per_play"] == round(44 / 8, 2)
+
+
+# A run like 2024_02_LV_BAL 4375: 25 rushing yards and 5 after a lateral, but yards_gained 5
+# (the source keeps only part of the play). The credited yards are the official ones, so
+# total_yards and yards_allowed add the 30 rushing yards, not the 5 of yards_gained:
+#   rush_yards 19 + 30 = 49, total_yards 49 + 25 = 74, total_plays 9 (SUM(yards_gained) 49)
+_LATERAL_PENALTY = _p(13, "run", 5, rush_attempt=1.0, rushing_yards=25.0,
+                      lateral_rushing_yards=5.0)
+
+
+def test_total_is_built_from_the_credited_yards_not_yards_gained():
+    con = _team_db(plays=[*_PLAYS, _LATERAL_PENALTY])
+    off = _row(con, "team_offense_stats", "BAL")
+    assert (off["rush_yards"], off["net_pass_yards"], off["total_yards"]) == (49, 25, 74)
+    assert (off["total_plays"], off["yards_per_play"]) == (9, round(74 / 9, 2))
+    de = _row(con, "team_defense_stats", "PIT")
+    assert (de["rush_yards_allowed"], de["yards_allowed"], de["plays_against"]) == (49, 74, 9)
+    assert de["yards_per_play_allowed"] == round(74 / 9, 2)
 
 
 def test_offense_analytic_metrics_leave_kneels_out():
@@ -470,37 +492,39 @@ def real4(monkeypatch):
 #     sum(COALESCE(rushing_yards,0)+COALESCE(lateral_rushing_yards,0)) FILTER (WHERE
 #         rush_attempt=1 AND COALESCE(two_point_attempt,0)=0
 #         AND play_type IS DISTINCT FROM 'no_play')                                     -- rush_yards
-#     sum(yards_gained) FILTER (WHERE play_type IN ('pass','run','qb_kneel')
-#                               AND COALESCE(two_point_attempt,0)=0)                    -- total_yards
-#     count(*) FILTER (same)                                                            -- total_plays
+#     rush_yards + pass_yards - sack_yards                                              -- total_yards
+#     count(*) FILTER (WHERE play_type IN ('pass','run','qb_kneel')
+#                      AND COALESCE(two_point_attempt,0)=0)                             -- total_plays
 #   FROM plays WHERE season=2024 AND season_type='REG' GROUP BY posteam
-#   BAL 24 154 4189 3189 7199 1050 | PHI 45 323 3517 3048 6242 1113
+#   BAL 24 154 4189 3189 7224 1050 | PHI 45 323 3517 3048 6242 1113
 #   DET 33 244 4718 2488 6962 1115 | KC  41 266 4046 1790 5570 1089
 #   net = pass - sack: BAL 4035, PHI 3194, DET 4474, KC 3780.
-#   rush + net = total: PHI 6242, DET 6962, KC 5570; BAL 7224 = 7199 + 25 (play 4375 below).
-_OFFENSE_SQL = """
+#   rush + net = total: BAL 7224, PHI 6242, DET 6962, KC 5570.
+_SACK_YARDS_SQL = """-sum(yards_gained) FILTER (WHERE sack = 1 AND COALESCE(two_point_attempt, 0) = 0
+                                   AND play_type IS DISTINCT FROM 'no_play')"""
+_PASS_YARDS_SQL = """sum(passing_yards) FILTER (WHERE pass_attempt = 1 AND COALESCE(sack, 0) = 0
+                                   AND COALESCE(two_point_attempt, 0) = 0
+                                   AND play_type IS DISTINCT FROM 'no_play')"""
+_RUSH_YARDS_SQL = """sum(COALESCE(rushing_yards, 0) + COALESCE(lateral_rushing_yards, 0)) FILTER (
+            WHERE rush_attempt = 1 AND COALESCE(two_point_attempt, 0) = 0
+            AND play_type IS DISTINCT FROM 'no_play')"""
+_OFFENSE_SQL = f"""
     SELECT
         count(*) FILTER (WHERE sack = 1 AND COALESCE(two_point_attempt, 0) = 0
                          AND play_type IS DISTINCT FROM 'no_play'),
-        -sum(yards_gained) FILTER (WHERE sack = 1 AND COALESCE(two_point_attempt, 0) = 0
-                                   AND play_type IS DISTINCT FROM 'no_play'),
-        sum(passing_yards) FILTER (WHERE pass_attempt = 1 AND COALESCE(sack, 0) = 0
-                                   AND COALESCE(two_point_attempt, 0) = 0
-                                   AND play_type IS DISTINCT FROM 'no_play'),
-        sum(COALESCE(rushing_yards, 0) + COALESCE(lateral_rushing_yards, 0)) FILTER (
-            WHERE rush_attempt = 1 AND COALESCE(two_point_attempt, 0) = 0
-            AND play_type IS DISTINCT FROM 'no_play'),
-        sum(yards_gained) FILTER (WHERE play_type IN ('pass', 'run', 'qb_kneel')
-                                  AND COALESCE(two_point_attempt, 0) = 0),
+        {_SACK_YARDS_SQL},
+        {_PASS_YARDS_SQL},
+        {_RUSH_YARDS_SQL},
+        {_RUSH_YARDS_SQL} + {_PASS_YARDS_SQL} - ({_SACK_YARDS_SQL}),
         count(*) FILTER (WHERE play_type IN ('pass', 'run', 'qb_kneel')
                          AND COALESCE(two_point_attempt, 0) = 0)
-    FROM plays WHERE season = 2024 AND season_type = 'REG' AND {side} = ?
+    FROM plays WHERE season = 2024 AND season_type = 'REG' AND {{side}} = ?
 """
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("team, sacks, sack_yards, pass_yards, rush_yards, total, plays", [
-    ("BAL", 24, 154, 4189, 3189, 7199, 1050),
+    ("BAL", 24, 154, 4189, 3189, 7224, 1050),
     ("PHI", 45, 323, 3517, 3048, 6242, 1113),
     ("DET", 33, 244, 4718, 2488, 6962, 1115),
     ("KC", 41, 266, 4046, 1790, 5570, 1089),
@@ -551,18 +575,49 @@ def test_offense_matches_nflverse_team_stats(real4, team):
     assert (row["rush_yards"], row["pass_yards"], row["sacks"], row["sack_yards"]) == published
 
 
-# total = rush + net pass for every 2024 team and season type, except on the plays where the
-# source yards_gained holds only part of a lateral play with an enforced penalty. The oracle
-# is per play on plays, with the table play sets:
+# The parts of total_yards for every 2024 team and season type, from plays with the table
+# play sets (each side by posteam, and by defteam for the defense table):
+#   rush part:  rushing_yards + lateral_rushing_yards on rush_attempt=1 (runs, scrambles and
+#               kneels), not two-point, not no_play
+#   pass part:  passing_yards on pass_attempt=1 AND sack=0, not two-point, not no_play
+#   sack part:  -yards_gained on sack=1, not two-point, not no_play
+#   SELECT {side}, season_type, rush, pass - sack FROM plays WHERE season=2024 GROUP BY 1, 2
+# The table's rush and net passing columns must equal these parts, and its total their sum.
+_PARTS_SQL = f"""
+    SELECT {{side}} AS team, season_type,
+        COALESCE({_RUSH_YARDS_SQL}, 0),
+        COALESCE({_PASS_YARDS_SQL}, 0) - COALESCE({_SACK_YARDS_SQL}, 0)
+    FROM plays WHERE season = 2024 AND {{side}} IS NOT NULL GROUP BY 1, 2
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("table, side, total, rush, net", [
+    ("team_offense_stats", "posteam", "total_yards", "rush_yards", "net_pass_yards"),
+    ("team_defense_stats", "defteam", "yards_allowed", "rush_yards_allowed",
+     "net_pass_yards_allowed"),
+])
+def test_total_is_rush_plus_net_for_every_team(real4, table, side, total, rush, net):
+    parts = {(t, st): (r, n) for t, st, r, n in
+             real4.execute(_PARTS_SQL.format(side=side)).fetchall()}
+    rows = real4.execute(f"SELECT team, season_type, {rush}, {net}, {total} FROM {table} "
+                         "WHERE season_year = 2024").fetchall()
+    assert len(rows) == 46  # 32 REG + 14 POST
+    assert {(t, st): (r, n) for t, st, r, n, _ in rows} == parts
+    assert all(tot == r + n for _, _, r, n, tot in rows)
+
+
+# SUM(yards_gained) differs from rush + net pass only on two 2024 plays, where the source
+# yards_gained holds only part of a lateral play with an enforced penalty. The yards credited
+# to the rusher and passer are the official ones, so total_yards uses them. Per play on plays:
 #   total part:  yards_gained when play_type IN ('pass','run','qb_kneel') AND not two-point
-#   rush part:   rushing_yards + lateral_rushing_yards on rush_attempt=1, not two-point, not no_play
-#   pass part:   passing_yards on pass_attempt=1 AND sack=0, not two-point, not no_play
-#   sack part:   yards_gained on sack=1, not two-point, not no_play
-#   SELECT game_id, play_id, posteam, season_type, total - (rush + pass + sack) FROM plays
+#   minus the rush, pass and sack parts above (sack part as yards_gained, negative)
+#   SELECT game_id, play_id, posteam, season_type, yards_gained part - parts FROM plays
 #   WHERE season=2024 AND that difference <> 0
 #   -> 2024_02_LV_BAL 4375 BAL REG -25 (run 25 + lateral 5, yards_gained 5)
 #      2024_04_NE_SF  3004 NE  REG  -3 (pass 7 with a lateral, yards_gained 4)
-_SOURCE_PLAYS = {("2024_02_LV_BAL", 4375, "BAL", "REG"): -25, ("2024_04_NE_SF", 3004, "NE", "REG"): -3}
+_LATERAL_PENALTY_PLAYS = {("2024_02_LV_BAL", 4375, "BAL", "REG"): -25,
+                          ("2024_04_NE_SF", 3004, "NE", "REG"): -3}
 _PLAY_GAP_SQL = """
     WITH parts AS (
         SELECT game_id, CAST(play_id AS INTEGER) AS play_id, {side} AS team, season_type,
@@ -579,26 +634,35 @@ _PLAY_GAP_SQL = """
     SELECT game_id, play_id, team, season_type, gap FROM parts WHERE gap <> 0
 """.format(side="{side}", not2="COALESCE(two_point_attempt, 0) = 0",
            nnp="play_type IS DISTINCT FROM 'no_play'")
+# SELECT {side}, season_type, sum(yards_gained) FILTER (WHERE play_type IN
+#   ('pass','run','qb_kneel') AND COALESCE(two_point_attempt,0)=0) FROM plays
+#   WHERE season=2024 GROUP BY 1, 2
+_YARDS_GAINED_SQL = """
+    SELECT {side}, season_type, COALESCE(sum(yards_gained) FILTER (
+        WHERE play_type IN ('pass', 'run', 'qb_kneel') AND COALESCE(two_point_attempt, 0) = 0), 0)
+    FROM plays WHERE season = 2024 AND {side} IS NOT NULL GROUP BY 1, 2
+"""
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("table, side, total, rush, net", [
-    ("team_offense_stats", "posteam", "total_yards", "rush_yards", "net_pass_yards"),
-    ("team_defense_stats", "defteam", "yards_allowed", "rush_yards_allowed",
-     "net_pass_yards_allowed"),
+@pytest.mark.parametrize("table, side, total", [
+    ("team_offense_stats", "posteam", "total_yards"),
+    ("team_defense_stats", "defteam", "yards_allowed"),
 ])
-def test_total_is_rush_plus_net_except_the_source_plays(real4, table, side, total, rush, net):
+def test_yards_gained_differs_only_on_the_lateral_penalty_plays(real4, table, side, total):
     plays = {(g, p, t, st): v for g, p, t, st, v in
              real4.execute(_PLAY_GAP_SQL.format(side=side)).fetchall()}
     # On defense the same plays count for the opponent: LV for 4375, SF for 3004.
-    expected = _SOURCE_PLAYS if side == "posteam" else {
+    expected = _LATERAL_PENALTY_PLAYS if side == "posteam" else {
         ("2024_02_LV_BAL", 4375, "LV", "REG"): -25, ("2024_04_NE_SF", 3004, "SF", "REG"): -3}
     assert plays == expected
-    rows = real4.execute(f"SELECT team, season_type, {total} - ({rush} + {net}) FROM {table} "
+    gained = {(t, st): y for t, st, y in
+              real4.execute(_YARDS_GAINED_SQL.format(side=side)).fetchall()}
+    rows = real4.execute(f"SELECT team, season_type, {total} FROM {table} "
                          "WHERE season_year = 2024").fetchall()
-    assert len(rows) == 46  # 32 REG + 14 POST
-    by_team = {(t, st): v for (_, _, t, st), v in expected.items()}
-    assert {(t, st): v for t, st, v in rows if v} == by_team
+    # The table total is SUM(yards_gained) minus the gap: BAL REG 7199 + 25 = 7224.
+    diff = {(t, st): gained[(t, st)] - tot for t, st, tot in rows if gained[(t, st)] != tot}
+    assert diff == {(t, st): v for (_, _, t, st), v in expected.items()}
 
 
 @pytest.mark.integration
