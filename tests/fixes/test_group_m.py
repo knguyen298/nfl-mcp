@@ -33,7 +33,7 @@ Contract corrections (the tests follow these, not the spec text)
    refuse it as "newer".
 
 Interface contract (shared contract plus the choices made here)
-- nfl_mcp.migrate: SCHEMA_VERSION == 3 (v0.7.1; 2 in v0.7.0, 1 before); check(conn); upgrade(conn, *, fetch=True);
+- nfl_mcp.migrate: SCHEMA_VERSION == 4 (v0.7.2; 3 in v0.7.1, 2 in v0.7.0, 1 before); check(conn); upgrade(conn, *, fetch=True);
   stamp_if_current(conn). Status objects expose the attribute names in the spec
   (version, target, steps, upgrade_needed, newer; Step.name/needed/needs_network/detail;
   result.before/after/ran/failed/pending/stamped).
@@ -121,7 +121,7 @@ V0_DB = Path("/tmp/grpE_v3.duckdb")
 V053_DB = Path.home() / ".nfl-mcp" / "nflread.duckdb"
 F_DB = Path("/tmp/grpF_work.duckdb")
 
-CUR = 3  # migrate.SCHEMA_VERSION since v0.7.1 (points in team_records); 2 was v0.7.0 (the season_type split)
+CUR = 4  # migrate.SCHEMA_VERSION since v0.7.2 (net passing in the team tables); 3 was v0.7.1, 2 v0.7.0
 
 V2_TABLES = ["player_role_trend", "player_separation_opportunity", "player_contract_value"]
 STEPS = ["derived_tables", "depth_charts_season", "raw_columns"]
@@ -148,6 +148,16 @@ V0_GAPS = {
 }
 # v0.7.1 (schema version 3): team_records gains points; every older build lacks them.
 V3_GAPS = {"team_records": ["points_for", "points_against", "point_diff"]}
+# v0.7.2 (schema version 4): the team tables gain the net passing split; every older build
+# lacks it. rush_yards (and yards_per_rush) now count yards after a lateral.
+V4_GAPS = {"team_offense_stats": ["sack_yards", "net_pass_yards"],
+           "team_defense_stats": ["rush_yards_allowed", "pass_yards_allowed", "sack_yards",
+                                  "net_pass_yards_allowed"]}
+V4_REDEFINED = {"rush_yards", "yards_per_rush"}
+
+
+def _gap_pairs(*gaps):
+    return sorted((t, c) for g in gaps for t, cs in g.items() for c in cs)
 V0_NULL_DEPTH = 1_280_630
 
 
@@ -564,8 +574,10 @@ class _Once:
 
 
 def _shared_columns(con, table, oracle="oracle"):
-    """The oracle's columns of table (grpF_work predates the v0.7.1 points columns)."""
-    names = [r[0] for r in con.execute(f"DESCRIBE {oracle}.{table}").fetchall()]
+    """The oracle's columns of table (grpF_work predates the v0.7.1 points columns and the
+    v0.7.2 net passing split), less the columns v0.7.2 redefined."""
+    names = [r[0] for r in con.execute(f"DESCRIBE {oracle}.{table}").fetchall()
+             if r[0] not in V4_REDEFINED]
     return ", ".join(f'"{n}"' for n in names)
 
 
@@ -711,8 +723,7 @@ def test_grpE_v3_shape_measurements():
         assert raw_gaps == []
         derived_gaps = sorted((t, c) for t in DERIVED for c in REQUIRED_COLUMNS[t]
                               if c not in cols.get(t, set()))
-        assert derived_gaps == sorted((t, c) for t, cs in {**V0_GAPS, **V3_GAPS}.items()
-                                      for c in cs)
+        assert derived_gaps == _gap_pairs(V0_GAPS, V3_GAPS, V4_GAPS)
     finally:
         con.close()
 
@@ -726,12 +737,15 @@ def test_v053_shape_measurements(v053_copy):
         assert all("season_type" in cols[t] for t in V0_GAPS)
         derived_gaps = sorted((t, c) for t in DERIVED for c in REQUIRED_COLUMNS[t]
                               if c not in cols.get(t, set()))
-        assert derived_gaps == [("situational_stats", "conversion_rule"),
-                                ("team_defense_stats", "def_touchdowns"),
-                                ("team_offense_stats", "pass_attempts"),
-                                ("team_records", "point_diff"),
-                                ("team_records", "points_against"),
-                                ("team_records", "points_for")]
+        assert derived_gaps == sorted([("situational_stats", "conversion_rule"),
+                                       ("team_defense_stats", "def_touchdowns"),
+                                       ("team_offense_stats", "pass_attempts"),
+                                       ("team_records", "point_diff"),
+                                       ("team_records", "points_against"),
+                                       ("team_records", "points_for")]
+                                      # v0.5.3 had its own sack_yards (from team_stats_raw)
+                                      + [p for p in _gap_pairs(V4_GAPS)
+                                         if p != ("team_offense_stats", "sack_yards")])
         assert [(t, c) for t in RAW for c in REQUIRED_COLUMNS[t] if c not in cols.get(t, set())] == []
         assert _count(con, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL") == V0_NULL_DEPTH
         assert con.execute("SELECT row_count FROM _ingest_metadata WHERE dataset_id = 'derived_shape'"
@@ -741,7 +755,7 @@ def test_v053_shape_measurements(v053_copy):
 
 
 @pytest.mark.integration
-def test_grpF_work_lacks_only_the_v2_season_type_and_v3_points_columns(f_copy):
+def test_grpF_work_lacks_only_the_v2_season_type_v3_points_and_v4_net_pass_columns(f_copy):
     con = _ro(f_copy)
     try:
         cols = _columns(con)
@@ -749,7 +763,7 @@ def test_grpF_work_lacks_only_the_v2_season_type_and_v3_points_columns(f_copy):
         con.close()
     assert sorted((t, c) for t, need in REQUIRED_COLUMNS.items()
                   for c in need if c not in cols.get(t, set())) == sorted(
-        [(t, "season_type") for t in V2_TABLES] + [(t, c) for t, cs in V3_GAPS.items() for c in cs])
+        [(t, "season_type") for t in V2_TABLES] + _gap_pairs(V3_GAPS, V4_GAPS))
 
 
 @pytest.mark.integration
@@ -792,7 +806,7 @@ def test_validate_existing_checks_pass_on_grpF_work_against_itself(f_copy):
 
 
 def test_schema_version_constant_is_2():
-    assert _migrate().SCHEMA_VERSION == CUR == 3
+    assert _migrate().SCHEMA_VERSION == CUR == 4
 
 
 def test_check_v0_synthetic_reports_every_step(tmp_path):
@@ -1002,14 +1016,19 @@ def test_check_v053_details(v053_copy):
 
 @pytest.mark.integration
 def test_check_grpF_work_needs_the_v2_derived_columns_and_the_depth_restamp(f_copy):
-    # grpF_work was built before v0.7.0: its three fantasy tables lack season_type.
+    # grpF_work was built before v0.7.0: its three fantasy tables lack season_type. It has
+    # the group F team columns; it lacks only the v0.7.2 net passing split there.
     status = _status(f_copy)
     assert status.version == 0
     assert _needed(status) == ["derived_tables", "depth_charts_season"]
     derived = _step(status, "derived_tables").detail
     for table in V2_TABLES:
         assert f"{table}.season_type" in derived, derived
-    assert "team_offense_stats" not in derived, derived
+    for table, cols in V4_GAPS.items():
+        for col in cols:
+            assert f"{table}.{col}" in derived, derived
+    assert "team_offense_stats.pass_attempts" not in derived, derived
+    assert "team_defense_stats.def_touchdowns" not in derived, derived
 
 
 # ═══ 3. migrate.upgrade ════════════════════════════════════════════════════════
@@ -1335,7 +1354,10 @@ def test_grpE_v3_upgraded_oracle_rows(v0_upgraded):
     off = [r for r in snap["team_offense_stats"] if r[:3] == ("KC", 2024, "REG")]
     assert len(off) == 1 and off[0][3:9] == (1067, 5602.0, 5.25, 450, 598, 600)
     deff = [r for r in snap["team_defense_stats"] if r[:3] == ("PHI", 2024, "POST")]
-    assert len(deff) == 1 and deff[0][3:10] == (255, 1330.0, 5.22, 16, 6, 13, 1)
+    # plays_against, yards_allowed, yards_per_play_allowed; sacks after rush and pass yards
+    # allowed (v0.7.2); interceptions, turnovers_forced, def_touchdowns after sack_yards and net.
+    assert len(deff) == 1 and deff[0][3:6] == (255, 1330.0, 5.22)
+    assert (deff[0][8], deff[0][11:14]) == (16, (6, 13, 1))
     rec = [r for r in snap["team_records"] if r[:2] == (2025, "KC")]
     # Points: SELECT SUM(pf), SUM(pa) FROM (home and away rows of schedules) WHERE
     # season = 2025 AND game_type = 'REG' AND team = 'KC' on grpE_v3 -> 362, 328.

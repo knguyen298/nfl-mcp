@@ -1379,6 +1379,76 @@ def _team_rows(
         raise _StaleDerivedTables() from e
 
 
+# What each yardage field of the team tables counts, shown in the definitions block of
+# nfl_team_stats and nfl_compare (team mode) for the blocks in the result.
+_TEAM_DEFINITIONS = {
+    "offense": {
+        "total_yards": "Net yards: yards_gained summed over pass and run plays. Sacks are in, so "
+                       "yards lost on sacks are subtracted. Kneels, spikes, special teams, no_play "
+                       "rows and two-point tries are out.",
+        "yards_per_play": "total_yards / total_plays.",
+        "rush_yards": "rushing_yards plus yards after a lateral (lateral_rushing_yards) on "
+                      "rush_attempt=1 plays, two-point tries and no_play out. Kneels and scrambles "
+                      "are in, as in the official rushing figure. Kneels are not in total_yards, so "
+                      "rush_yards + net_pass_yards = total_yards plus the kneel yards (a kneel is "
+                      "about -1 yard). On a rare lateral play with a penalty the source "
+                      "yards_gained differs too.",
+        "yards_per_rush": "rush_yards / rush_plays.",
+        "pass_yards": "Gross passing yards: passing_yards on pass attempts (sacks, two-point tries "
+                      "and no_play out). Yards lost on sacks are not subtracted.",
+        "yards_per_pass": "pass_yards / pass_attempts (gross).",
+        "sacks": "Sacks taken: sack=1 plays, two-point tries and no_play out.",
+        "sack_yards": "Yards lost on sacks, as a positive number.",
+        "net_pass_yards": "pass_yards - sack_yards: net passing yards, the official passing figure. "
+                          "total_yards counts passing this way.",
+    },
+    "defense": {
+        "yards_allowed": "Net yards allowed: the opponent's yards_gained summed over its pass and "
+                         "run plays. Sacks are in, so yards the defense gained on sacks are "
+                         "subtracted. Kneels, spikes, special teams, no_play rows and two-point "
+                         "tries are out.",
+        "yards_per_play_allowed": "yards_allowed / plays_against.",
+        "rush_yards_allowed": "The opponent's rush_yards: rushing_yards plus yards after a lateral, "
+                              "kneels and scrambles in. rush_yards_allowed + net_pass_yards_allowed "
+                              "= yards_allowed plus the opponent's kneel yards.",
+        "pass_yards_allowed": "Gross passing yards allowed: the opponent's passing_yards on pass "
+                              "attempts. Yards gained on sacks are not subtracted.",
+        "sacks": "Sacks made: sack=1 plays against the opponent, two-point tries and no_play out.",
+        "sack_yards": "Yards the defense gained on sacks (the opponent's loss), as a positive number.",
+        "net_pass_yards_allowed": "pass_yards_allowed - sack_yards: net passing yards allowed, the "
+                                  "official figure. yards_allowed counts passing this way.",
+    },
+}
+# A team table built before schema version 4 has no net_pass_yards (offense) or
+# net_pass_yards_allowed (defense). Its rows lack these fields, or count them another way
+# (rush_yards had no yards after a lateral), so their definitions are left out.
+_TEAM_V4_MARKER = {"offense": "net_pass_yards", "defense": "net_pass_yards_allowed"}
+_TEAM_V4_FIELDS = {
+    "offense": {"rush_yards", "yards_per_rush", "sack_yards", "net_pass_yards"},
+    "defense": {"rush_yards_allowed", "pass_yards_allowed", "sack_yards", "net_pass_yards_allowed"},
+}
+_STALE_TEAM_WARNING = (
+    "team_offense_stats and team_defense_stats were built by an older nfl-mcp, so sack_yards, "
+    "net_pass_yards and the defense yardage split are left out. pass_yards is gross: yards lost "
+    "on sacks are not subtracted. The new fields appear after the next database update."
+)
+
+
+def _add_team_definitions(result: dict[str, Any], blocks: dict[str, list[dict]]) -> None:
+    """Definitions of the offense and defense blocks in `blocks` (block -> rows), and the
+    warning when the rows come from a table built before schema version 4."""
+    present = [b for b in ("offense", "defense") if b in blocks]
+    if not present:
+        return
+    stale = any(_TEAM_V4_MARKER[b] not in row for b in present for row in blocks[b])
+    result["definitions"] = {
+        b: {k: v for k, v in _TEAM_DEFINITIONS[b].items()
+            if not (stale and k in _TEAM_V4_FIELDS[b])}
+        for b in present}
+    if stale:
+        result["warning"] = _STALE_TEAM_WARNING
+
+
 @_checked
 def nfl_team_stats(
     team: str,
@@ -1404,6 +1474,7 @@ def nfl_team_stats(
             results["defense"] = _team_rows("team_defense_stats", codes, filters)
         if side in ("situational", "both"):
             results["situational"] = _team_rows("situational_stats", codes, filters, ", situation")
+        _add_team_definitions(results, dict(results))
         return _with_reason(
             results, any(results.get(k) for k in ("offense", "defense", "situational")),
             "team_offense_stats", season=_int_arg("season", season),
@@ -1719,10 +1790,13 @@ def _compare_teams(
         raise _BadArgument(
             f"'{team1}' and '{team2}' are the same franchise ({first[0]}). Compare two different teams.")
     result: dict[str, Any] = {}
+    blocks: dict[str, list[dict]] = {"offense": [], "defense": []}
     for codes in (first, second):
         team = codes[0]
         offense = _team_rows("team_offense_stats", codes, filters)
         defense = _team_rows("team_defense_stats", codes, filters)
+        blocks["offense"] += offense
+        blocks["defense"] += defense
         entry: dict[str, Any] = {"offense": offense, "defense": defense}
         if not offense and not defense:
             scope = f" in {season}" if season is not None else ""
@@ -1734,6 +1808,7 @@ def _compare_teams(
             if outside:
                 entry["reason"] += f". {outside}"
         result[team] = entry
+    _add_team_definitions(result, blocks)
     return result
 
 

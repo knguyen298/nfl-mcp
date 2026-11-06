@@ -12,6 +12,10 @@ Version 2 (v0.7.0) adds season_type to player_role_trend, player_separation_oppo
 player_contract_value. The derived_tables step rebuilds them from local raw tables.
 Version 3 (v0.7.1) adds points_for, points_against and point_diff to team_records; the same
 step rebuilds it from local schedules.
+Version 4 (v0.7.2) adds sack_yards and net_pass_yards to team_offense_stats, and
+rush_yards_allowed, pass_yards_allowed, sack_yards and net_pass_yards_allowed to
+team_defense_stats; rush_yards now counts yards after a lateral. The same step rebuilds both
+tables from local plays.
 """
 
 import datetime
@@ -24,7 +28,7 @@ from .required_columns import REQUIRED_COLUMNS
 
 logger = logging.getLogger("nfl-mcp")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _VERSION_DDL = (
     "CREATE TABLE IF NOT EXISTS _schema_version "

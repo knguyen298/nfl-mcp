@@ -59,12 +59,15 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
         "points_against", "point_diff", "source",
     ],
     # nfl_team_stats, nfl_compare (team mode). The tools select * and filter on team,
-    # season_year and season_type; the rest are the columns group F added or redefined.
+    # season_year and season_type; the rest are the columns group F added or redefined, and
+    # the yardage split of v0.7.2 (schema 4).
     "team_offense_stats": [
         "team", "season_year", "season_type", "pass_plays", "pass_attempts",
+        "sack_yards", "net_pass_yards",
     ],
     "team_defense_stats": [
         "team", "season_year", "season_type", "turnovers_forced", "def_touchdowns",
+        "rush_yards_allowed", "pass_yards_allowed", "sack_yards", "net_pass_yards_allowed",
     ],
     "situational_stats": [
         "team", "season_year", "season_type", "situation", "conversion_rule",

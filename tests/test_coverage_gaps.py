@@ -611,8 +611,8 @@ class TestTeamTables:
         monkeypatch.setattr(tools, "_team_rows", lambda *a, **k: [])
         monkeypatch.setattr(tools, "_range_reason", lambda *a, **k: "Season 1900 is outside the loaded range.")
         result = tools._compare_teams("KC", "BUF", 1900, None, None, "REG")
-        for entry in result.values():
-            assert entry["reason"].endswith(". Season 1900 is outside the loaded range.")
+        for team in ("KC", "BUF"):  # v0.7.2: the result also holds "definitions"
+            assert result[team]["reason"].endswith(". Season 1900 is outside the loaded range.")
 
 
 # ── tools: statement gate ───────────────────────────────────────────────────────

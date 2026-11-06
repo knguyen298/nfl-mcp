@@ -461,7 +461,8 @@ TOOLS = [
             "season_type; situational holds one row per team, season_year, season_type and "
             "situation. To rank teams against each other, use nfl_query on team_offense_stats "
             "or team_defense_stats. Points scored and allowed are in nfl_team_records; a "
-            "playoff game's result is in nfl_schedule."
+            "playoff game's result is in nfl_schedule. pass_yards is gross, net_pass_yards "
+            "subtracts sack_yards, and definitions says what each yardage field counts."
         ),
         inputSchema={
             "type": "object",
@@ -591,7 +592,9 @@ TOOLS = [
             "nfl_team_stats or nfl_player_stats twice when the user asks to compare or "
             "contrast two teams or two players against each other. Each player gets one entry "
             "per season and season type (as nfl_player_stats); each team gets one row per "
-            "team, season_year and season_type in offense and defense (as nfl_team_stats)."
+            "team, season_year and season_type in offense and defense (as nfl_team_stats). "
+            "Team rows carry gross pass_yards and net_pass_yards, with definitions for each "
+            "yardage field."
         ),
         inputSchema={
             "type": "object",

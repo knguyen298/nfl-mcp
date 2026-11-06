@@ -421,13 +421,17 @@ AGGREGATE TABLES  (pre-aggregated, much faster for team/season queries; season_t
 POST, one row each, so filter it before you sum)
   team_offense_stats
     (team, season_year, season_type, total_plays, total_yards, yards_per_play,
-     rush_plays, pass_plays, rush_yards, pass_yards, yards_per_rush, yards_per_pass,
-     touchdowns, turnovers, third_down_pct, red_zone_td_pct, explosive_plays,
-     avg_epa, pass_epa, rush_epa)
+     rush_plays, pass_plays, sacks, rush_yards, pass_yards, sack_yards, net_pass_yards,
+     yards_per_rush, yards_per_pass, touchdowns, turnovers, third_down_pct,
+     red_zone_td_pct, explosive_plays, avg_epa, pass_epa, rush_epa)
+    -- pass_yards is gross; net_pass_yards = pass_yards - sack_yards (sack_yards positive).
+    -- total_yards is net (sacks in) and leaves out kneels, which rush_yards counts.
 
   team_defense_stats
     (team, season_year, season_type, plays_against, yards_allowed, yards_per_play_allowed,
-     sacks, interceptions, turnovers_forced, third_down_stop_pct, avg_epa_allowed)
+     rush_yards_allowed, pass_yards_allowed, sacks, sack_yards, net_pass_yards_allowed,
+     interceptions, turnovers_forced, third_down_stop_pct, avg_epa_allowed)
+    -- pass_yards_allowed is gross; net_pass_yards_allowed = pass_yards_allowed - sack_yards.
 
   situational_stats
     (team, season_year, season_type, situation, plays, avg_yards, touchdowns, conversion_pct, avg_epa)

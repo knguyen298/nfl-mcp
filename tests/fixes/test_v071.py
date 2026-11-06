@@ -18,7 +18,7 @@ file is missing. The unit tests build small databases in tmp_path and need no fi
 Interface contract tested here
 - team_records gains points_for, points_against and point_diff (regular season, the current
   season to date; NULL on ESPN rows). nfl_team_records returns them. migrate.SCHEMA_VERSION is
-  3 and a schema-2 database is upgraded without the network to the same table a fresh build
+  3 (4 since v0.7.2) and a schema-2 database is upgraded without the network to the same table a fresh build
   makes. On a database whose team_records lacks the columns, nfl_team_records still returns
   the records, without points, with a `warning` that says the points appear after the next
   database update (it does not tell the user to run `nfl-mcp upgrade`).
@@ -134,8 +134,9 @@ def test_team_records_requires_points_columns():
     assert {"points_for", "points_against", "point_diff"} <= set(REQUIRED_COLUMNS["team_records"])
 
 
-def test_schema_version_is_3_and_team_records_is_rewritten_by_the_upgrade():
-    assert migrate.SCHEMA_VERSION == 3
+def test_schema_version_is_at_least_3_and_team_records_is_rewritten_by_the_upgrade():
+    # 3 in v0.7.1; v0.7.2 moved to 4 (net passing in the team tables).
+    assert migrate.SCHEMA_VERSION >= 3
     assert "team_records" in migrate.DERIVED_TABLES
     assert "team_records" in migrate.UPGRADE_REWRITES
 
@@ -355,17 +356,17 @@ def downgraded_then_upgraded(tmp_path_factory):
 @pytest.mark.integration
 def test_v2_database_needs_the_upgrade_without_network(downgraded_then_upgraded):
     before = downgraded_then_upgraded["before"]
-    assert (before.version, before.target, before.upgrade_needed) == (2, 3, True)
+    assert (before.version, before.target, before.upgrade_needed) == (2, migrate.SCHEMA_VERSION, True)
     needed = [s for s in before.steps if s.needed]
     assert [s.name for s in needed] == ["derived_tables"], needed
     assert not needed[0].needs_network
 
 
 @pytest.mark.integration
-def test_upgrade_from_v2_stamps_3_and_rebuilds_the_same_team_records(downgraded_then_upgraded):
+def test_upgrade_from_v2_stamps_current_and_rebuilds_the_same_team_records(downgraded_then_upgraded):
     out = downgraded_then_upgraded
     assert out["result"].stamped and not out["result"].failed, out["result"]
-    assert out["version"] == 3
+    assert out["version"] == migrate.SCHEMA_VERSION
     assert out["upgraded"] == out["original"]
 
 
@@ -876,8 +877,9 @@ def test_team_stats_points_to_schedule_for_playoff_results():
 
 # ═══ 9. version and README ═════════════════════════════════════════════════════
 
-def test_version_is_0_7_1():
-    assert __version__ == "0.7.1"
+def test_version_is_at_least_0_7_1():
+    # 0.7.2 pins its own version in test_v072.
+    assert tuple(int(p) for p in __version__.split(".")) >= (0, 7, 1)
 
 
 def _readme_row(tool):

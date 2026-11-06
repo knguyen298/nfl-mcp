@@ -801,7 +801,7 @@ _PLAYS_COLUMNS: dict[str, str] = {
     **{c: "DOUBLE" for c in (
         "two_point_attempt", "pass_attempt", "rush_attempt", "complete_pass", "sack",
         "interception", "fumble_lost", "qb_dropback", "qb_scramble", "first_down", "touchdown",
-        "passing_yards", "rushing_yards")},
+        "passing_yards", "rushing_yards", "lateral_rushing_yards")},
 }
 
 # Play definitions shared by every derived team table. A two-point try carries
@@ -815,6 +815,12 @@ _PASS_ATTEMPT = f"(pass_attempt = 1 AND COALESCE(sack, 0) = 0 AND {_NOT_2PT} AND
 _RUSH_PLAY = f"(rush_attempt = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
 _SACK = f"(sack = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
 _INTERCEPTION = f"(interception = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
+# Yardage sums shared by the offense and defense tables (0, not NULL, when no play matches).
+_RUSH_YARDS = (f"COALESCE(SUM(COALESCE(rushing_yards, 0) + COALESCE(lateral_rushing_yards, 0)) "
+               f"FILTER (WHERE {_RUSH_PLAY}), 0)")
+_PASS_YARDS = f"COALESCE(SUM(COALESCE(passing_yards, 0)) FILTER (WHERE {_PASS_ATTEMPT}), 0)"
+# 0 - SUM keeps a sack for no loss at 0.0 (a unary minus gives -0.0).
+_SACK_YARDS = f"COALESCE(0 - SUM(COALESCE(yards_gained, 0)) FILTER (WHERE {_SACK}), 0)"
 
 
 def _plays_source(conn: duckdb.DuckDBPyConnection) -> str:
@@ -843,6 +849,10 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
     # teams, no_play and two-point tries out). pass_plays excludes spikes; pass_attempts is
     # the official nflverse count (spikes in). A turnover is an interception thrown or a
     # fumble lost by the team, so a muffed punt is charged to the receiving team.
+    # pass_yards is gross; sack_yards (positive) is what total_yards subtracts for sacks, so
+    # net_pass_yards is the official net figure. rush_yards adds the yards after a lateral
+    # and keeps kneels, which total_yards leaves out: total_yards is rush_yards +
+    # net_pass_yards minus the kneel yards.
     conn.execute(f"""
         CREATE TABLE team_offense_stats AS
         WITH oagg AS (
@@ -859,8 +869,9 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
                 COUNT(*) FILTER (WHERE {_SACK}) AS sacks,
                 COUNT(*) FILTER (WHERE qb_dropback = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY}) AS dropbacks,
                 COUNT(*) FILTER (WHERE qb_scramble = 1 AND {_RUSH_PLAY}) AS scrambles,
-                COALESCE(SUM(COALESCE(rushing_yards, 0)) FILTER (WHERE {_RUSH_PLAY}), 0) AS rush_yards,
-                COALESCE(SUM(COALESCE(passing_yards, 0)) FILTER (WHERE {_PASS_ATTEMPT}), 0) AS pass_yards,
+                {_RUSH_YARDS} AS rush_yards,
+                {_PASS_YARDS} AS pass_yards,
+                {_SACK_YARDS} AS sack_yards,
                 COUNT(*) FILTER (WHERE {_SCRIMMAGE} AND touchdown = 1 AND td_team = posteam) AS touchdowns,
                 COUNT(*) FILTER (WHERE {_SCRIMMAGE} AND down = 3 AND first_down = 1) AS third_down_conversions,
                 COUNT(*) FILTER (WHERE {_SCRIMMAGE} AND down = 3) AS third_downs,
@@ -887,7 +898,8 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
             oagg.total_plays, oagg.total_yards, oagg.yards_per_play,
             oagg.rush_plays, oagg.pass_plays, oagg.pass_attempts, oagg.completions,
             oagg.interceptions, oagg.sacks, oagg.dropbacks, oagg.scrambles,
-            oagg.rush_yards, oagg.pass_yards,
+            oagg.rush_yards, oagg.pass_yards, oagg.sack_yards,
+            oagg.pass_yards - oagg.sack_yards AS net_pass_yards,
             ROUND(oagg.rush_yards / NULLIF(oagg.rush_plays, 0), 2) AS yards_per_rush,
             ROUND(oagg.pass_yards / NULLIF(oagg.pass_attempts, 0), 2) AS yards_per_pass,
             oagg.touchdowns,
@@ -901,7 +913,8 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
     print("    team_offense_stats ✓")
 
     # turnovers_forced counts an interception against the team plus an opponent fumble the
-    # team recovered, so the receiving team's own muffed punt is not credited to it.
+    # team recovered, so the receiving team's own muffed punt is not credited to it. The
+    # yardage split is the offense's, seen from the defense: sack_yards is what it gained.
     conn.execute(f"""
         CREATE TABLE team_defense_stats AS
         WITH dagg AS (
@@ -910,7 +923,10 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
                 COUNT(*) FILTER (WHERE {_SCRIMMAGE}) AS plays_against,
                 COALESCE(SUM(COALESCE(yards_gained, 0)) FILTER (WHERE {_SCRIMMAGE}), 0) AS yards_allowed,
                 ROUND(AVG(yards_gained) FILTER (WHERE {_SCRIMMAGE}), 2) AS yards_per_play_allowed,
+                {_RUSH_YARDS} AS rush_yards_allowed,
+                {_PASS_YARDS} AS pass_yards_allowed,
                 COUNT(*) FILTER (WHERE {_SACK}) AS sacks,
+                {_SACK_YARDS} AS sack_yards,
                 COUNT(*) FILTER (WHERE {_INTERCEPTION}) AS interceptions,
                 COUNT(*) FILTER (WHERE {_SCRIMMAGE} AND touchdown = 1 AND td_team = defteam) AS def_touchdowns,
                 COUNT(*) FILTER (WHERE {_SCRIMMAGE} AND down = 3 AND COALESCE(first_down, 0) <> 1) AS third_down_stops,
@@ -930,7 +946,9 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
         SELECT
             dagg.team, dagg.season_year, dagg.season_type,
             dagg.plays_against, dagg.yards_allowed, dagg.yards_per_play_allowed,
-            dagg.sacks, dagg.interceptions,
+            dagg.rush_yards_allowed, dagg.pass_yards_allowed, dagg.sacks, dagg.sack_yards,
+            dagg.pass_yards_allowed - dagg.sack_yards AS net_pass_yards_allowed,
+            dagg.interceptions,
             dagg.interceptions + COALESCE(recovered.fumbles_recovered, 0) AS turnovers_forced,
             dagg.def_touchdowns,
             ROUND(100.0 * dagg.third_down_stops / NULLIF(dagg.third_downs, 0), 1) AS third_down_stop_pct,

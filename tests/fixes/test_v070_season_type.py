@@ -27,7 +27,7 @@ Interface contract tested here
   ff_opportunity get the round from schedules through game_id.
 - player_role_trend, player_separation_opportunity and player_contract_value gain a
   season_type column (REQUIRED_COLUMNS lists it). The role_trend window is per season_type.
-- migrate.SCHEMA_VERSION == 2 (3 since v0.7.1). A version 1 database whose derived tables lack those columns
+- migrate.SCHEMA_VERSION == 2 (3 since v0.7.1, 4 since v0.7.2). A version 1 database whose derived tables lack those columns
   is detected and fixed by `nfl-mcp upgrade` without the network.
 - Snap shares are percents (0 to 100). season, season_year and week are Python ints.
 

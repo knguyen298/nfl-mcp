@@ -45,7 +45,7 @@ RAW = ["plays", "schedules", "rosters", "injuries", "snap_counts", "players", "p
 EXTRA = {"depth_charts": ["season", "club_code", "gsis_id"],
          "participation": ["nflverse_game_id", "play_id", "possession_team"]}
 
-CUR = 3  # migrate.SCHEMA_VERSION since v0.7.1 (points in team_records); 2 was v0.7.0, 1 was v0.6.x (valid old slots)
+CUR = 4  # migrate.SCHEMA_VERSION since v0.7.2 (net passing in the team tables); 3 was v0.7.1, 2 v0.7.0, 1 v0.6.x (valid old slots)
 PRODUCTION_NEW = {"depth_charts": 2173176, "injury_return_curve": 1172}
 PRODUCTION_CURRENT = {"depth_charts": 2911328, "injury_return_curve": 1215}
 PRODUCTION_FAIL = ("depth_charts has 2173176 rows, current slot has 2911328; "
@@ -165,7 +165,7 @@ def test_production_shrink_at_same_version_cli_exits_one(pair):
 # ── 2. which tables the allowance covers ───────────────────────────────────────
 
 
-@pytest.mark.parametrize("current_version", [None, (), 0, 1])
+@pytest.mark.parametrize("current_version", [None, (), 0, 1, CUR - 1])
 @pytest.mark.parametrize("table", REWRITTEN)
 def test_rewritten_table_may_shrink_across_upgrade(pair, table, current_version):
     result = floor(*pair(CUR, current_version, {table: 50}))

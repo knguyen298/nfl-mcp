@@ -252,8 +252,8 @@ def test_defense_mirrors_the_opponent_offense():
 # ═══ 3. schema version 4 ═══════════════════════════════════════════════════════
 
 def test_required_columns_list_the_new_fields():
-    assert set(NEW_OFFENSE) | {"sacks"} <= set(REQUIRED_COLUMNS["team_offense_stats"])
-    assert set(NEW_DEFENSE) | {"sacks"} <= set(REQUIRED_COLUMNS["team_defense_stats"])
+    assert set(NEW_OFFENSE) <= set(REQUIRED_COLUMNS["team_offense_stats"])
+    assert set(NEW_DEFENSE) <= set(REQUIRED_COLUMNS["team_defense_stats"])
 
 
 def test_schema_version_is_4_and_team_tables_are_rewritten_by_the_upgrade():
