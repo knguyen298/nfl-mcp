@@ -29,7 +29,8 @@ def current_season(today: datetime.date | None = None) -> int:
     year rolls over (free agency, draft, new schedules, new rosters). From March through
     February of the following year the season is labelled by the year it kicks off in.
     Data sources that do not exist yet for a new season (e.g. play-by-play before
-    Week 1) fail to load gracefully and are retried on the next ingest.
+    Week 1, participation until the season ends) are skipped by the ingest using each
+    dataset's registry newest_season rule, and loaded once nflreadpy accepts them.
     """
     today = today or datetime.date.today()
     return today.year if today.month >= 3 else today.year - 1

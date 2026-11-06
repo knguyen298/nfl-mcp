@@ -26,10 +26,21 @@ from .seasons import FIRST_SEASON, EARLIEST_SEASON, current_season
 CURRENT_SEASON = current_season()
 
 
-def _season_window_label(min_season: int | None, max_season: int | None) -> str:
-    """Render a dataset's coverage window for --list, e.g. '1999-present'."""
+def _season_window_label(min_season: int | None, max_season: int | None,
+                         newest_season: str | None = None) -> str:
+    """Render a dataset's coverage window for --list, e.g. '1999-present'.
+
+    A newest_season rule that stops before the roster year (participation) never reaches
+    the season in progress, so its window ends at the last completed season.
+    """
+    from .registry import NEWEST_SEASON_RULES
     start = str(min_season) if min_season is not None else "earliest"
-    end = str(max_season) if max_season is not None else "present"
+    if max_season is not None:
+        end = str(max_season)
+    elif newest_season is not None and NEWEST_SEASON_RULES[newest_season][1] < 0:
+        end = "last completed season"
+    else:
+        end = "present"
     return f"{start}–{end}"
 
 
@@ -147,7 +158,7 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, allo
             default_tag = "[default]" if defn.default else "[opt-in]"
             click.echo(f"  {ds_id:<35} {default_tag:<10}  {defn.description}")
             if defn.seasonal:
-                label = _season_window_label(defn.min_season, defn.max_season)
+                label = _season_window_label(defn.min_season, defn.max_season, defn.newest_season)
                 if defn.min_season is not None and defn.min_season < FIRST_SEASON:
                     label += f" (from {FIRST_SEASON} by default)"
                 click.echo(f"  {'':<35} {'':<10}  → seasons {label}")

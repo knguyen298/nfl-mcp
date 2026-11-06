@@ -14,6 +14,7 @@ import os
 import duckdb
 import polars as pl
 from pathlib import Path
+from nflreadpy.utils_date import get_current_season as _nflreadpy_current_season
 from tqdm import tqdm
 
 from .seasons import FIRST_SEASON, EARLIEST_SEASON, all_seasons, current_season
@@ -59,13 +60,38 @@ def _apply_duckdb_pragmas(conn: duckdb.DuckDBPyConnection, db_path: str) -> None
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+def _newest_season(dataset_def) -> int | None:
+    """Newest season nflreadpy's own validator accepts for this dataset, None if unbounded.
+
+    Asks nflreadpy's get_current_season (imported at module load, so a fake nflreadpy in a
+    test cannot replace it) with the registry rule's roster flag, so the bound rolls over
+    on the same day as the loader's check.
+    """
+    from .registry import NEWEST_SEASON_RULES
+    if dataset_def.newest_season is None:
+        return None
+    roster, offset = NEWEST_SEASON_RULES[dataset_def.newest_season]
+    return _nflreadpy_current_season(roster=roster) + offset
+
+
 def _clip_to_window(season_list, dataset_def):
-    """Drop seasons outside a dataset's own published coverage window (no network)."""
-    return [
-        s for s in season_list
-        if (dataset_def.min_season is None or s >= dataset_def.min_season)
-        and (dataset_def.max_season is None or s <= dataset_def.max_season)
-    ]
+    """Drop seasons outside a dataset's own published coverage window (no network).
+
+    Seasons outside min_season/max_season go silently. Seasons past _newest_season are not
+    published yet (participation during the season, most loaders from March until Week 1):
+    they are skipped with a note, not fetched, and not counted as failures.
+    """
+    newest = _newest_season(dataset_def)
+    kept = []
+    for s in season_list:
+        if (dataset_def.min_season is not None and s < dataset_def.min_season) or (
+                dataset_def.max_season is not None and s > dataset_def.max_season):
+            continue
+        if newest is not None and s > newest:
+            print(f"    {dataset_def.dataset_id} {s}: not published yet, skipping")
+            continue
+        kept.append(s)
+    return kept
 
 
 # Soft failures of the current run (a fetch that raised, a season write that rolled back).
@@ -1462,10 +1488,16 @@ def run_ingest_datasets(
 
         # Play-by-play is on a special code path, so it must clip to its own window
         # explicitly: the default backfill starts in 1966, but load_pbp only publishes
-        # from 1999 and raises for anything earlier.
+        # from 1999 and raises for anything earlier, or past get_current_season().
         pbp_seasons = _clip_to_window(all_seasons() if bulk_mode else seasons, REGISTRY["pbp"])
+        if not pbp_seasons:
+            # Only an explicit range can get here (--start in the off-season): nothing to do.
+            print("  No published play-by-play season in range, skipping")
+            has_pbp = False
+
+    if has_pbp:
         # Discover the schema from the newest season that actually has a pbp file.
-        # Early in a new league year the current season has no play-by-play yet.
+        # On kickoff day the new season can pass the validator before its file exists.
         sample_df = None
         for schema_season in reversed(pbp_seasons):
             print(f"  Discovering schema from {schema_season}…")
