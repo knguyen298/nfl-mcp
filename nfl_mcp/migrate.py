@@ -32,6 +32,11 @@ _TABLE_DATASET = {d.table_name: d for d in REGISTRY.values()}
 RAW_TABLES = [t for t in REQUIRED_COLUMNS if t in _TABLE_DATASET]
 DERIVED_TABLES = [t for t in REQUIRED_COLUMNS if t not in _TABLE_DATASET and t != "_ingest_metadata"]
 
+# Tables an upgrade rewrites instead of adding to: derived_tables rebuilds them with the
+# current definitions, and depth_charts_season re-fetches one season-stamped copy per
+# season. validate lets them shrink against a slot at an older schema version.
+UPGRADE_REWRITES = frozenset(DERIVED_TABLES) | {REGISTRY["depth_charts"].table_name}
+
 
 @dataclass(frozen=True)
 class Step:

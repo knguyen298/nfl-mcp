@@ -10,7 +10,7 @@ from pathlib import Path
 import duckdb
 
 from .database import _connection_config
-from .migrate import SCHEMA_VERSION, _read_version
+from .migrate import SCHEMA_VERSION, UPGRADE_REWRITES, _read_version
 from .required_columns import REQUIRED_COLUMNS, SNAPSHOT_TABLES
 
 # A new slot may hold up to 1 percent fewer rows than the active one before it fails.
@@ -92,8 +92,24 @@ def _check_schema_version(conn, columns: dict[str, set[str]]) -> CheckResult:
     return CheckResult("schema_version", True, f"schema version {version}")
 
 
+def _slot_version(conn, columns: dict[str, set[str]]) -> int | None:
+    """Schema version of a slot, or None when its _schema_version cannot be read."""
+    try:
+        version = _read_version(conn, columns)
+    except duckdb.Error:
+        return None
+    return version if isinstance(version, int) else None
+
+
 def _check_row_counts(new, new_cols, current, current_cols) -> CheckResult:
-    low = []
+    """Fail a table that shrank beyond ROW_TOLERANCE. When the current slot is at an older
+    schema version, a table the upgrade rewrites (UPGRADE_REWRITES) may shrink; the detail
+    still names it. An unreadable version gets no such allowance."""
+    new_version = _slot_version(new, new_cols)
+    current_version = _slot_version(current, current_cols)
+    upgraded = (new_version is not None and current_version is not None
+                and current_version < new_version)
+    low, allowed = [], []
     for table in sorted(set(new_cols) & set(current_cols)):
         new_n = _row_count(new, table)
         if table in SNAPSHOT_TABLES:
@@ -102,13 +118,21 @@ def _check_row_counts(new, new_cols, current, current_cols) -> CheckResult:
                            f"{_row_count(current, table)} rows)")
             continue
         current_n = _row_count(current, table)
-        if new_n < current_n * ROW_TOLERANCE:
-            low.append(f"{table} has {new_n} rows, current slot has {current_n}")
+        if new_n >= current_n * ROW_TOLERANCE:
+            continue
+        shrink = f"{table} has {new_n} rows, current slot has {current_n}"
+        if table in UPGRADE_REWRITES and upgraded:
+            allowed.append(f"{shrink} (allowed: the current slot is schema version "
+                           f"{current_version}, and the upgrade to {new_version} rewrote this table)")
+        elif table in UPGRADE_REWRITES and current_version is None:
+            low.append(f"{shrink} (not allowed: cannot read the current slot's schema version)")
+        else:
+            low.append(shrink)
     if low:
-        return CheckResult("row_count_floor", False, "; ".join(low))
-    return CheckResult("row_count_floor", True,
-                       "no table shrank beyond the 1 percent tolerance; snapshot tables "
-                       f"({', '.join(sorted(SNAPSHOT_TABLES))}) only need to be non-empty")
+        return CheckResult("row_count_floor", False, "; ".join(low + allowed))
+    usual = (f"no {'other ' if allowed else ''}table shrank beyond the 1 percent tolerance; "
+             f"snapshot tables ({', '.join(sorted(SNAPSHOT_TABLES))}) only need to be non-empty")
+    return CheckResult("row_count_floor", True, "; ".join(allowed + [usual]))
 
 
 def _check_duplicates(conn, columns) -> CheckResult:
