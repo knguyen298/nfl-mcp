@@ -25,6 +25,10 @@ from .seasons import FIRST_SEASON, EARLIEST_SEASON, current_season
 
 CURRENT_SEASON = current_season()
 
+# `nfl-mcp ingest` exit code when the run finished but some datasets or seasons failed.
+# A fatal error exits 1 and a usage error 2 (click).
+INGEST_PARTIAL_EXIT = 3
+
 
 def _season_window_label(min_season: int | None, max_season: int | None,
                          newest_season: str | None = None) -> str:
@@ -139,9 +143,15 @@ def serve(host, port):
               help="Exit 0 even if a dataset or season failed to load (the failures are still "
                    "listed). For image builds and first-start loads that should not stop on "
                    "one flaky fetch.")
-def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, allow_failures):
+@click.option("--failures-file", default=None, type=click.Path(dir_okay=False),
+              help="Write each dataset (or dataset and season) that failed to load to this "
+                   "file, one per line. The file is empty when nothing failed. update_db.sh "
+                   "uses it to name the failures in its log.")
+def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, allow_failures,
+           failures_file):
     """Download NFL data via nflreadpy and load into DuckDB.
 
+    \b
     Examples:
       nfl-mcp ingest                          # default datasets, all seasons
       nfl-mcp ingest --dataset all            # every dataset, all seasons
@@ -149,6 +159,16 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, allo
       nfl-mcp ingest --dataset pbp --start 2020 --end 2024
       nfl-mcp ingest --pre1999                # defaults + ESPN 1970-1998 records
       nfl-mcp ingest --list                   # show all dataset names
+
+    Exit codes:
+
+    \b
+      0  Every requested dataset loaded, or --allow-failures was given.
+      3  The run finished, but some datasets or seasons failed to load. Each
+         failed one keeps the rows it had before. The failures are listed.
+      1  The run stopped with an error, for example when no play-by-play
+         season could be fetched or the database could not be opened.
+      2  A usage error, for example an unknown dataset name.
     """
     from .registry import REGISTRY, DEFAULT_DATASETS, ALL_DATASETS
 
@@ -191,7 +211,7 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, allo
     if pre1999 and "espn_records" not in dataset_ids:
         dataset_ids.append("espn_records")
 
-    from .ingest import run_ingest_datasets
+    from .ingest import failure_labels, run_ingest_datasets
     failures = run_ingest_datasets(
         dataset_ids=dataset_ids,
         start=start,
@@ -199,11 +219,18 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, allo
         fresh=fresh,
         skip_views=skip_views,
     )
+    if failures_file:
+        labels = failure_labels(failures)
+        Path(failures_file).write_text("".join(f"{label}\n" for label in labels))
     if failures:
         message = "Ingest failed for: " + "; ".join(failures)
-        if not allow_failures:
-            raise click.ClickException(message)
-        click.echo(f"{message} (ignored: --allow-failures)")
+        if allow_failures:
+            click.echo(f"{message} (ignored: --allow-failures)")
+            return
+        # A distinct code: the run finished and the rest loaded. update_db.sh goes on to
+        # upgrade and validate on this code and stops on any other non-zero one.
+        click.secho(f"Error: {message}", fg="red", err=True)
+        sys.exit(INGEST_PARTIAL_EXIT)
 
 
 # ── rebuild ────────────────────────────────────────────────────────────────────

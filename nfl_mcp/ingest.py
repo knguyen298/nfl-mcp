@@ -105,6 +105,19 @@ def _note_failure(dataset_id: str, season: int | None, err: Exception) -> None:
     _FAILURES.append(f"{label}: {err}")
 
 
+def failure_labels(failures: list[str]) -> list[str]:
+    """The "<dataset>" or "<dataset> <season>" of each failure, in order, each once.
+
+    A failure is "<label>: <error>" (see _note_failure); dataset ids hold no colon.
+    """
+    labels: list[str] = []
+    for failure in failures:
+        label = failure.split(":", 1)[0].strip()
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
 @contextlib.contextmanager
 def _transaction(conn: duckdb.DuckDBPyConnection):
     """BEGIN ... COMMIT, or ROLLBACK and re-raise, so a season is replaced all or nothing."""

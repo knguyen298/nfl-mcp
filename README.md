@@ -185,6 +185,19 @@ nfl-mcp ingest --list                   # show all available dataset names
 
 Ingest is **idempotent** — re-running skips completed seasons already in the database. The current season and the static snapshot tables (rankings, players, contracts, teams) are re-fetched on every run, so run `nfl-mcp ingest` after a game week to pick up new stats. The current season is computed from today's date (the league year rolls over in March), so a new season is picked up automatically.
 
+Exit codes of `nfl-mcp ingest`:
+
+| Code | Meaning |
+|---|---|
+| 0 | Every requested dataset loaded, or `--allow-failures` was given. |
+| 3 | The run finished, but some datasets or seasons failed to load. Each failed one keeps the rows it had before. `--failures-file PATH` writes them to a file, one per line. |
+| 1 | The run stopped with an error, for example when no play-by-play season could be fetched. |
+| 2 | A usage error, for example an unknown dataset name. |
+
+In the container, `update_db.sh` goes on to the schema upgrade and the validation when the
+ingest exits 3. It logs one `WARNING` line that names the failed datasets. On any other
+non-zero exit it stops and keeps the active slot.
+
 ### Upgrade an older database
 
 ```bash

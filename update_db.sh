@@ -26,12 +26,15 @@ else
     TARGET="$DB_DIR/nflread_a.duckdb"
 fi
 
+# The ingest writes the datasets that failed to load here, one per line.
+FAILED_LIST="$TARGET.failed"
+
 echo "[$(date -u)] Active DB : $CURRENT"
 echo "[$(date -u)] Target DB : $TARGET"
 
 # The idle slot is disposable: drop it (and any WAL left by an interrupted run) so a
 # failed previous pass can neither be mistaken for fresh data nor fill the disk.
-rm -f "$TARGET" "$TARGET.wal"
+rm -f "$TARGET" "$TARGET.wal" "$FAILED_LIST"
 
 # Fail before the copy rather than partway through it — a truncated DuckDB file in the
 # idle slot is harmless, but a full disk mid-ingest wastes the whole run.
@@ -50,8 +53,22 @@ chmod u+w "$TARGET"
 
 # Incremental: completed seasons are skipped; the current season and static
 # snapshot tables (rankings, players, contracts) are re-fetched every run.
+# Exit 3 means the run finished but some datasets or seasons failed to load. Each of them
+# rolled back and keeps the rows of the active slot this copy came from, so the update
+# goes on: the schema upgrade below must not wait for every download to succeed, and
+# validate still decides the swap. Any other non-zero exit is a fatal error and stops here.
 echo "[$(date -u)] Running incremental ingest..."
-NFL_MCP_DB_PATH="$TARGET" nfl-mcp ingest
+INGEST_RC=0
+NFL_MCP_DB_PATH="$TARGET" nfl-mcp ingest --failures-file "$FAILED_LIST" || INGEST_RC=$?
+if [ "$INGEST_RC" -eq 3 ]; then
+    FAILED=$(awk 'NR > 1 { printf ", " } { printf "%s", $0 }' "$FAILED_LIST" 2>/dev/null || true)
+    echo "[$(date -u)] WARNING: ingest could not load: ${FAILED:-unknown, see the ingest output above}." \
+        "They keep their previous rows. Continuing with the schema upgrade and validation."
+elif [ "$INGEST_RC" -ne 0 ]; then
+    echo "[$(date -u)] ERROR: ingest failed (exit $INGEST_RC). Keeping $CURRENT active."
+    exit 1
+fi
+rm -f "$FAILED_LIST"
 
 # Bring a slot copied from an older database up to the current schema (derived tables,
 # depth_charts season, missing raw columns) and record the version. Exit 3 means a step
