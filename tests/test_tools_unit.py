@@ -583,12 +583,15 @@ def test_schedule_builds_team_pair_filter_and_game_type(monkeypatch):
     def fake_execute(sql, params=None):
         captured["sql"] = sql
         captured["params"] = params
-        return [{"game_id": "2024_01_KC_BAL"}]
+        return [{"game_id": "2024_01_KC_BAL", "away_team": "BAL", "home_team": "KC",
+                 "away_score": 20, "home_score": 27, "_site": "Home"}]
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
     result = tools.nfl_schedule(team="kc", season=2024, week=1, season_type="REG")
     assert result["count"] == 1
     assert "(home_team = ? OR away_team = ?)" in captured["sql"]
+    assert "location AS _site" in captured["sql"]
+    assert result["games"][0]["outcome"] == "W" and "_site" not in result["games"][0]
     assert "game_type = ?" in captured["sql"]
     assert captured["params"] == ["KC", "KC", 2024, 1, "REG"]
 

@@ -33,6 +33,8 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
         "home_team", "away_score", "home_score", "result", "overtime", "spread_line",
         "total_line", "div_game", "roof", "surface", "temp", "wind", "away_coach",
         "home_coach", "referee", "stadium",
+        # with team: neutral site ('Home' or 'Neutral')
+        "location",
     ],
     # nfl_roster
     "rosters": [

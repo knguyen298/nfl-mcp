@@ -2120,6 +2120,25 @@ def nfl_injuries(
         return {"error": str(e)}
 
 
+def _team_side(row: dict, codes: Sequence[str]) -> dict:
+    """A schedules row plus the game from the side of the franchise with `codes`.
+
+    team is the code that row stores (OAK on a 2019 row, LV on a 2020 row). location is
+    home, away, or neutral when schedules.location says Neutral. outcome is W, L or T for
+    that team, None while the game has no score.
+    """
+    site = row.pop("_site")
+    home = row["home_team"] in codes
+    side, other = ("home", "away") if home else ("away", "home")
+    team_score, opponent_score = row[f"{side}_score"], row[f"{other}_score"]
+    outcome = None
+    if team_score is not None and opponent_score is not None:
+        outcome = "W" if team_score > opponent_score else "L" if team_score < opponent_score else "T"
+    return {**row, "team": row[f"{side}_team"], "opponent": row[f"{other}_team"],
+            "location": "neutral" if site == "Neutral" else side,
+            "team_score": team_score, "opponent_score": opponent_score, "outcome": outcome}
+
+
 @_checked
 def nfl_schedule(
     team: str | None = None,
@@ -2133,7 +2152,9 @@ def nfl_schedule(
     Look up game schedules and results. Filter by team, season, week, or season type
     (required: REG, POST, ALL or one round WC, DIV, CON, SB). Each game carries its
     season_type (REG or POST) and its game_type (the round).
-    Returns scores, spread lines, weather, stadium, and coaching info.
+    Returns scores, spread lines, weather, stadium, and coaching info. result is the home
+    margin (home_score - away_score). With team, each row also gives the game from that
+    team's side (see _team_side).
     """
     game_types = _game_types(season_type)
     limit, offset = _page_args(limit, offset)
@@ -2161,13 +2182,15 @@ def nfl_schedule(
                away_team, home_team, away_score, home_score, result,
                overtime, spread_line, total_line, div_game,
                roof, surface, temp, wind,
-               away_coach, home_coach, referee, stadium
+               away_coach, home_coach, referee, stadium{", location AS _site" if codes else ""}
         FROM schedules
         WHERE {where}
         ORDER BY season, week, gameday, game_id
     """
     try:
         rows, page = _execute_limited(sql, params, limit, offset)
+        if codes:
+            rows = [_team_side(row, codes) for row in rows]
         return _with_reason({"games": rows, **page}, rows, "schedules",
                             season=season, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:

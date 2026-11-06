@@ -187,7 +187,7 @@ SCHEMA = {
     "schedules": "game_id:V season:I game_type:V week:I gameday:V gametime:V away_team:V "
                  "away_score:I home_team:V home_score:I result:I overtime:I spread_line:D "
                  "total_line:D div_game:I roof:V surface:V temp:I wind:I away_coach:V "
-                 "home_coach:V referee:V stadium:V",
+                 "home_coach:V referee:V stadium:V location:V",
     "rosters": "season:I team:V position:V depth_chart_position:V jersey_number:I status:V "
                "full_name:V height:D weight:I college:V years_exp:I",
     "injuries": "season:I game_type:V team:V week:I gsis_id:V position:V full_name:V "

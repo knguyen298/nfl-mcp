@@ -189,9 +189,9 @@ def _build(path: Path) -> None:
         away_score INTEGER, home_score INTEGER, result INTEGER, overtime INTEGER,
         spread_line DOUBLE, total_line DOUBLE, div_game INTEGER, roof VARCHAR, surface VARCHAR,
         temp INTEGER, wind INTEGER, away_coach VARCHAR, home_coach VARCHAR, referee VARCHAR,
-        stadium VARCHAR)""")
+        stadium VARCHAR, location VARCHAR)""")
     c.executemany("INSERT INTO schedules VALUES (?,?,?,?,?,'13:00',?,?,20,24,4,0,3.0,45.0,0,"
-                  "'outdoors','grass',60,5,'A','B','R','S')",
+                  "'outdoors','grass',60,5,'A','B','R','S','Home')",
                   [(g, s, t, w, f"{s}-09-{w:02d}", a, h) for g, s, t, w, a, h in SCHEDULES])
 
     c.execute("""CREATE TABLE snap_counts (game_id VARCHAR, pfr_game_id VARCHAR, season INTEGER,

@@ -731,7 +731,10 @@ TOOLS = [
         description=(
             "PREFERRED for schedule and game result questions. Look up games by team, "
             "season, week, or season type. Returns scores, spread/total lines, "
-            "weather, stadium, coaches, and referee."
+            "weather, stadium, coaches, and referee. result is the home margin "
+            "(home_score - away_score), not the team's margin. With team, each row also has "
+            "team, opponent, location (home, away or neutral), team_score, opponent_score "
+            "and outcome (W, L or T for that team; null before the game is played)."
         ),
         inputSchema={
             "type": "object",
