@@ -322,8 +322,9 @@ def test_check_flags_team_tables_without_the_new_columns(tmp_path):
         assert f"team_defense_stats.{col}" in derived.detail
 
 
-def test_version_is_0_7_2():
-    assert __version__ == "0.7.2"
+def test_version_is_at_least_0_7_2():
+    # 0.7.3 pins its own version in test_v073.
+    assert tuple(int(p) for p in __version__.split(".")) >= (0, 7, 2)
 
 
 # ═══ 4. the tools: new fields and definitions ══════════════════════════════════
