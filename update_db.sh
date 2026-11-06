@@ -62,7 +62,7 @@ INGEST_RC=0
 NFL_MCP_DB_PATH="$TARGET" nfl-mcp ingest --failures-file "$FAILED_LIST" || INGEST_RC=$?
 if [ "$INGEST_RC" -eq 3 ]; then
     FAILED=$(awk 'NR > 1 { printf ", " } { printf "%s", $0 }' "$FAILED_LIST" 2>/dev/null || true)
-    echo "[$(date -u)] WARNING: ingest could not load: ${FAILED:-unknown, see the ingest output above}." \
+    echo "[$(date -u)] WARNING: ingest failed to load: ${FAILED:-unknown, see the ingest output above}." \
         "They keep their previous rows. Continuing with the schema upgrade and validation."
 elif [ "$INGEST_RC" -ne 0 ]; then
     echo "[$(date -u)] ERROR: ingest failed (exit $INGEST_RC). Keeping $CURRENT active."

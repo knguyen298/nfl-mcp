@@ -439,7 +439,7 @@ def test_partial_ingest_goes_on_to_upgrade_validate_and_swap(tmp_path):
     assert _names(sim) == ["ingest", "upgrade", "validate"]
     assert _active(sim) == "nflread_b.duckdb"
     (warning,) = _lines_with(res.stdout, "WARNING")
-    assert "ingest could not load: pbp 2026, schedules 2026." in warning
+    assert "ingest failed to load: pbp 2026, schedules 2026." in warning
     assert "Continuing with the schema upgrade and validation" in warning
     assert "Update complete" in res.stdout
     assert not (sim["data"] / "nflread_b.duckdb.failed").exists()
