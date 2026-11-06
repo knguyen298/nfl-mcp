@@ -421,19 +421,23 @@ AGGREGATE TABLES  (pre-aggregated, much faster for team/season queries; season_t
 POST, one row each, so filter it before you sum)
   team_offense_stats
     (team, season_year, season_type, total_plays, total_yards, yards_per_play,
-     rush_plays, pass_plays, sacks, rush_yards, pass_yards, sack_yards, net_pass_yards,
-     yards_per_rush, yards_per_pass, touchdowns, turnovers, third_down_pct,
-     red_zone_td_pct, explosive_plays, avg_epa, pass_epa, rush_epa)
+     rush_plays, pass_plays, pass_attempts, completions, interceptions, sacks, dropbacks,
+     scrambles, rush_yards, pass_yards, sack_yards, net_pass_yards, yards_per_rush,
+     yards_per_pass, touchdowns, turnovers, third_down_pct, red_zone_td_pct,
+     explosive_plays, avg_epa, pass_epa, rush_epa)
     -- pass_yards is gross; net_pass_yards = pass_yards - sack_yards (sack_yards positive).
-    -- total_plays counts pass and run plays plus kneels. total_yards = rush_yards +
-    -- net_pass_yards (official total net yards). EPA and rate columns leave kneels out.
+    -- total_plays counts runs, kneels, pass attempts, spikes and sacks. total_yards =
+    -- rush_yards + net_pass_yards (the NFL definition of total net yards). yards_per_play and
+    -- yards_per_rush include kneels. avg_epa, pass_epa, rush_epa, third_down_pct,
+    -- red_zone_td_pct and explosive_plays leave kneels and spikes out.
 
   team_defense_stats
     (team, season_year, season_type, plays_against, yards_allowed, yards_per_play_allowed,
      rush_yards_allowed, pass_yards_allowed, sacks, sack_yards, net_pass_yards_allowed,
      interceptions, turnovers_forced, third_down_stop_pct, avg_epa_allowed)
     -- pass_yards_allowed is gross; net_pass_yards_allowed = pass_yards_allowed - sack_yards.
-    -- yards_allowed = rush_yards_allowed + net_pass_yards_allowed, kneels in.
+    -- yards_allowed = rush_yards_allowed + net_pass_yards_allowed, kneels in. plays_against
+    -- counts kneels and spikes like total_plays.
 
   situational_stats
     (team, season_year, season_type, situation, plays, avg_yards, touchdowns, conversion_pct, avg_epa)

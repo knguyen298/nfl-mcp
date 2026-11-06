@@ -88,8 +88,9 @@ Measured values (read-only connections to the originals; copies for anything els
   grpF_work: team_offense_stats KC 2024 REG total_plays 1067, total_yards 5602.0,
   rush_plays 450, pass_plays 598, pass_attempts 600; team_defense_stats PHI 2024 POST
   plays_against 255, yards_allowed 1330.0, sacks 16, interceptions 6, turnovers_forced
-  13, def_touchdowns 1 (v0.7.2 counts kneels in the totals: KC 1089 plays, 5570.0 yards,
-  5.11 per play; PHI POST 256 plays against, 1329.0 yards, 5.19 per play); situational_stats BUF 2025 REG plays per situation (below);
+  13, def_touchdowns 1 (v0.7.2 counts kneels and spikes in the play counts and builds the
+  totals as rush + net pass: KC 1091 plays, 5570.0 yards, 5.11 per play; PHI POST 256
+  plays against, 1329.0 yards, 5.19 per play); situational_stats BUF 2025 REG plays per situation (below);
   team_records KC 2025 17 games, 6-11-0.
 """
 
@@ -150,8 +151,10 @@ V0_GAPS = {
 # v0.7.1 (schema version 3): team_records gains points; every older build lacks them.
 V3_GAPS = {"team_records": ["points_for", "points_against", "point_diff"]}
 # v0.7.2 (schema version 4): the team tables gain the net passing split; every older build
-# lacks it. rush_yards (and yards_per_rush) now count yards after a lateral, and the play and
-# yard totals on both sides count kneels.
+# lacks it. rush_yards (and yards_per_rush) now count yards after a lateral, the play counts
+# on both sides count kneels and spikes, and the yard totals are rush + net pass. grpF_work
+# holds the old values of these columns, so the EXCEPT ALL comparison leaves them out and
+# test_grpE_v3_upgraded_redefined_columns_match_plays checks them with SQL on plays.
 V4_GAPS = {"team_offense_stats": ["sack_yards", "net_pass_yards"],
            "team_defense_stats": ["rush_yards_allowed", "pass_yards_allowed", "sack_yards",
                                   "net_pass_yards_allowed"]}
@@ -613,6 +616,8 @@ def v0_upgraded(tmp_path_factory, f_copy):
             try:
                 first = _quiet(migrate.upgrade, con, fetch=False)
                 snap1 = _team_snapshot(con)
+                cols = {t: [r[0] for r in con.execute(f"DESCRIBE {t}").fetchall()]
+                        for t in TEAM_TABLES}
                 second = _quiet(migrate.upgrade, con, fetch=False)
                 snap2 = _team_snapshot(con)
                 null_depth = _count(con, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL")
@@ -621,7 +626,7 @@ def v0_upgraded(tmp_path_factory, f_copy):
                 con.execute("DETACH oracle")
             finally:
                 con.close()
-        return {"path": dest, "first": first, "second": second, "snap1": snap1,
+        return {"path": dest, "first": first, "second": second, "snap1": snap1, "cols": cols,
                 "snap2": snap2, "null_depth": null_depth, "diff": diff, "calls": fake.calls,
                 "versions": _versions(dest)}
 
@@ -787,7 +792,7 @@ def test_rebuild_derived_tables_on_grpE_v3_sources_reproduces_grpF_work(f_copy):
         assert con.execute(
             "SELECT total_plays, total_yards, rush_plays, pass_plays, pass_attempts FROM "
             "main.team_offense_stats WHERE team = 'KC' AND season_year = 2024 AND season_type = 'REG'"
-        ).fetchall() == [(1089, 5570.0, 450, 598, 600)]  # kneels in the totals since v0.7.2
+        ).fetchall() == [(1091, 5570.0, 450, 598, 600)]  # see _V4_ORACLE_SQL (v0.7.2)
     finally:
         con.close()
 
@@ -1351,20 +1356,83 @@ def test_grpE_v3_upgraded_team_tables_equal_grpF_work(v0_upgraded):
     assert v0_upgraded.get()["diff"] == {t: (0, 0) for t in TEAM_TABLES}
 
 
+# The columns v0.7.2 redefined, from plays on grpE_v3 with the table play sets:
+#   plays: play_type IN ('pass','run','qb_kneel','qb_spike'), not two-point
+#   rush:  rushing_yards + lateral_rushing_yards on rush_attempt=1 (runs, scrambles, kneels),
+#          not two-point, not no_play; rush_plays counts the same rows
+#   pass:  passing_yards on pass_attempt=1 AND sack=0, not two-point, not no_play
+#   sack:  -yards_gained on sack=1, not two-point, not no_play
+#   total = rush + pass - sack, per play = ROUND(total / plays, 2)
+# Offense (posteam), 2024: KC REG 1091 5570 5.11, KC POST 162 855 5.28,
+#   PHI REG 1114 6242 5.6, PHI POST 254 1444 5.69.
+# Defense (defteam), 2024: KC REG 1026 5451 5.31, KC POST 203 1055 5.2,
+#   PHI REG 999 4732 4.74, PHI POST 256 1329 5.19.
+_N2 = "COALESCE(two_point_attempt, 0) = 0"
+_NNP = "play_type IS DISTINCT FROM 'no_play'"
+_V4_ORACLE_SQL = f"""
+    WITH parts AS (
+        SELECT {{side}} AS team, season_type,
+            count(*) FILTER (WHERE play_type IN ('pass', 'run', 'qb_kneel', 'qb_spike')
+                             AND {_N2}) AS plays,
+            COALESCE(sum(COALESCE(rushing_yards, 0) + COALESCE(lateral_rushing_yards, 0))
+                     FILTER (WHERE rush_attempt = 1 AND {_N2} AND {_NNP}), 0) AS rush,
+            count(*) FILTER (WHERE rush_attempt = 1 AND {_N2} AND {_NNP}) AS rush_plays,
+            COALESCE(sum(passing_yards) FILTER (WHERE pass_attempt = 1 AND COALESCE(sack, 0) = 0
+                                                AND {_N2} AND {_NNP}), 0) AS pass,
+            COALESCE(0 - sum(yards_gained) FILTER (WHERE sack = 1 AND {_N2} AND {_NNP}), 0)
+                AS sack
+        FROM plays WHERE season = 2024 AND {{side}} IN ('KC', 'PHI') GROUP BY 1, 2
+    )
+    SELECT team, season_type, plays, rush + pass - sack, ROUND((rush + pass - sack) / plays, 2),
+           rush, ROUND(rush / rush_plays, 2), pass, sack, pass - sack
+    FROM parts
+"""
+_V4_ORACLE_COLUMNS = {
+    "team_offense_stats": ("posteam", ["total_plays", "total_yards", "yards_per_play",
+                                       "rush_yards", "yards_per_rush", "pass_yards",
+                                       "sack_yards", "net_pass_yards"]),
+    "team_defense_stats": ("defteam", ["plays_against", "yards_allowed",
+                                       "yards_per_play_allowed", "rush_yards_allowed", None,
+                                       "pass_yards_allowed", "sack_yards",
+                                       "net_pass_yards_allowed"]),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("table", sorted(_V4_ORACLE_COLUMNS))
+def test_grpE_v3_upgraded_redefined_columns_match_plays(v0_upgraded, table):
+    r = v0_upgraded.get()
+    side, cols = _V4_ORACLE_COLUMNS[table]
+    assert V4_REDEFINED <= {c for spec in _V4_ORACLE_COLUMNS.values() for c in spec[1]}
+    con = _ro(V0_DB)
+    try:
+        oracle = {(t, st): vals for t, st, *vals in
+                  con.execute(_V4_ORACLE_SQL.format(side=side)).fetchall()}
+    finally:
+        con.close()
+    assert len(oracle) == 4  # KC and PHI, REG and POST
+    names = r["cols"][table]
+    got = {}
+    for row in r["snap1"][table]:
+        rec = dict(zip(names, row))
+        if rec["season_year"] == 2024 and rec["team"] in ("KC", "PHI"):
+            got[(rec["team"], rec["season_type"])] = [rec[c] if c else v for c, v in
+                                                      zip(cols, oracle[(rec["team"],
+                                                                        rec["season_type"])])]
+    assert got == oracle
+
+
 @pytest.mark.integration
 def test_grpE_v3_upgraded_oracle_rows(v0_upgraded):
     snap = v0_upgraded.get()["snap1"]
     off = [r for r in snap["team_offense_stats"] if r[:3] == ("KC", 2024, "REG")]
-    # v0.7.2: total_plays, total_yards and yards_per_play count kneels (22 for -32 yards).
-    #   SELECT count(*), sum(yards_gained) FROM plays WHERE posteam='KC' AND season=2024
-    #   AND season_type='REG' AND play_type IN ('pass','run','qb_kneel')
-    #   AND COALESCE(two_point_attempt,0)=0 on grpE_v3 -> 1089, 5570 (5.11 per play)
-    assert len(off) == 1 and off[0][3:9] == (1089, 5570.0, 5.11, 450, 598, 600)
+    # v0.7.2: total_plays counts kneels and spikes, total_yards is rush + net pass
+    # (_V4_ORACLE_SQL on grpE_v3 -> KC 2024 REG 1091 plays, 5570 yards, 5.11 per play).
+    assert len(off) == 1 and off[0][3:9] == (1091, 5570.0, 5.11, 450, 598, 600)
     deff = [r for r in snap["team_defense_stats"] if r[:3] == ("PHI", 2024, "POST")]
     # plays_against, yards_allowed, yards_per_play_allowed; sacks after rush and pass yards
     # allowed (v0.7.2); interceptions, turnovers_forced, def_touchdowns after sack_yards and net.
-    # Kneels in the totals (v0.7.2): the same SQL with defteam='PHI', season_type='POST'
-    # -> 256, 1329 (5.19 per play).
+    # v0.7.2: _V4_ORACLE_SQL with defteam, PHI 2024 POST -> 256, 1329 (5.19 per play).
     assert len(deff) == 1 and deff[0][3:6] == (256, 1329.0, 5.19)
     assert (deff[0][8], deff[0][11:14]) == (16, (6, 13, 1))
     rec = [r for r in snap["team_records"] if r[:2] == (2025, "KC")]

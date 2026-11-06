@@ -17,8 +17,8 @@ Interface contract (beyond the shared brief)
 * team_offense_stats: one row per (team, season_year, season_type), season_type in {REG, POST}.
   Scrimmage play = play_type IN ('pass','run') AND two_point_attempt = 0 (no kickoff, punt,
   field_goal, extra_point, no_play, qb_kneel, qb_spike). Columns:
-    total_plays   = scrimmage plays plus kneels (sacks and scrambles included, spikes excluded;
-                    kneels since v0.7.2, the official play count)
+    total_plays   = runs, kneels, pass attempts, spikes and sacks (scrambles included; kneels
+                    and spikes since v0.7.2, the official play count)
     pass_plays    = pass_attempt=1, sack=0, two-pt=0, play_type='pass' (spikes EXCLUDED)
     pass_attempts = official nflverse attempts: pass_attempt=1, sack=0, two-pt=0, not no_play
                     (spikes INCLUDED; this is what team_stats_raw.attempts counts)
@@ -355,11 +355,11 @@ def test_team_tables_one_row_per_key(db, table):
 
 @pytest.mark.parametrize("season_type, expected", [
     # REG pass/run non-2pt rows: 1-7, 9-11, 13-14, 16-21, 24-27, 29-31, 33-38, 40-41 = 33,
-    # plus the kneels 43-44 (v0.7.2) = 35
-    ("REG", 35),
+    # plus the spike 42 and the kneels 43-44 (v0.7.2) = 36
+    ("REG", 36),
     ("POST", 4),  # rows 201-204
 ])
-def test_total_plays_counts_scrimmage_and_kneels(db, season_type, expected):
+def test_total_plays_counts_scrimmage_kneels_and_spikes(db, season_type, expected):
     assert one(db, "team_offense_stats", "KC", season_type)["total_plays"] == expected
 
 

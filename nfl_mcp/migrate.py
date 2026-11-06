@@ -15,8 +15,9 @@ step rebuilds it from local schedules.
 Version 4 (v0.7.2) adds sack_yards and net_pass_yards to team_offense_stats, and
 rush_yards_allowed, pass_yards_allowed, sack_yards and net_pass_yards_allowed to
 team_defense_stats; rush_yards now counts yards after a lateral, the play counts on both
-sides count kneels, and total_yards and yards_allowed are net rushing plus net passing yards
-(official totals). The same step rebuilds both tables from local plays.
+sides count kneels and spikes, and total_yards and yards_allowed are net rushing plus net
+passing yards (the NFL definition of total net yards). The same step rebuilds both tables
+from local plays.
 """
 
 import datetime

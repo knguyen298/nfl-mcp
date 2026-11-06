@@ -12,9 +12,9 @@ The SQL sits in a comment next to the value. Values were measured on a 2024-only
 (the shape GitHub CI ingests).
 
 Databases. Integration tests read NFL_MCP_DB_PATH when it is set, otherwise
-/tmp/ci2024/v072c.duckdb (a copy of v071.duckdb upgraded by this nfl-mcp; v072.duckdb holds the
-first schema-4 build, before kneels counted in the totals, and v072b.duckdb the build where
-total_yards still summed yards_gained). The schema-3 tests
+/tmp/ci2024/v072d.duckdb (a copy of v071.duckdb upgraded by this nfl-mcp, read-only; v072,
+v072b and v072c hold earlier schema-4 builds of this release: before kneels, with
+SUM(yards_gained) as the total, and before spikes in the play count). The schema-3 tests
 read /tmp/ci2024/v071.duckdb only. Each skips with a reason when its file is missing. The unit
 tests build small databases in tmp_path and need no file.
 
@@ -26,8 +26,11 @@ What the gap between total_yards and rush_yards + net_pass_yards is, measured on
   official rushing figure does), and total_yards and total_plays left them out (pass and run
   plays only, since group F). Official total net yards is net rushing plus net passing, so
   total_plays, total_yards and yards_per_play (and the defense play count, yards_allowed and
-  yards_per_play_allowed) now count kneels. EPA, third-down, red-zone and explosive-play
-  figures keep the pass and run plays only.
+  yards_per_play_allowed) now count kneels. The official play count is rushes + pass attempts
+  + sacks, and a spike is a pass attempt, so the play counts also count spikes. EPA,
+  third-down, red-zone and explosive-play figures keep the pass and run plays only.
+- Rows tagged no_play stay out of every figure. The nflverse team stats count one 2024 play
+  tagged no_play (2024_15_MIA_HOU 2274, a 35-yard fake-punt run), so HOU REG differs there.
 - Two plays where yards_gained holds only part of a lateral play with an enforced penalty
   (2024_02_LV_BAL 4375: -25, 2024_04_NE_SF 3004: -3). The yards credited to the rusher and
   passer on these plays are the official ones, so total_yards (and yards_allowed) is now
@@ -41,7 +44,9 @@ Interface contract tested here
   the defense gained on sacks, positive) and net_pass_yards_allowed. yards_allowed and sacks
   keep their names and meaning.
 - On both tables total = rush + net pass on every row, by construction. yards_per_play is
-  total / plays, with kneels in the play count.
+  total / plays, with kneels and spikes in the play count. total_plays equals carries +
+  attempts + sacks_suffered of the nflverse team stats for every 2024 team and season type
+  except HOU REG.
 - migrate.SCHEMA_VERSION is 4. The new columns are in REQUIRED_COLUMNS, both tables are in
   DERIVED_TABLES and UPGRADE_REWRITES, and a schema-3 database is upgraded without the network
   to the same tables a fresh build makes.
@@ -73,7 +78,7 @@ from nfl_mcp.database import get_db_connection
 from nfl_mcp.required_columns import REQUIRED_COLUMNS
 
 _ENV_DB = os.environ.get("NFL_MCP_DB_PATH")
-DB4 = Path(_ENV_DB or "/tmp/ci2024/v072c.duckdb")
+DB4 = Path(_ENV_DB or "/tmp/ci2024/v072d.duckdb")
 DB3 = Path("/tmp/ci2024/v071.duckdb")
 TOOLS_BY_NAME = {t.name: t for t in server.TOOLS}
 
@@ -127,8 +132,8 @@ def _p(pid, play_type, yds, *, pos="BAL", de="PIT", **kw):
 #   sacks 2, sack_yards 7 + 3                            = 10
 #   net_pass_yards      35 - 10                          = 25
 #   rush_yards          10 + (4 + 6 after a lateral) - 1 (kneel) = 19
-#   total_yards         20 + 0 - 7 - 3 + 10 + 10 - 1 + 15 = 44 (pass and run plays and the
-#                       kneel: no spike, two-point try or no_play), 8 total_plays
+#   total_yards         19 + 25 = 44 (rush_yards + net_pass_yards)
+#   total_plays         9: plays 1-7, the spike 10 and 11 (no two-point try or no_play)
 #   total = rush + net  = 19 + 25 = 44
 # PIT offense: one 5-yard completion and no sack (sack_yards 0, not NULL).
 _PASS = {"pass_attempt": 1.0, "qb_dropback": 1.0}
@@ -209,17 +214,17 @@ def test_offense_rush_yards_count_yards_after_a_lateral():
     assert row["yards_per_rush"] == round(19 / row["rush_plays"], 2)
 
 
-def test_offense_total_is_rush_plus_net_with_kneels():
+def test_offense_total_is_rush_plus_net_with_kneels_and_spikes():
     row = _row(_team_db(), "team_offense_stats", "BAL")
-    assert (row["total_plays"], row["total_yards"]) == (8, 44)
+    assert (row["total_plays"], row["total_yards"]) == (9, 44)
     assert row["total_yards"] == row["rush_yards"] + row["net_pass_yards"]
-    assert row["yards_per_play"] == round(44 / 8, 2)
+    assert row["yards_per_play"] == round(44 / 9, 2)
 
 
 # A run like 2024_02_LV_BAL 4375: 25 rushing yards and 5 after a lateral, but yards_gained 5
 # (the source keeps only part of the play). The credited yards are the official ones, so
 # total_yards and yards_allowed add the 30 rushing yards, not the 5 of yards_gained:
-#   rush_yards 19 + 30 = 49, total_yards 49 + 25 = 74, total_plays 9 (SUM(yards_gained) 49)
+#   rush_yards 19 + 30 = 49, total_yards 49 + 25 = 74, total_plays 10 (SUM(yards_gained) 49)
 _LATERAL_PENALTY = _p(13, "run", 5, rush_attempt=1.0, rushing_yards=25.0,
                       lateral_rushing_yards=5.0)
 
@@ -228,15 +233,16 @@ def test_total_is_built_from_the_credited_yards_not_yards_gained():
     con = _team_db(plays=[*_PLAYS, _LATERAL_PENALTY])
     off = _row(con, "team_offense_stats", "BAL")
     assert (off["rush_yards"], off["net_pass_yards"], off["total_yards"]) == (49, 25, 74)
-    assert (off["total_plays"], off["yards_per_play"]) == (9, round(74 / 9, 2))
+    assert (off["total_plays"], off["yards_per_play"]) == (10, round(74 / 10, 2))
     de = _row(con, "team_defense_stats", "PIT")
-    assert (de["rush_yards_allowed"], de["yards_allowed"], de["plays_against"]) == (49, 74, 9)
-    assert de["yards_per_play_allowed"] == round(74 / 9, 2)
+    assert (de["rush_yards_allowed"], de["yards_allowed"], de["plays_against"]) == (49, 74, 10)
+    assert de["yards_per_play_allowed"] == round(74 / 10, 2)
 
 
-def test_offense_analytic_metrics_leave_kneels_out():
-    # avg_epa: every play has epa 0.1 except the kneel, set to -5 here.
-    plays = [dict(r, epa=-5.0) if r["play_type"] == "qb_kneel" else r for r in _PLAYS]
+def test_offense_analytic_metrics_leave_kneels_and_spikes_out():
+    # avg_epa: every play has epa 0.1 except the kneel and the spike, set to -5 here.
+    plays = [dict(r, epa=-5.0) if r["play_type"] in ("qb_kneel", "qb_spike") else r
+             for r in _PLAYS]
     con = duckdb.connect(":memory:")
     ddl = ", ".join(f'"{c}" {t}' for c, t in _PLAY_COLS.items())
     con.execute(f"CREATE TABLE plays ({ddl})")
@@ -264,8 +270,8 @@ def test_offense_column_order_puts_the_split_after_pass_yards():
 
 def test_defense_has_rush_gross_pass_sack_yards_and_net_allowed():
     row = _row(_team_db(), "team_defense_stats", "PIT")
-    assert (row["plays_against"], row["yards_allowed"]) == (8, 44)
-    assert row["yards_per_play_allowed"] == round(44 / 8, 2)
+    assert (row["plays_against"], row["yards_allowed"]) == (9, 44)
+    assert row["yards_per_play_allowed"] == round(44 / 9, 2)
     assert row["rush_yards_allowed"] == 19
     assert row["pass_yards_allowed"] == 35
     assert row["sacks"] == 2
@@ -354,8 +360,17 @@ def test_team_stats_definitions_say_gross_net_sacks_and_kneels(team_db):
     assert "gross" in de["pass_yards_allowed"].lower()
     assert "net" in de["net_pass_yards_allowed"].lower()
     assert "sack" in de["yards_allowed"].lower() and "kneel" in de["yards_allowed"].lower()
-    assert "kneel" in off["total_plays"].lower() and "kneel" in de["plays_against"].lower()
-    assert "without kneels" in off["avg_epa"] and "without kneels" in de["avg_epa_allowed"]
+    for text in (off["total_plays"], de["plays_against"]):
+        assert "kneel" in text.lower() and "spike" in text.lower()
+    assert "without kneels or spikes" in off["avg_epa"]
+    assert "without kneels or spikes" in de["avg_epa_allowed"]
+    for text in (off["total_yards"], off["rush_yards"], de["yards_allowed"]):
+        assert "no_play are out" in text
+    assert "NFL definition of total net yards" in off["total_yards"]
+    assert "NFL definition of total net yards" in de["yards_allowed"]
+    for text in (off["sack_yards"], off["net_pass_yards"], de["sack_yards"],
+                 de["net_pass_yards_allowed"]):
+        assert "nflverse figure" in text and "official" not in text
 
 
 @pytest.mark.parametrize("side, blocks", [("offense", {"offense"}), ("defense", {"defense"}),
@@ -493,11 +508,12 @@ def real4(monkeypatch):
 #         rush_attempt=1 AND COALESCE(two_point_attempt,0)=0
 #         AND play_type IS DISTINCT FROM 'no_play')                                     -- rush_yards
 #     rush_yards + pass_yards - sack_yards                                              -- total_yards
-#     count(*) FILTER (WHERE play_type IN ('pass','run','qb_kneel')
+#     count(*) FILTER (WHERE play_type IN ('pass','run','qb_kneel','qb_spike')
 #                      AND COALESCE(two_point_attempt,0)=0)                             -- total_plays
 #   FROM plays WHERE season=2024 AND season_type='REG' GROUP BY posteam
-#   BAL 24 154 4189 3189 7224 1050 | PHI 45 323 3517 3048 6242 1113
-#   DET 33 244 4718 2488 6962 1115 | KC  41 266 4046 1790 5570 1089
+#   BAL 24 154 4189 3189 7224 1055 | PHI 45 323 3517 3048 6242 1114
+#   DET 33 244 4718 2488 6962 1118 | KC  41 266 4046 1790 5570 1091
+#   yards_per_play: BAL 6.85, PHI 5.6, DET 6.23, KC 5.11
 #   net = pass - sack: BAL 4035, PHI 3194, DET 4474, KC 3780.
 #   rush + net = total: BAL 7224, PHI 6242, DET 6962, KC 5570.
 _SACK_YARDS_SQL = """-sum(yards_gained) FILTER (WHERE sack = 1 AND COALESCE(two_point_attempt, 0) = 0
@@ -516,7 +532,7 @@ _OFFENSE_SQL = f"""
         {_PASS_YARDS_SQL},
         {_RUSH_YARDS_SQL},
         {_RUSH_YARDS_SQL} + {_PASS_YARDS_SQL} - ({_SACK_YARDS_SQL}),
-        count(*) FILTER (WHERE play_type IN ('pass', 'run', 'qb_kneel')
+        count(*) FILTER (WHERE play_type IN ('pass', 'run', 'qb_kneel', 'qb_spike')
                          AND COALESCE(two_point_attempt, 0) = 0)
     FROM plays WHERE season = 2024 AND season_type = 'REG' AND {{side}} = ?
 """
@@ -524,10 +540,10 @@ _OFFENSE_SQL = f"""
 
 @pytest.mark.integration
 @pytest.mark.parametrize("team, sacks, sack_yards, pass_yards, rush_yards, total, plays", [
-    ("BAL", 24, 154, 4189, 3189, 7224, 1050),
-    ("PHI", 45, 323, 3517, 3048, 6242, 1113),
-    ("DET", 33, 244, 4718, 2488, 6962, 1115),
-    ("KC", 41, 266, 4046, 1790, 5570, 1089),
+    ("BAL", 24, 154, 4189, 3189, 7224, 1055),
+    ("PHI", 45, 323, 3517, 3048, 6242, 1114),
+    ("DET", 33, 244, 4718, 2488, 6962, 1118),
+    ("KC", 41, 266, 4046, 1790, 5570, 1091),
 ])
 def test_offense_net_passing_matches_plays(real4, team, sacks, sack_yards, pass_yards,
                                            rush_yards, total, plays):
@@ -538,17 +554,18 @@ def test_offense_net_passing_matches_plays(real4, team, sacks, sack_yards, pass_
     assert (row["sacks"], row["sack_yards"], row["pass_yards"], row["rush_yards"],
             row["total_yards"], row["total_plays"]) == expected
     assert row["net_pass_yards"] == pass_yards - sack_yards
+    assert row["yards_per_play"] == {"BAL": 6.85, "PHI": 5.6, "DET": 6.23, "KC": 5.11}[team]
     assert row["yards_per_play"] == round(total / plays, 2)
     assert "warning" not in res
 
 
 # Defense, BAL 2024 REG, from plays (the _OFFENSE_SQL sets with defteam = 'BAL'):
 #   sacks 54, sack_yards 318, pass_yards_allowed 4468, rush_yards_allowed 1361,
-#   yards_allowed 5511, plays_against 1061. net_pass_yards_allowed 4468 - 318 = 4150, and
-#   1361 + 4150 = 5511.
+#   yards_allowed 5511, plays_against 1062. net_pass_yards_allowed 4468 - 318 = 4150, and
+#   1361 + 4150 = 5511 (5.19 per play).
 @pytest.mark.integration
 def test_defense_net_passing_allowed_matches_plays(real4):
-    expected = (54, 318, 4468, 1361, 5511, 1061)
+    expected = (54, 318, 4468, 1361, 5511, 1062)
     assert real4.execute(_OFFENSE_SQL.format(side="defteam"), ["BAL"]).fetchone() == expected
     res = tools.nfl_team_stats(team="BAL", season=2024, side="defense", season_type="REG")
     (row,) = res["defense"]
@@ -665,6 +682,40 @@ def test_yards_gained_differs_only_on_the_lateral_penalty_plays(real4, table, si
     assert diff == {(t, st): v for (_, _, t, st), v in expected.items()}
 
 
+# The official play count is carries + pass attempts (spikes in) + sacks. From the nflverse
+# team stats, against the table, for every 2024 team and season type:
+#   SELECT team, season_type, sum(carries) + sum(attempts) + sum(sacks_suffered)
+#   FROM team_stats_raw WHERE season=2024 GROUP BY 1, 2       (offense)
+#   the same grouped by opponent_team                          (defense)
+# They differ only where nflverse counts a play tagged no_play, which the tables leave out:
+#   SELECT game_id, play_id, posteam, defteam, rushing_yards FROM plays
+#   WHERE season=2024 AND play_type='no_play' AND rush_attempt=1 AND rushing_yards IS NOT NULL
+#   -> 2024_15_MIA_HOU 2274 HOU MIA 35 (a fake-punt run): HOU REG offense (1057 against
+#      1058) and MIA REG defense (1011 against 1012) are one play short.
+_RAW_PLAYS_SQL = """
+    SELECT {team}, season_type, sum(carries) + sum(attempts) + sum(sacks_suffered)
+    FROM team_stats_raw WHERE season = 2024 GROUP BY 1, 2
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("table, team, plays, expected", [
+    ("team_offense_stats", "team", "total_plays", {("HOU", "REG"): (1057, 1058)}),
+    ("team_defense_stats", "opponent_team", "plays_against", {("MIA", "REG"): (1011, 1012)}),
+])
+def test_play_count_matches_nflverse_except_the_no_play_run(real4, table, team, plays, expected):
+    raw = {(t, st): n for t, st, n in real4.execute(_RAW_PLAYS_SQL.format(team=team)).fetchall()}
+    rows = real4.execute(f"SELECT team, season_type, {plays} FROM {table} "
+                         "WHERE season_year = 2024").fetchall()
+    assert len(rows) == len(raw) == 46
+    assert {(t, st): (n, raw[(t, st)]) for t, st, n in rows if n != raw[(t, st)]} == expected
+    (play,) = real4.execute(
+        "SELECT game_id, CAST(play_id AS INTEGER), posteam, defteam, rushing_yards FROM plays "
+        "WHERE season = 2024 AND play_type = 'no_play' AND rush_attempt = 1 "
+        "AND rushing_yards IS NOT NULL").fetchall()
+    assert play == ("2024_15_MIA_HOU", 2274, "HOU", "MIA", 35.0)
+
+
 @pytest.mark.integration
 def test_league_offense_and_defense_agree(real4):
     off = real4.execute("SELECT sum(rush_yards), sum(pass_yards), sum(sack_yards), "
@@ -710,6 +761,12 @@ def schema3_then_upgraded(tmp_path_factory):
     con = duckdb.connect(str(path))
     try:
         _make_stale(con)
+        # Wrong values in the columns v0.7.2 redefined, so the upgrade must recompute them.
+        con.execute("UPDATE team_offense_stats SET total_plays = -1, total_yards = -1, "
+                    "yards_per_play = -1, rush_yards = -1, yards_per_rush = -1")
+        con.execute("UPDATE team_defense_stats SET plays_against = -1, yards_allowed = -1, "
+                    "yards_per_play_allowed = -1")
+        stale = _team_tables(con)
         con.execute("DELETE FROM _schema_version WHERE version > 3")
         con.execute("INSERT INTO _schema_version VALUES (3, TIMESTAMP '2026-11-06', '0.7.1')")
         before = migrate.check(con)
@@ -720,7 +777,7 @@ def schema3_then_upgraded(tmp_path_factory):
     finally:
         con.close()
     return {"original": original, "upgraded": upgraded, "before": before, "result": result,
-            "version": version}
+            "version": version, "stale": stale}
 
 
 @pytest.mark.integration
@@ -738,6 +795,9 @@ def test_upgrade_from_v3_stamps_4_and_rebuilds_the_same_team_tables(schema3_then
     assert out["result"].stamped and not out["result"].failed, out["result"]
     assert out["version"] == 4
     assert out["upgraded"] == out["original"]
+    # Every row held -1 in the redefined columns before the upgrade.
+    assert all(-1 in row for rows in out["stale"].values() for row in rows)
+    assert not any(-1 in row[3:6] for rows in out["upgraded"].values() for row in rows)
 
 
 @pytest.mark.integration

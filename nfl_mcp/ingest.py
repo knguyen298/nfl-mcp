@@ -810,17 +810,18 @@ _PLAYS_COLUMNS: dict[str, str] = {
 _NOT_2PT = "COALESCE(two_point_attempt, 0) = 0"
 _NOT_NO_PLAY = "play_type IS DISTINCT FROM 'no_play'"
 _SCRIMMAGE = f"(play_type IN ('pass', 'run') AND {_NOT_2PT})"
-# The official play count: pass and run plays plus kneels. The analytic metrics (EPA, third
-# downs, red zone, explosive plays) keep _SCRIMMAGE, without kneels.
-_TOTAL_PLAY = f"(play_type IN ('pass', 'run', 'qb_kneel') AND {_NOT_2PT})"
+# The official play count: runs, kneels, pass attempts, spikes and sacks (carries + attempts
+# + sacks in the nflverse team stats). Rows tagged no_play stay out. The analytic metrics (EPA,
+# third downs, red zone, explosive plays) keep _SCRIMMAGE, without kneels or spikes.
+_TOTAL_PLAY = f"(play_type IN ('pass', 'run', 'qb_kneel', 'qb_spike') AND {_NOT_2PT})"
 _PASS_PLAY = f"(play_type = 'pass' AND pass_attempt = 1 AND COALESCE(sack, 0) = 0 AND {_NOT_2PT})"
 _PASS_ATTEMPT = f"(pass_attempt = 1 AND COALESCE(sack, 0) = 0 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
 _RUSH_PLAY = f"(rush_attempt = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
 _SACK = f"(sack = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
 _INTERCEPTION = f"(interception = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
 # Yardage sums shared by the offense and defense tables (0, not NULL, when no play matches).
-# The total is net rushing plus net passing yards (the official total net yards), built from
-# these parts, not from SUM(yards_gained).
+# The total is net rushing plus net passing yards (the NFL definition of total net yards),
+# built from these parts, not from SUM(yards_gained).
 _RUSH_YARDS = (f"COALESCE(SUM(COALESCE(rushing_yards, 0) + COALESCE(lateral_rushing_yards, 0)) "
                f"FILTER (WHERE {_RUSH_PLAY}), 0)")
 _PASS_YARDS = f"COALESCE(SUM(COALESCE(passing_yards, 0)) FILTER (WHERE {_PASS_ATTEMPT}), 0)"
@@ -850,14 +851,14 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
                   "situational_stats", "formation_effectiveness"]:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
 
-    # total_plays is pass/run plays plus kneels (sacks and scrambles in; spikes, special
+    # total_plays counts runs, kneels, pass attempts, spikes and sacks (scrambles in; special
     # teams, no_play and two-point tries out). pass_plays excludes spikes; pass_attempts is
     # the official nflverse count (spikes in). A turnover is an interception thrown or a
     # fumble lost by the team, so a muffed punt is charged to the receiving team.
     # pass_yards is gross; sack_yards (positive) is what total_yards subtracts for sacks, so
-    # net_pass_yards is the official net figure. rush_yards adds the yards after a lateral
-    # and keeps kneels. total_yards is rush_yards + net_pass_yards (official total net
-    # yards), and yards_per_play is total_yards / total_plays.
+    # net_pass_yards is the nflverse net figure. rush_yards adds the yards after a lateral
+    # and keeps kneels. total_yards is rush_yards + net_pass_yards (the NFL definition of
+    # total net yards), and yards_per_play is total_yards / total_plays.
     conn.execute(f"""
         CREATE TABLE team_offense_stats AS
         WITH oagg AS (
