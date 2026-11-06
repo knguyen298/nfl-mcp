@@ -49,6 +49,7 @@ import io
 import json
 import os
 import shutil
+from collections import defaultdict
 from pathlib import Path
 
 import anyio
@@ -236,6 +237,19 @@ def test_stale_team_records_over_mcp_is_not_an_error(stale_records):
     is_error, payload = _raw("nfl_team_records", {"team": "KC", "season": 2024})
     assert not is_error, payload
     assert "nfl-mcp upgrade" in payload["warning"]
+
+
+def test_team_records_other_missing_column_is_an_error_not_a_points_fallback(tmp_path, monkeypatch):
+    # Only a missing points column falls back; any other binder error is reported.
+    path = tmp_path / "broken.duckdb"
+    con = _records_db(path, espn=False)
+    _quiet_records(con)
+    con.execute("ALTER TABLE team_records DROP COLUMN source_team")
+    con.close()
+    monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))
+    res = tools.nfl_team_records(team="KC", season=2024)
+    assert "source_team" in res["error"], res
+    assert "warning" not in res
 
 
 def test_team_records_with_points_has_no_warning(tmp_path, monkeypatch):
@@ -455,8 +469,9 @@ def one_player(monkeypatch):
 
 
 def _stats_row(season, season_type):
-    return {"season": season, "season_type": season_type, "attempts": 0, "carries": 3,
-            "rush_yards": 12, "targets": 2, "receptions": 1, "rec_yards": 9}
+    """One aggregate row of the stats query; every stat not set here is NULL."""
+    return defaultdict(lambda: None, season=season, season_type=season_type, carries=3,
+                       rush_yards=12, targets=2, receptions=1, rec_yards=9)
 
 
 def _fake_execute(games_rows, stats_rows):

@@ -434,6 +434,17 @@ def _ambiguous(
     return result
 
 
+# A client that names the argument player_name (or anything else) gets no player at all:
+# mcpo drops an argument the schema does not list, so the error shows the exact form.
+_ARGUMENT_FORM = (
+    'Pass the name as player, for example {"player": "Joe Burrow"}, or a gsis_id as player_id. '
+    "Other names such as player_name are not accepted, and a proxy can drop them without an "
+    "error."
+)
+_MISSING_PLAYER = {"error": f"player or player_id is required. {_ARGUMENT_FORM}",
+                   "code": "MISSING_PLAYER"}
+
+
 def _resolve_player(
     player_name: str | None,
     player_id: str | None,
@@ -464,7 +475,7 @@ def _resolve_player(
             return None, {"error": f"Unknown player_id '{pid}'", "code": "UNKNOWN_PLAYER_ID"}
         return found[0], None
     if not name:
-        return None, {"error": "player or player_id is required", "code": "MISSING_PLAYER"}
+        return None, dict(_MISSING_PLAYER)
     filters = {"team": team, "season": season, "season_from": season_from, "season_to": season_to}
     candidates, truncated = _find_players(name, **filters)
     if not candidates and any(v is not None for v in filters.values()):
@@ -491,7 +502,7 @@ def nfl_player_lookup(
     if not pid and _GSIS_ID.fullmatch(name):
         pid, name = name, ""
     if not pid and not name:
-        return {"error": "player or player_id is required", "code": "MISSING_PLAYER"}
+        return dict(_MISSING_PLAYER)
     season = _int_arg("season", season)
     try:
         if pid:
@@ -717,6 +728,13 @@ _DESC_HINT = (
     'desc is an SQL keyword, so the plays column desc (the play description) must be quoted: '
     '"desc", for example SELECT "desc" FROM plays WHERE "desc" ILIKE \'%touchdown%\'.'
 )
+# Any other parser error. Models reach for MySQL forms (SHOW COLUMNS FROM plays LIKE '%x%').
+_SYNTAX_HINT = (
+    "DuckDB could not parse the statement; nfl_query runs DuckDB SQL, not MySQL. List a "
+    "table's columns with DESCRIBE plays (or SHOW plays), or search them with SELECT "
+    "column_name FROM information_schema.columns WHERE table_name = 'plays' AND column_name "
+    "ILIKE '%conv%'. nfl_schema(category='<name>') lists play-by-play columns by topic."
+)
 
 _COLUMN_NAMES_SQL = (
     "SELECT DISTINCT column_name FROM information_schema.columns "
@@ -829,8 +847,9 @@ def _sql_error_detail(exc: Exception, sql: str | None = None) -> Dict[str, Any]:
     """
     message = str(exc)
     spelled = [m.group("name") for m in _QUOTED_NAMES.finditer(message)]
-    if _NEAR_DESC.search(message):
-        return {"hint": _DESC_HINT}
+    near_desc = bool(_NEAR_DESC.search(message))
+    if near_desc or isinstance(exc, duckdb.ParserException):
+        return {"code": "SQL_SYNTAX_ERROR", "hint": _DESC_HINT if near_desc else _SYNTAX_HINT}
 
     guessed_column = _COLUMN_NOT_FOUND.search(message) or _QUALIFIED_COLUMN_NOT_FOUND.search(message)
     if guessed_column:
@@ -939,6 +958,25 @@ _EXPLAIN_PREFIX = re.compile(
     rf"{_EXPLAIN_OPTION}(?:\s*,\s*{_EXPLAIN_OPTION})*\s*\))?",
     re.IGNORECASE | re.DOTALL,
 )
+# Statements that list a table's columns or describe it. Their row count is the column
+# count (plays has about 370), so they default to the row cap instead of 100.
+_CATALOG_STATEMENT = re.compile(rf"\A{_GAP}(?:DESCRIBE|SHOW|SUMMARIZE)\b", re.IGNORECASE | re.DOTALL)
+_DEFAULT_QUERY_ROWS = 100
+
+
+def _truncated_hint(max_rows: int) -> str:
+    """How to see more than the max_rows rows a truncated nfl_query returned."""
+    columns = ("SELECT column_name FROM information_schema.columns WHERE table_name = 'plays' "
+               "AND column_name LIKE '%epa%'")
+    if max_rows < _MAX_ROWS:
+        return (f"Only the first {max_rows} rows are shown (max_rows={max_rows}). To see more, "
+                f"raise max_rows (up to {_MAX_ROWS}), page with LIMIT and OFFSET, or narrow the "
+                f"statement with WHERE, for example {columns}. nfl_schema(category='<name>') "
+                "lists play-by-play columns by topic.")
+    return (f"Only the first {_MAX_ROWS} rows are shown; {_MAX_ROWS} is the most max_rows "
+            f"allows. Page with LIMIT and OFFSET, aggregate, or narrow the statement with WHERE, "
+            f"for example {columns}. nfl_schema(category='<name>') lists play-by-play columns "
+            "by topic.")
 
 
 def _statement_gate(sql: str) -> dict[str, Any] | None:
@@ -971,7 +1009,7 @@ def _statement_gate(sql: str) -> dict[str, Any] | None:
     return None
 
 
-def nfl_query(sql: str, max_rows: int = 100) -> Dict[str, Any]:
+def nfl_query(sql: str, max_rows: int | None = None) -> Dict[str, Any]:
     """
     Execute one read-only SQL statement against the nflread database.
 
@@ -979,23 +1017,28 @@ def nfl_query(sql: str, max_rows: int = 100) -> Dict[str, Any]:
       - Exactly one statement, parsed by DuckDB (a trailing ';' is fine)
       - Only SELECT, or EXPLAIN [ANALYZE] of a SELECT; anything else is
         rejected with its statement_type
-      - max_rows is an int from 1 to 500; larger values are clamped to 500
+      - max_rows is an int from 1 to 500; larger values are clamped to 500. Not given:
+        500 for DESCRIBE, SHOW and SUMMARIZE (one row per column), 100 otherwise
       - Query runs as written; max_rows + 1 rows are fetched to set `truncated`
       - 10-second timeout (NFL_MCP_QUERY_TIMEOUT_SECONDS overrides)
 
-    Returns columns ([{name, type}]), rows, row_count and truncated.
-    Unknown column/table failures also return `code`, the offending name,
-    `did_you_mean` (ranked against the live schema) and a `hint`.
+    Returns columns ([{name, type}]), rows, row_count and truncated, and a `hint` when
+    truncated. Unknown column/table failures also return `code`, the offending name,
+    `did_you_mean` (ranked against the live schema) and a `hint`; a parser error returns
+    code SQL_SYNTAX_ERROR and a `hint` with the DuckDB forms.
     """
-    if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 1:
+    if max_rows is not None and (
+            isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 1):
         return {"error": "max_rows must be an integer from 1 to 500."}
-    max_rows = min(max_rows, _MAX_ROWS)
 
     if not isinstance(sql, str):
         return {"error": "sql must be a string"}
     rejected = _statement_gate(sql)
     if rejected:
         return rejected
+    if max_rows is None:
+        max_rows = _MAX_ROWS if _CATALOG_STATEMENT.match(sql) else _DEFAULT_QUERY_ROWS
+    max_rows = min(max_rows, _MAX_ROWS)
 
     try:
         columns, rows = _fetch_capped(sql, max_rows + 1)
@@ -1005,12 +1048,15 @@ def nfl_query(sql: str, max_rows: int = 100) -> Dict[str, Any]:
 
     truncated = len(rows) > max_rows
     rows = rows[:max_rows]
-    return {
+    result = {
         "columns":   columns,
         "rows":      rows,
         "row_count": len(rows),
         "truncated": truncated,
     }
+    if truncated:
+        result["hint"] = _truncated_hint(max_rows)
+    return result
 
 
 _PLAY_TYPES = ("pass", "run", "field_goal", "punt", "kickoff", "extra_point", "qb_kneel",
@@ -1056,6 +1102,13 @@ _PLAY_COLUMNS = (
     "passer_player_id", "rusher_player_name", "rusher_player_id", "receiver_player_name",
     "receiver_player_id", "touchdown", "interception",
 )
+# plays stores these as DOUBLE, but every value is whole (SELECT count(*) FROM plays WHERE
+# play_id <> round(play_id) OR qtr <> round(qtr) OR ... -> 0), so they are returned as ints.
+# epa and wpa are real decimals and stay DOUBLE.
+_PLAY_INT_COLUMNS = frozenset({"play_id", "season", "week", "qtr", "down", "ydstogo",
+                               "yards_gained", "touchdown", "interception"})
+_PLAY_SELECT = ", ".join(f"CAST({c} AS INTEGER) AS {c}" if c in _PLAY_INT_COLUMNS else c
+                         for c in _PLAY_COLUMNS)
 _PLAYS_COLUMNS_SQL = (
     "SELECT column_name FROM information_schema.columns "
     "WHERE table_schema = 'main' AND table_name = 'plays'"
@@ -1153,7 +1206,8 @@ def nfl_search_plays(
         ("score_differential", "<=", "max_score_differential", max_score_differential),
         ("wp", ">=", "min_wp", min_wp), ("wp", "<=", "max_wp", max_wp))]
     if role and not (player or (player_id and str(player_id).strip())):
-        raise _BadArgument("player_role needs player or player_id", "MISSING_PLAYER")
+        raise _BadArgument(f"player or player_id is required with player_role. {_ARGUMENT_FORM}",
+                           "MISSING_PLAYER")
     extra = _extra_play_columns(columns)
 
     conditions = []
@@ -1226,7 +1280,7 @@ def nfl_search_plays(
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = (
-        f"SELECT {', '.join([*_PLAY_COLUMNS, *extra])} "
+        f"SELECT {', '.join([_PLAY_SELECT, *extra])} "
         f"FROM plays WHERE {where} "
         f"ORDER BY {_PLAY_SORTS[sort_by]}, game_id, play_id, rowid"
     )
@@ -1365,7 +1419,7 @@ def nfl_team_stats(
 _NOT_TWO_POINT = "COALESCE(two_point_attempt, 0) = 0"
 _NOT_NO_PLAY = "COALESCE(play_type, '') <> 'no_play'"
 _NOT_SACK = "COALESCE(sack, 0) = 0"
-# Row sets for one player (me.id). Each is the definition shown to users in _STAT_DEFINITIONS.
+# Row sets for one player (me.id). Each is the definition shown to users in _BLOCK_DEFINITIONS.
 _ATTEMPT = (f"passer_player_id = me.id AND pass_attempt = 1 AND {_NOT_SACK} "
             f"AND {_NOT_TWO_POINT} AND {_NOT_NO_PLAY}")
 _SACKED = f"passer_player_id = me.id AND sack = 1 AND {_NOT_TWO_POINT} AND {_NOT_NO_PLAY}"
@@ -1381,31 +1435,66 @@ _LATERAL_RUSHER = f"lateral_rusher_player_id = me.id AND rush_attempt = 1 AND {_
 _RECEIVING_TD = (f"({_TARGET} OR {_LATERAL_RECEIVER}) AND pass_touchdown = 1 "
                  "AND COALESCE(td_player_id, receiver_player_id) = me.id")
 
-_STAT_DEFINITIONS = {
-    "attempts": "pass_attempt=1 AND sack=0 AND two_point_attempt=0 AND play_type<>'no_play', "
-                "passer_player_id = the player. Spikes count as attempts. A play coded no_play "
-                "with pass_attempt=1 (for example a reversed sack ruled intentional grounding) "
-                "is excluded, so attempts can be one below the official count.",
-    "completions": "attempts with complete_pass=1.",
-    "yards": "passing: passing_yards on attempts; rushing: rushing_yards on carries plus "
-             "lateral_rushing_yards when the player took a lateral; receiving: receiving_yards "
-             "on targets plus lateral_receiving_yards when the player took a lateral.",
-    "sacks": "sack=1 with the player as passer_player_id, excluding two_point_attempt=1 and no_play.",
-    "dropbacks": "qb_dropback=1 AND two_point_attempt=0 AND play_type<>'no_play', where the player is "
-                 "passer_player_id or is rusher_player_id on a qb_scramble=1 play "
-                 "(attempts excluding spikes, plus sacks, plus scrambles).",
-    "epa_per_attempt": "average epa over attempts.",
-    "epa_per_dropback": "average epa over dropbacks.",
-    "carries": "rush_attempt=1 AND two_point_attempt=0, rusher_player_id = the player. "
-               "Kneels and scrambles count; no_play is not excluded.",
-    "scrambles": "carries with qb_scramble=1.",
-    "yards_per_carry": "rushing yards / carries.",
-    "targets": "pass_attempt=1 AND sack=0 AND two_point_attempt=0, receiver_player_id = the player.",
-    "receptions": "targets with complete_pass=1.",
-    "touchdowns": "passing: pass_touchdown=1 on attempts; rushing: rush_touchdown=1 on carries; "
-                  "receiving: pass_touchdown=1 on targets or lateral receptions, credited to the "
-                  "scorer (td_player_id), so a receiver who lateraled to the scorer gets none.",
+# What each stat counts, shown to users in the definitions block. A stat of one block is
+# listed only when that block is in the result; yards and touchdowns keep the part of each
+# block in the result.
+_BLOCK_DEFINITIONS = {
+    "passing": {
+        "attempts": "pass_attempt=1 AND sack=0 AND two_point_attempt=0 AND play_type<>'no_play', "
+                    "passer_player_id = the player. Spikes count as attempts. A play coded no_play "
+                    "with pass_attempt=1 (for example a reversed sack ruled intentional grounding) "
+                    "is excluded, so attempts can be one below the official count.",
+        "completions": "attempts with complete_pass=1.",
+        "sacks": "sack=1 with the player as passer_player_id, excluding two_point_attempt=1 and no_play.",
+        "dropbacks": "qb_dropback=1 AND two_point_attempt=0 AND play_type<>'no_play', where the player is "
+                     "passer_player_id or is rusher_player_id on a qb_scramble=1 play "
+                     "(attempts excluding spikes, plus sacks, plus scrambles).",
+        "epa_per_attempt": "average epa over attempts.",
+        "epa_per_dropback": "average epa over dropbacks.",
+    },
+    "rushing": {
+        "carries": "rush_attempt=1 AND two_point_attempt=0, rusher_player_id = the player. "
+                   "Kneels and scrambles count; no_play is not excluded.",
+        "scrambles": "carries with qb_scramble=1.",
+        "yards_per_carry": "rushing yards / carries.",
+    },
+    "receiving": {
+        "targets": "pass_attempt=1 AND sack=0 AND two_point_attempt=0, receiver_player_id = the player.",
+        "receptions": "targets with complete_pass=1.",
+    },
 }
+_SHARED_DEFINITIONS = {
+    "yards": {
+        "passing": "passing_yards on attempts",
+        "rushing": "rushing_yards on carries plus lateral_rushing_yards when the player took a "
+                   "lateral",
+        "receiving": "receiving_yards on targets plus lateral_receiving_yards when the player "
+                     "took a lateral",
+    },
+    "touchdowns": {
+        "passing": "pass_touchdown=1 on attempts",
+        "rushing": "rush_touchdown=1 on carries",
+        "receiving": "pass_touchdown=1 on targets or lateral receptions, credited to the scorer "
+                     "(td_player_id), so a receiver who lateraled to the scorer gets none",
+    },
+}
+_GAMES_DEFINITION = (
+    "distinct games of the season and season type in which the player has a snap_counts row "
+    "with at least one snap (offense, defense or special teams) or a player_stats row (a game "
+    "with a recorded stat). snap_counts starts in 2012, so before 2012 a game with no recorded "
+    "stat is not counted. null when neither table has the season."
+)
+
+
+def _stat_definitions(blocks: Sequence[str]) -> dict[str, str]:
+    """The definitions of the stat blocks in a result, plus yards, touchdowns and games."""
+    defs: dict[str, str] = {}
+    for block in blocks:
+        defs.update(_BLOCK_DEFINITIONS[block])
+    for key, parts in _SHARED_DEFINITIONS.items():
+        defs[key] = "; ".join(f"{block}: {parts[block]}" for block in blocks) + "."
+    defs["games"] = _GAMES_DEFINITION
+    return defs
 
 
 def _sql_count(cond: str, extra: str | None = None) -> str:
@@ -1456,7 +1545,7 @@ _PLAYER_STATS_SQL = f"""
 """
 
 
-def _season_row(row: dict[str, Any]) -> dict[str, Any]:
+def _season_row(row: dict[str, Any], games: int | None = None) -> dict[str, Any]:
     """Nest one aggregate row into passing, rushing and receiving blocks."""
     def n(key: str) -> int:
         return int(row[key] or 0)
@@ -1465,6 +1554,7 @@ def _season_row(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "season": row["season"],
         "season_type": row["season_type"],
+        "games": games,
         "passing": {
             "attempts": attempts,
             "completions": n("completions"),
@@ -1501,6 +1591,36 @@ def _season_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Games played: a game with a snap (snap_counts, 2012 on) or a recorded stat (player_stats, the
+# weekly nflverse table). player_stats alone misses a game with snaps and no stat, such as Josh
+# Allen's one snap in week 18 of 2024.
+_PLAYER_GAMES_SQL = """
+    SELECT season, season_type, COUNT(DISTINCT game_id) AS games FROM (
+        SELECT season, season_type, game_id FROM player_stats
+        WHERE player_id = ? AND game_id IS NOT NULL
+        UNION
+        SELECT s.season,
+               CASE s.game_type WHEN 'REG' THEN 'REG' WHEN 'WC' THEN 'POST' WHEN 'DIV' THEN 'POST'
+                    WHEN 'CON' THEN 'POST' WHEN 'SB' THEN 'POST' END,
+               s.game_id
+        FROM snap_counts s JOIN players p ON p.pfr_id = s.pfr_player_id
+        WHERE p.gsis_id = ? AND s.game_id IS NOT NULL
+          AND COALESCE(s.offense_snaps, 0) + COALESCE(s.defense_snaps, 0)
+              + COALESCE(s.st_snaps, 0) > 0
+    )
+    GROUP BY season, season_type
+"""
+
+
+def _player_games(gsis_id: str) -> dict[tuple[Any, Any], int]:
+    """Games played per (season, season_type) for one gsis_id; {} without the source tables."""
+    try:
+        rows = _execute(_PLAYER_GAMES_SQL, [gsis_id, gsis_id])
+    except duckdb.CatalogException:  # a trimmed database without player_stats or snap_counts
+        return {}
+    return {(r["season"], r["season_type"]): r["games"] for r in rows}
+
+
 def _player_seasons(
     gsis_id: str,
     season: int | None,
@@ -1531,7 +1651,9 @@ def _player_seasons(
         params.append(season_type)
     sql += (" GROUP BY season, season_type"
             " ORDER BY season, CASE season_type WHEN 'REG' THEN 0 ELSE 1 END, season_type")
-    return [_season_row(row) for row in _execute(sql, params)]
+    rows = _execute(sql, params)
+    games = _player_games(gsis_id) if rows else {}
+    return [_season_row(row, games.get((row["season"], row["season_type"]))) for row in rows]
 
 
 _STAT_BLOCKS = ("passing", "rushing", "receiving")
@@ -1572,7 +1694,8 @@ def nfl_player_stats(
         seasons = [{k: v for k, v in s.items() if k not in _STAT_BLOCKS or k == stat_type}
                    for s in seasons]
     result = {"player_id": found["gsis_id"], "player_name": found["display_name"],
-              "seasons": seasons, "definitions": dict(_STAT_DEFINITIONS)}
+              "seasons": seasons,
+              "definitions": _stat_definitions((stat_type,) if stat_type else _STAT_BLOCKS)}
     return _with_reason(result, seasons, "plays",
                         season=season, season_from=season_from, season_to=season_to)
 
@@ -1637,10 +1760,14 @@ def _compare_players(
             {"player_id": found["gsis_id"], "player_name": found["display_name"], "seasons": seasons},
             seasons, "plays", season=_int_arg("season", season),
             season_from=_int_arg("season_from", season_from), season_to=_int_arg("season_to", season_to)))
-    return {"players": entries, "definitions": dict(_STAT_DEFINITIONS)}
+    return {"players": entries, "definitions": _stat_definitions(_STAT_BLOCKS)}
 
 
-_COMPARE_PAIRS = "Use player1 and player2, or team1 and team2."
+_COMPARE_PAIRS = (
+    'Use player1 and player2, or team1 and team2, for example {"player1": "Joe Burrow", '
+    '"player2": "Lamar Jackson"} or {"team1": "KC", "team2": "PHI"}. Other names are not '
+    "accepted, and a proxy can drop them without an error."
+)
 
 
 def _given(value: Any) -> bool:
@@ -1897,8 +2024,9 @@ def nfl_roster(
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
-        SELECT full_name, gsis_id, position, depth_chart_position, team, season,
-               jersey_number, status, years_exp, college, height, weight
+        SELECT full_name, gsis_id, position, depth_chart_position, team,
+               CAST(season AS INTEGER) AS season, jersey_number, status, years_exp, college,
+               height, weight
         FROM rosters
         WHERE {where}
         ORDER BY position, full_name, rowid
@@ -1912,6 +2040,9 @@ def nfl_roster(
         return {"error": str(e)}
 
 
+# season and week of a raw nflverse table. A load can store them as DOUBLE (production
+# injuries did: 2024.0, 10.0), so they are cast to return ints.
+_SEASON_WEEK = "CAST(season AS INTEGER) AS season, CAST(week AS INTEGER) AS week"
 # season_type of a row keyed on game_type (injuries, schedules, snap_counts): REG for a
 # regular-season game, POST for any of the four playoff rounds.
 _SEASON_TYPE_OF_GAME = (
@@ -1970,7 +2101,7 @@ def nfl_injuries(
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
-        SELECT full_name, gsis_id, position, team, season, week,
+        SELECT full_name, gsis_id, position, team, {_SEASON_WEEK},
                {_SEASON_TYPE_OF_GAME} AS season_type,
                report_primary_injury, report_secondary_injury, report_status,
                practice_primary_injury, practice_secondary_injury, practice_status
@@ -2023,7 +2154,7 @@ def nfl_schedule(
 
     where = " AND ".join(conditions)
     sql = f"""
-        SELECT game_id, season, week, {_SEASON_TYPE_OF_GAME} AS season_type, game_type,
+        SELECT game_id, {_SEASON_WEEK}, {_SEASON_TYPE_OF_GAME} AS season_type, game_type,
                gameday, gametime,
                away_team, home_team, away_score, home_score, result,
                overtime, spread_line, total_line, div_game,
@@ -2044,6 +2175,13 @@ def nfl_schedule(
 
 # ── Team records (1970–present) ───────────────────────────────────────────────
 
+_RECORD_POINTS = " points_for, points_against, point_diff,"
+# A database whose team_records predates schema version 3 still answers win-loss questions.
+_STALE_RECORDS_WARNING = (
+    "team_records was built by an older nfl-mcp and has no points_for, points_against or "
+    "point_diff, so points are left out. Run `nfl-mcp upgrade` to add them."
+)
+
 @_checked
 def nfl_team_records(
     team: str | None = None,
@@ -2056,6 +2194,8 @@ def nfl_team_records(
     """
     PREFERRED for win-loss / standings questions. Regular-season records per franchise,
     1970 to present: final records, and the record to date for a season still in progress.
+    points_for, points_against and point_diff are regular-season points (to date in a season
+    in progress; NULL for the ESPN seasons before 1999).
     Needs team, season or a season_from/season_to range. Teams are given by their CURRENT abbreviation, so the
     Raiders are 'LV' in every season; each row also carries `club` (the name the franchise
     played that season under) and `source_team` (the code the source used).
@@ -2095,14 +2235,23 @@ def nfl_team_records(
         params.append(season_to)
     where = " AND ".join(conditions) or "1=1"
 
-    sql = f"""
-        SELECT season, team, source_team, games, wins, losses, ties, source
-        FROM team_records
-        WHERE {where}
-        ORDER BY season DESC, team, rowid
-    """
+    def sql(points: str) -> str:
+        return f"""
+            SELECT season, team, source_team, games, wins, losses, ties,{points} source
+            FROM team_records
+            WHERE {where}
+            ORDER BY season DESC, team, rowid
+        """
+    warning = None
     try:
-        rows, page = _execute_limited(sql, params, limit, offset)
+        try:
+            rows, page = _execute_limited(sql(_RECORD_POINTS), params, limit, offset)
+        except duckdb.BinderException as e:
+            if 'column "points_for"' not in str(e):  # the message also quotes the SQL text
+                raise
+            # team_records built before schema version 3: the records, without points.
+            rows, page = _execute_limited(sql(""), params, limit, offset)
+            warning = _STALE_RECORDS_WARNING
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -2111,6 +2260,8 @@ def nfl_team_records(
         row["club"] = era_name(row["season"], row["team"])
 
     result: Dict[str, Any] = {"records": rows, **page}
+    if warning:
+        result["warning"] = warning
     if key and not rows:
         result["status"] = "record_not_available"
         if season is not None and season < RECORDS_FIRST_NFLVERSE_SEASON:
@@ -2180,7 +2331,7 @@ def nfl_snap_counts(
 
         where = " AND ".join(conditions)
         sql = f"""
-            SELECT player, pfr_player_id, position, team, opponent, season, week,
+            SELECT player, pfr_player_id, position, team, opponent, {_SEASON_WEEK},
                    {_SEASON_TYPE_OF_GAME} AS season_type, game_type,
                    offense_snaps, ROUND(100 * offense_pct, 1) AS offense_pct, defense_snaps,
                    ROUND(100 * defense_pct, 1) AS defense_pct,

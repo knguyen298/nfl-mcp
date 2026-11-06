@@ -281,11 +281,15 @@ TOOLS = [
             "Call nfl_schema first, and copy column names from it, "
             "never guess them (per-play EPA is `epa`, not `play_epa`). "
             "One statement per call: SELECT (including a WITH common table expression, CTE), "
-            "DESCRIBE, SUMMARIZE, SHOW or EXPLAIN. Other statement types are rejected. "
+            "DESCRIBE <table>, SHOW <table>, SUMMARIZE <table> or EXPLAIN. This is DuckDB SQL: "
+            "to find a column, use SELECT column_name FROM information_schema.columns WHERE "
+            "table_name = 'plays' AND column_name ILIKE '%conv%'. Other statement types are "
+            "rejected. "
             "The plays column desc (the play description) is an SQL keyword: quote it as "
             "\"desc\". An unknown column returns did_you_mean, taken from the tables the "
-            "statement reads. Returns the rows of the statement as written. "
-            "max_rows 1-500 (default 100, larger values are clamped to 500). 10s timeout."
+            "statement reads. Returns the rows of the statement as written; a truncated "
+            "result has a hint. max_rows 1-500 (default 100, or 500 for DESCRIBE, SHOW and "
+            "SUMMARIZE; larger values are clamped to 500). 10s timeout."
         ),
         inputSchema={
             "type": "object",
@@ -293,14 +297,19 @@ TOOLS = [
                 "sql": {
                     "type": "string",
                     "description": (
-                        "One SQL statement: SELECT, WITH ... SELECT, DESCRIBE, SUMMARIZE, SHOW, "
-                        "or EXPLAIN [ANALYZE] of a SELECT. Quote the plays column as \"desc\"."
+                        "One DuckDB SQL statement: SELECT, WITH ... SELECT, DESCRIBE <table>, "
+                        "SHOW <table>, SUMMARIZE <table>, or EXPLAIN [ANALYZE] of a SELECT. "
+                        "Quote the plays column as \"desc\"."
                     ),
                 },
+                # No schema default: mcpo sends a schema default on every call, and the
+                # default depends on the statement.
                 "max_rows": {
                     "type": "integer",
-                    "description": "Max rows to return (default 100, max 500)",
-                    "default": 100,
+                    "description": (
+                        "Max rows to return, 1-500. Omit for the default: 100, or 500 for "
+                        "DESCRIBE, SHOW and SUMMARIZE."
+                    ),
                     "minimum": 1,
                     "maximum": 500,
                 },
@@ -454,7 +463,8 @@ TOOLS = [
             "team efficiency. offense and defense hold one row per team, season_year and "
             "season_type; situational holds one row per team, season_year, season_type and "
             "situation. To rank teams against each other, use nfl_query on team_offense_stats "
-            "or team_defense_stats."
+            "or team_defense_stats. Points scored and allowed are in nfl_team_records; a "
+            "playoff game's result is in nfl_schedule."
         ),
         inputSchema={
             "type": "object",
@@ -489,7 +499,8 @@ TOOLS = [
     Tool(
         name="nfl_player_lookup",
         description=(
-            "Find a player by name and get the gsis_id that the other player tools take as "
+            "Find a player by name: pass player, e.g. {\"player\": \"Josh Allen\"}, or "
+            "player_id. Returns the gsis_id that the other player tools take as "
             "player_id. Use it when a name could match several players (e.g. 'Allen', 'Josh "
             "Allen', 'J.Williams'): every match is listed, never merged. The name matches exactly "
             "(see player); player_id looks one player up. Returns one candidate per matching "
@@ -525,9 +536,11 @@ TOOLS = [
     Tool(
         name="nfl_player_stats",
         description=(
-            "PREFERRED for any player stats question. Returns season-by-season passing, "
-            "rushing and receiving stats for one player: seasons holds one entry per season "
-            "and season type, with the definitions used (attempts exclude sacks and two-point "
+            "Stats for one player: pass player, e.g. {\"player\": \"Joe Burrow\"}, or "
+            "player_id. PREFERRED for any player stats question. Returns season-by-season "
+            "games played, passing, rushing and receiving stats: seasons holds one entry per "
+            "season and season type, each with games (games with a snap or a recorded stat), "
+            "with the definitions used (attempts exclude sacks and two-point "
             "tries; targets exclude two-point tries). Always use this instead of nfl_query for "
             "questions about a player's performance, stats, or trends. If the name matches "
             "several players the result is {ambiguous: true, candidates: [...]}: call again "
@@ -575,9 +588,9 @@ TOOLS = [
     Tool(
         name="nfl_compare",
         description=(
-            "PREFERRED for any comparison question. Side-by-side stats for two teams "
-            "or two players in a single call: pass player1 and player2, or team1 and team2 "
-            "(one pair per call). Always use this instead of calling "
+            "Compare two players (pass player1 and player2) or two teams (team1 and team2), "
+            "one pair per call. PREFERRED for any comparison question: side-by-side stats in "
+            "a single call. Always use this instead of calling "
             "nfl_team_stats or nfl_player_stats twice when the user asks to compare or "
             "contrast two teams or two players against each other. Each player gets one entry "
             "per season and season type (as nfl_player_stats); each team gets one row per "
@@ -1062,9 +1075,12 @@ TOOLS = [
     Tool(
         name="nfl_team_records",
         description=(
-            "PREFERRED for win-loss, record and standings questions. Returns each "
+            "PREFERRED for win-loss, record, standings and points questions. Returns each "
             "franchise's regular-season record, 1970 to present: the final record of a "
-            "finished season, and the record to date of the season in progress. Use the team's "
+            "finished season, and the record to date of the season in progress. "
+            "points_for, points_against and point_diff are regular-season points, to date in "
+            "the current season (null before 1999). A playoff game's result is in "
+            "nfl_schedule. Use the team's "
             "CURRENT abbreviation ('LV' for the Raiders in every era); rows include the "
             "name the club played that season under. Pre-1999 seasons need the optional "
             "'nfl-mcp ingest --pre1999' pull and report record_not_available if absent. "

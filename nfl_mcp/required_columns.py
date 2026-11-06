@@ -45,15 +45,16 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
         "report_secondary_injury", "report_status", "practice_primary_injury",
         "practice_secondary_injury", "practice_status",
     ],
-    # nfl_snap_counts
+    # nfl_snap_counts; nfl_player_stats counts games from game_id
     "snap_counts": [
         "player", "position", "team", "opponent", "season", "week", "game_type",
         "offense_snaps", "offense_pct", "defense_snaps", "defense_pct", "st_snaps",
-        "st_pct", "pfr_player_id",
+        "st_pct", "pfr_player_id", "game_id",
     ],
     # nfl_team_records
     "team_records": [
-        "season", "team", "source_team", "games", "wins", "losses", "ties", "source",
+        "season", "team", "source_team", "games", "wins", "losses", "ties", "points_for",
+        "points_against", "point_diff", "source",
     ],
     # nfl_team_stats, nfl_compare (team mode). The tools select * and filter on team,
     # season_year and season_type; the rest are the columns group F added or redefined.
@@ -125,11 +126,12 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
     "_ingest_metadata": [
         "dataset_id", "table_name", "season", "row_count", "loaded_at",
     ],
-    # Not read by a tool today: the player-identity and stat-definition work reads them.
-    "players": ["gsis_id", "display_name", "position"],
+    # players: every player tool resolves names here; pfr_id maps to snap_counts.
+    # player_stats: nfl_player_stats counts games from it (one row per player per game).
+    "players": ["gsis_id", "display_name", "position", "pfr_id"],
     "player_stats": [
         "player_id", "player_display_name", "position", "team", "season", "week",
-        "season_type",
+        "season_type", "game_id",
     ],
 }
 

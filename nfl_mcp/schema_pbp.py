@@ -28,10 +28,12 @@ filter season_type before you sum):
   team_defense_stats  (team, season_year, season_type, yards_allowed, sacks, turnovers_forced, avg_epa_allowed, ...)
   situational_stats   (team, season_year, season_type, situation, plays, avg_epa, conversion_pct)
   formation_effectiveness (team, season_year, season_type, formation, play_type, avg_epa, ...)
-  team_records        (season, team, source_team, games, wins, losses, ties, source) — final
-                      regular-season record per franchise, 1970+ (1970-1998 needs the optional
-                      'nfl-mcp ingest --pre1999'). `team` is the CURRENT abbreviation, so the
-                      Raiders are 'LV' in every season and will not match `posteam`='OAK' in plays.
+  team_records        (season, team, source_team, games, wins, losses, ties, points_for,
+                      points_against, point_diff, source) — final regular-season record and
+                      points per franchise, 1970+ (1970-1998 needs the optional
+                      'nfl-mcp ingest --pre1999' and has no points). `team` is the CURRENT
+                      abbreviation, so the Raiders are 'LV' in every season and will not match
+                      `posteam`='OAK' in plays.
 
 Categories available (pass category='<name>' for full detail):
   game_context, teams, game_situation, play_details, timeouts, score,

@@ -417,14 +417,14 @@ their `gsis_id` and no rows. Call the tool again with `player_id` set to one `gs
 |------|-----------|-------------|
 | `nfl_schema` | `category`, `table` | Database schema reference. The default call gives a summary, the verified table relationships, data notes, and the derived tables. Pass `category` for column detail or `table` for one table's columns, grain, and join keys. |
 | `nfl_status` | none | Database health: total plays, loaded seasons, and per dataset the row count, newest season, newest week, and last refresh time |
-| `nfl_query` | `sql` (required), `max_rows` | Raw SQL SELECT for custom queries (500 row cap, 10s timeout) |
+| `nfl_query` | `sql` (required), `max_rows` | Raw SQL SELECT for custom queries (default 100 rows, 500 for `DESCRIBE`/`SHOW`/`SUMMARIZE`; 500 row cap, 10s timeout) |
 | `nfl_search_plays` | `season_type` (required), `team`, `opponent`, `player`, `player_id`, `player_role`, `season`, `season_from`, `season_to`, `week`, `play_type`, `situation`, play filters such as `down`, `qtr` and `is_touchdown`, `sort_by`, `columns`, `max_rows` | Find plays by player, team, season, season type, situation, touchdowns, etc. |
 | `nfl_team_stats` | `team` (required), `season_type` (required), `season`, `season_from`, `season_to`, `side` | Pre-aggregated team offense, defense, and situational stats, one row per team, season and season type |
 | `nfl_player_lookup` | `player` or `player_id`, `team`, `season`, `position` | Find players by name and return each candidate's `gsis_id` for the other player tools |
-| `nfl_player_stats` | `player` or `player_id`, `season_type` (required), `season`, `season_from`, `season_to`, `stat_type` | Player stats by season and season type — passing, rushing, or receiving |
+| `nfl_player_stats` | `player` or `player_id`, `season_type` (required), `season`, `season_from`, `season_to`, `stat_type` | Player stats by season and season type: `games` (games with a snap or a recorded stat), passing, rushing, or receiving |
 | `nfl_compare` | `player1` and `player2`, or `team1` and `team2`; `season_type` (required), `season`, `season_from`, `season_to` | Side-by-side comparison of two teams or two players |
 | `nfl_schedule` | `season_type` (required), `team`, `season`, `week` | Game schedule and results — scores, spread, weather, coaches |
-| `nfl_team_records` | `team`, `season`, `season_from`, `season_to` (at least one) | Season win-loss records per franchise, 1970–present (1970–1998 needs `--pre1999`). A season in progress shows the record to date. |
+| `nfl_team_records` | `team`, `season`, `season_from`, `season_to` (at least one) | Season win-loss records per franchise, 1970–present (1970–1998 needs `--pre1999`), with regular-season `points_for`, `points_against` and `point_diff` (from 1999). A season in progress shows the record and points to date. |
 | `nfl_roster` | `team`, `season`, `position`, `player`, `player_id` | Team roster by season and position. `position` matches the roster position or the depth chart position. Each row has the player's `gsis_id`. |
 | `nfl_injuries` | `season_type` (required), `team`, `season`, `week`, `player`, `player_id`, `report_status`, `practice_status` | Player injury report status by team, week, and designation. Each row has the player's `gsis_id` and a `season_type` (REG or POST). |
 | `nfl_snap_counts` | `season_type` (required), `player`, `player_id`, `team`, `season`, `week`, `position` | Offensive, defensive, and special teams snap counts per player |

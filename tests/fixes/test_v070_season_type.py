@@ -27,7 +27,7 @@ Interface contract tested here
   ff_opportunity get the round from schedules through game_id.
 - player_role_trend, player_separation_opportunity and player_contract_value gain a
   season_type column (REQUIRED_COLUMNS lists it). The role_trend window is per season_type.
-- migrate.SCHEMA_VERSION == 2. A version 1 database whose derived tables lack those columns
+- migrate.SCHEMA_VERSION == 2 (3 since v0.7.1). A version 1 database whose derived tables lack those columns
   is detected and fixed by `nfl-mcp upgrade` without the network.
 - Snap shares are percents (0 to 100). season, season_year and week are Python ints.
 
@@ -792,8 +792,10 @@ def test_derived_table_has_reg_and_post_rows(real, table):
 
 # ═══ 6. schema version 2: detection, upgrade, validate ══════════════════════════
 
-def test_schema_version_is_2():
-    assert migrate.SCHEMA_VERSION == 2
+def test_schema_version_is_at_least_2():
+    # 2 in v0.7.0; v0.7.1 moved to 3 (points in team_records). The v1 -> current upgrade
+    # below still has to add the season_type columns.
+    assert migrate.SCHEMA_VERSION >= 2
 
 
 # Synthetic source tables: the columns the derived SQL in ingest.py reads (as in
@@ -963,7 +965,7 @@ def test_check_detects_v1_without_season_type_columns(tmp_path):
         status = migrate.check(con)
     finally:
         con.close()
-    assert (status.version, status.target, status.upgrade_needed, status.newer) == (1, 2, True, False)
+    assert (status.version, status.target, status.upgrade_needed, status.newer) == (1, migrate.SCHEMA_VERSION, True, False)
     needed = {s.name: s for s in status.steps if s.needed}
     assert not any(s.needs_network for s in needed.values()), needed
     assert "derived_tables" in needed, [s.name for s in status.steps]
@@ -974,7 +976,7 @@ def test_check_detects_v1_without_season_type_columns(tmp_path):
 def test_cli_check_exits_3_on_v1(upgraded):
     code, out = upgraded["check_before"]
     assert code == 3, out
-    assert "1" in out and "2" in out, out
+    assert "1" in out and str(migrate.SCHEMA_VERSION) in out, out
 
 
 def test_cli_upgrade_exits_0_on_v1(upgraded):
@@ -987,10 +989,11 @@ def test_cli_check_exits_0_after_upgrade(upgraded):
     assert code == 0, out
 
 
-def test_upgrade_stamps_version_2(upgraded):
+def test_upgrade_stamps_current_version(upgraded):
     con = _ro(upgraded["path"])
     try:
-        assert con.execute("SELECT MAX(version) FROM _schema_version").fetchone()[0] == 2
+        assert (con.execute("SELECT MAX(version) FROM _schema_version").fetchone()[0]
+                == migrate.SCHEMA_VERSION)
     finally:
         con.close()
 
@@ -1037,10 +1040,10 @@ def test_validate_accepts_upgraded_slot_against_v1_slot(upgraded, tmp_path):
     assert "player_role_trend" in floor.detail and "allowed" in floor.detail, floor.detail
 
 
-def test_validate_upgraded_slot_reports_schema_version_2(upgraded):
+def test_validate_upgraded_slot_reports_current_schema_version(upgraded):
     results = run_checks(upgraded["path"])
     version = next(r for r in results if r.name == "schema_version")
-    assert version.ok and "2" in version.detail, version.detail
+    assert version.ok and str(migrate.SCHEMA_VERSION) in version.detail, version.detail
 
 
 def test_validate_still_fails_a_raw_shrink_across_the_upgrade(upgraded, tmp_path):

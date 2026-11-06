@@ -331,10 +331,16 @@ def test_max_rows_above_500_clamped(db, n):
     assert (result["row_count"], result["truncated"]) == (500, True)  # 700 rows, clamp 500
 
 
-@pytest.mark.parametrize("bad", [0, -5, "7", None, 2.5], ids=["zero", "neg", "str", "none", "float"])
+@pytest.mark.parametrize("bad", [0, -5, "7", 2.5], ids=["zero", "neg", "str", "float"])
 def test_invalid_max_rows_returns_error(db, bad):
     result = nfl_query("SELECT * FROM plays", max_rows=bad)
     assert "max_rows" in result.get("error", ""), result
+
+
+def test_max_rows_none_means_the_default(db):
+    # v0.7.1: max_rows defaults to None (100 rows; 500 for DESCRIBE/SHOW/SUMMARIZE).
+    result = nfl_query("SELECT range AS i FROM range(150)", max_rows=None)
+    assert (result["row_count"], result["truncated"]) == (100, True)
 
 
 # ── 5. columns metadata ────────────────────────────────────────────────────────

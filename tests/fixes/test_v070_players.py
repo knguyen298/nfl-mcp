@@ -274,7 +274,8 @@ def test_player_stats_without_player_or_player_id_is_error_naming_both(real):
     assert is_error, payload
     msg = payload["error"]
     assert _named("player", msg) and _named("player_id", msg), msg
-    assert "player_name" not in msg, msg
+    # v0.7.1: player_name appears only as a name that is not accepted (a proxy drops it).
+    assert "player_name" not in msg.replace("such as player_name are not accepted", ""), msg
 
 
 def test_player_stats_function_without_player_returns_error(empty_db):

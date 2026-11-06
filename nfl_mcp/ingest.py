@@ -1351,13 +1351,20 @@ def _create_team_records(conn: duckdb.DuckDBPyConnection):
     from 1999 (aggregated from scores) and ESPN's reported records for 1970-1998 (see
     nfl_mcp/espn.py for why scores cannot be used there). Team codes are normalized to the
     canonical current abbreviation so one query spans relocations and renames.
+
+    points_for, points_against and point_diff (schema version 3) are regular-season sums
+    over the games with a score, so a season in progress has its points to date. ESPN
+    rows carry no scores: their points are NULL.
     """
     from .franchises import schedule_alias_case
 
     statements: list[str] = []
     if _table_exists(conn, "espn_team_records"):
         statements.append("""
-            SELECT season, team, espn_abbrev AS source_team, games, wins, losses, ties,
+            SELECT CAST(season AS INTEGER) AS season, team, espn_abbrev AS source_team,
+                   games, wins, losses, ties,
+                   CAST(NULL AS INTEGER) AS points_for, CAST(NULL AS INTEGER) AS points_against,
+                   CAST(NULL AS INTEGER) AS point_diff,
                    'espn' AS source
             FROM espn_team_records
         """)
@@ -1375,11 +1382,15 @@ def _create_team_records(conn: duckdb.DuckDBPyConnection):
                 WHERE game_type = 'REG' AND away_team IS NOT NULL
                   AND home_score IS NOT NULL AND away_score IS NOT NULL
             )
-            SELECT season, {schedule_alias_case("source_team")} AS team, source_team,
+            SELECT CAST(season AS INTEGER) AS season,
+                   {schedule_alias_case("source_team")} AS team, source_team,
                    COUNT(*)                                    AS games,
                    SUM(CASE WHEN points_for > points_against THEN 1 ELSE 0 END) AS wins,
                    SUM(CASE WHEN points_for < points_against THEN 1 ELSE 0 END) AS losses,
                    SUM(CASE WHEN points_for = points_against THEN 1 ELSE 0 END) AS ties,
+                   CAST(SUM(points_for) AS INTEGER)            AS points_for,
+                   CAST(SUM(points_against) AS INTEGER)        AS points_against,
+                   CAST(SUM(points_for - points_against) AS INTEGER) AS point_diff,
                    'nflverse' AS source
             FROM games
             GROUP BY 1, 2, 3

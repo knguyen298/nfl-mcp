@@ -102,6 +102,8 @@ def test_player_stats_stat_type_keeps_one_block(monkeypatch, resolves_to_mahomes
     row = defaultdict(lambda: None, season=2024, season_type="REG")  # every other stat is NULL
 
     def fake_execute(sql, params=None):
+        if "snap_counts" in sql:  # the games query (v0.7.1), not the stats query
+            return []
         captured["sql"] = sql
         captured["params"] = params
         return [row]
@@ -115,7 +117,7 @@ def test_player_stats_stat_type_keeps_one_block(monkeypatch, resolves_to_mahomes
         season_type="REG",
     )
     (season,) = result["seasons"]
-    assert set(season) == {"season", "season_type", stat_type}
+    assert set(season) == {"season", "season_type", "games", stat_type}
     assert "season >=" in captured["sql"]
     assert "season <=" in captured["sql"]
     assert captured["params"] == [MAHOMES["gsis_id"], 2020, 2024, "REG"]
@@ -990,7 +992,7 @@ def test_fold_player_name(name, strip, expected):
 def test_player_lookup_requires_a_name():
     result = tools.nfl_player_lookup(player="  ")
     assert result["code"] == "MISSING_PLAYER"
-    assert result["error"] == "player or player_id is required"
+    assert result["error"].startswith("player or player_id is required")
 
 
 def test_player_stats_without_player_is_an_error_with_code():

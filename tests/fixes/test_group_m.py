@@ -33,7 +33,7 @@ Contract corrections (the tests follow these, not the spec text)
    refuse it as "newer".
 
 Interface contract (shared contract plus the choices made here)
-- nfl_mcp.migrate: SCHEMA_VERSION == 2 (v0.7.0; 1 before); check(conn); upgrade(conn, *, fetch=True);
+- nfl_mcp.migrate: SCHEMA_VERSION == 3 (v0.7.1; 2 in v0.7.0, 1 before); check(conn); upgrade(conn, *, fetch=True);
   stamp_if_current(conn). Status objects expose the attribute names in the spec
   (version, target, steps, upgrade_needed, newer; Step.name/needed/needs_network/detail;
   result.before/after/ran/failed/pending/stamped).
@@ -121,7 +121,7 @@ V0_DB = Path("/tmp/grpE_v3.duckdb")
 V053_DB = Path.home() / ".nfl-mcp" / "nflread.duckdb"
 F_DB = Path("/tmp/grpF_work.duckdb")
 
-CUR = 2  # migrate.SCHEMA_VERSION since v0.7.0 (the season_type split of the fantasy tables)
+CUR = 3  # migrate.SCHEMA_VERSION since v0.7.1 (points in team_records); 2 was v0.7.0 (the season_type split)
 
 V2_TABLES = ["player_role_trend", "player_separation_opportunity", "player_contract_value"]
 STEPS = ["derived_tables", "depth_charts_season", "raw_columns"]
@@ -146,6 +146,8 @@ V0_GAPS = {
     "player_separation_opportunity": ["season_type"],
     "player_contract_value": ["season_type"],
 }
+# v0.7.1 (schema version 3): team_records gains points; every older build lacks them.
+V3_GAPS = {"team_records": ["points_for", "points_against", "point_diff"]}
 V0_NULL_DEPTH = 1_280_630
 
 
@@ -195,7 +197,7 @@ SCHEMA = {
     "snap_counts": "game_id:V season:I game_type:V week:I player:V pfr_player_id:V position:V "
                    "team:V opponent:V offense_snaps:D offense_pct:D defense_snaps:D "
                    "defense_pct:D st_snaps:D st_pct:D",
-    "player_stats": "player_id:V player_display_name:V position:V season:I week:I "
+    "player_stats": "player_id:V player_display_name:V position:V season:I week:I game_id:V "
                     "season_type:V team:V",
     "players": "gsis_id:V display_name:V pfr_id:V position:V",
     "ff_opportunity": "season:V posteam:V week:D game_id:V player_id:V full_name:V position:V "
@@ -561,6 +563,20 @@ class _Once:
         return self.value
 
 
+def _shared_columns(con, table, oracle="oracle"):
+    """The oracle's columns of table (grpF_work predates the v0.7.1 points columns)."""
+    names = [r[0] for r in con.execute(f"DESCRIBE {oracle}.{table}").fetchall()]
+    return ", ".join(f'"{n}"' for n in names)
+
+
+def _except_both_ways(con, table):
+    cols = _shared_columns(con, table)
+    return (_count(con, f"SELECT COUNT(*) FROM (SELECT {cols} FROM main.{table} "
+                        f"EXCEPT ALL SELECT {cols} FROM oracle.{table})"),
+            _count(con, f"SELECT COUNT(*) FROM (SELECT {cols} FROM oracle.{table} "
+                        f"EXCEPT ALL SELECT {cols} FROM main.{table})"))
+
+
 def _team_snapshot(con):
     return {t: con.execute(f"SELECT * FROM {t} ORDER BY ALL").fetchall() for t in TEAM_TABLES}
 
@@ -586,11 +602,7 @@ def v0_upgraded(tmp_path_factory, f_copy):
                 snap2 = _team_snapshot(con)
                 null_depth = _count(con, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL")
                 con.execute(f"ATTACH '{f_copy}' AS oracle (READ_ONLY)")
-                diff = {t: (_count(con, f"SELECT COUNT(*) FROM (SELECT * FROM main.{t} "
-                                        f"EXCEPT ALL SELECT * FROM oracle.{t})"),
-                            _count(con, f"SELECT COUNT(*) FROM (SELECT * FROM oracle.{t} "
-                                        f"EXCEPT ALL SELECT * FROM main.{t})"))
-                        for t in TEAM_TABLES}
+                diff = {t: _except_both_ways(con, t) for t in TEAM_TABLES}
                 con.execute("DETACH oracle")
             finally:
                 con.close()
@@ -699,7 +711,8 @@ def test_grpE_v3_shape_measurements():
         assert raw_gaps == []
         derived_gaps = sorted((t, c) for t in DERIVED for c in REQUIRED_COLUMNS[t]
                               if c not in cols.get(t, set()))
-        assert derived_gaps == sorted((t, c) for t, cs in V0_GAPS.items() for c in cs)
+        assert derived_gaps == sorted((t, c) for t, cs in {**V0_GAPS, **V3_GAPS}.items()
+                                      for c in cs)
     finally:
         con.close()
 
@@ -715,7 +728,10 @@ def test_v053_shape_measurements(v053_copy):
                               if c not in cols.get(t, set()))
         assert derived_gaps == [("situational_stats", "conversion_rule"),
                                 ("team_defense_stats", "def_touchdowns"),
-                                ("team_offense_stats", "pass_attempts")]
+                                ("team_offense_stats", "pass_attempts"),
+                                ("team_records", "point_diff"),
+                                ("team_records", "points_against"),
+                                ("team_records", "points_for")]
         assert [(t, c) for t in RAW for c in REQUIRED_COLUMNS[t] if c not in cols.get(t, set())] == []
         assert _count(con, "SELECT COUNT(*) FROM depth_charts WHERE season IS NULL") == V0_NULL_DEPTH
         assert con.execute("SELECT row_count FROM _ingest_metadata WHERE dataset_id = 'derived_shape'"
@@ -725,7 +741,7 @@ def test_v053_shape_measurements(v053_copy):
 
 
 @pytest.mark.integration
-def test_grpF_work_lacks_only_the_v2_season_type_columns(f_copy):
+def test_grpF_work_lacks_only_the_v2_season_type_and_v3_points_columns(f_copy):
     con = _ro(f_copy)
     try:
         cols = _columns(con)
@@ -733,7 +749,7 @@ def test_grpF_work_lacks_only_the_v2_season_type_columns(f_copy):
         con.close()
     assert sorted((t, c) for t, need in REQUIRED_COLUMNS.items()
                   for c in need if c not in cols.get(t, set())) == sorted(
-        (t, "season_type") for t in V2_TABLES)
+        [(t, "season_type") for t in V2_TABLES] + [(t, c) for t, cs in V3_GAPS.items() for c in cs])
 
 
 @pytest.mark.integration
@@ -750,10 +766,7 @@ def test_rebuild_derived_tables_on_grpE_v3_sources_reproduces_grpF_work(f_copy):
         _quiet(ing.rebuild_derived_tables, con)
         con.execute(f"ATTACH '{f_copy}' AS oracle (READ_ONLY)")
         for t in TEAM_TABLES:
-            assert _count(con, f"SELECT COUNT(*) FROM (SELECT * FROM main.{t} EXCEPT ALL "
-                               f"SELECT * FROM oracle.{t})") == 0, t
-            assert _count(con, f"SELECT COUNT(*) FROM (SELECT * FROM oracle.{t} EXCEPT ALL "
-                               f"SELECT * FROM main.{t})") == 0, t
+            assert _except_both_ways(con, t) == (0, 0), t
         assert con.execute(
             "SELECT total_plays, total_yards, rush_plays, pass_plays, pass_attempts FROM "
             "main.team_offense_stats WHERE team = 'KC' AND season_year = 2024 AND season_type = 'REG'"
@@ -779,7 +792,7 @@ def test_validate_existing_checks_pass_on_grpF_work_against_itself(f_copy):
 
 
 def test_schema_version_constant_is_2():
-    assert _migrate().SCHEMA_VERSION == CUR == 2
+    assert _migrate().SCHEMA_VERSION == CUR == 3
 
 
 def test_check_v0_synthetic_reports_every_step(tmp_path):
@@ -1324,7 +1337,9 @@ def test_grpE_v3_upgraded_oracle_rows(v0_upgraded):
     deff = [r for r in snap["team_defense_stats"] if r[:3] == ("PHI", 2024, "POST")]
     assert len(deff) == 1 and deff[0][3:10] == (255, 1330.0, 5.22, 16, 6, 13, 1)
     rec = [r for r in snap["team_records"] if r[:2] == (2025, "KC")]
-    assert rec == [(2025, "KC", "KC", 17, 6, 11, 0, "nflverse")]
+    # Points: SELECT SUM(pf), SUM(pa) FROM (home and away rows of schedules) WHERE
+    # season = 2025 AND game_type = 'REG' AND team = 'KC' on grpE_v3 -> 362, 328.
+    assert rec == [(2025, "KC", "KC", 17, 6, 11, 0, 362, 328, 34, "nflverse")]
 
 
 @pytest.mark.integration
