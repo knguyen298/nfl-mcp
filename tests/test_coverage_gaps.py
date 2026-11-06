@@ -471,11 +471,26 @@ class TestToolPlayers:
         assert result["truncated"] is True
         assert "Add team, season or position" in result["hint"]
 
-    def test_player_filter_returns_the_error_when_resolution_fails(self, monkeypatch):
+    def test_lookup_takes_a_gsis_shaped_player_as_an_id(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(tools, "_find_players", lambda *a, **k: seen.append((a, k)) or ([], False))
+        tools.nfl_player_lookup(player=" 00-0033873 ")
+        assert seen == [((), {"gsis_id": "00-0033873", "limit": 1})]
+
+    def test_one_player_returns_the_error_when_resolution_fails(self, monkeypatch):
         monkeypatch.setattr(tools, "_resolve_player", _raise(duckdb.Error("players table broke")))
-        cond, params, found, early = tools._player_filter("Smith", None, "some_table", "full_name")
-        assert (cond, params, found) == (None, [], None)
-        assert early == {"error": "players table broke"}
+        assert tools._one_player("Smith", None, "x") == (None, {"error": "players table broke"})
+
+    def test_one_player_with_no_match_returns_no_rows_and_a_reason(self, monkeypatch):
+        monkeypatch.setattr(tools, "_resolve_player", lambda *a, **k: (None, None))
+        found, early = tools._one_player("Smit", None, "x")
+        assert found is None
+        assert early["x"] == [] and early["count"] == 0 and early["truncated"] is False
+        assert "No player matches 'Smit'" in early["reason"]
+
+    def test_one_player_without_a_player_resolves_nothing(self, monkeypatch):
+        monkeypatch.setattr(tools, "_resolve_player", lambda *a, **k: pytest.fail("must not resolve"))
+        assert tools._one_player(None, None, "x") == (None, None)
 
     def test_compare_players_reports_an_entity_that_matches_nobody(self, monkeypatch):
         monkeypatch.setattr(tools, "_resolve_player", lambda *a, **k: (None, None))
@@ -535,6 +550,55 @@ class TestFtnAndSeparationPlayers:
         assert tools.nfl_separation_opportunity(player_id="00-0000001", season_type="REG") == ambiguous
 
 
+class TestFantasyRankingsPlayers:
+    def test_resolver_error_is_returned(self, monkeypatch):
+        monkeypatch.setattr(tools, "_resolve_player", _raise(duckdb.Error("players broke")))
+        monkeypatch.setattr(tools, "_execute", lambda *a, **k: pytest.fail("rankings query must not run"))
+        assert tools.nfl_fantasy_rankings(player="Smith")["error"] == "players broke"
+
+    def test_position_is_an_exact_match(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(tools, "_execute", lambda sql, params=None: captured.append((sql, params)) or [])
+        tools.nfl_fantasy_rankings(position=" wr ")
+        sql, params = captured[0]
+        assert "upper(pos) = ?" in sql and "ILIKE" not in sql
+        assert params[0] == "WR"
+
+    def test_team_fa_lists_free_agents_not_a_franchise(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(tools, "_execute", lambda sql, params=None: captured.append((sql, params)) or [])
+        tools.nfl_fantasy_rankings(team=" fa ")
+        sql, params = captured[0]
+        assert "team = 'FA'" in sql
+        assert not any(str(p).upper() == "FA" for p in params or [])
+
+
+# ── tools: SQL error help ───────────────────────────────────────────────────────
+
+class TestSqlErrorHelp:
+    COLUMN_ERROR = 'Binder Error: Referenced column "play_epa" not found in FROM clause!'
+
+    def test_column_error_without_the_statement_offers_every_live_column(self, monkeypatch):
+        seen = []
+
+        def fake_execute(sql, params=None):
+            seen.append(params)
+            return [{"column_name": c} for c in ("epa", "qb_epa", "yards_gained")]
+
+        monkeypatch.setattr(tools, "_execute", fake_execute)
+        detail = tools._sql_error_detail(duckdb.BinderException(self.COLUMN_ERROR))
+        assert detail["did_you_mean"][:2] == ["epa", "qb_epa"]
+        assert seen == [None]  # one lookup, not narrowed to any table
+
+    def test_queried_tables_is_none_when_duckdb_cannot_serialize(self, monkeypatch):
+        monkeypatch.setattr(tools.duckdb, "connect", _raise(duckdb.Error("no in-memory db")))
+        assert tools._queried_tables("SELECT 1 FROM plays") is None
+
+    def test_queried_tables_is_none_for_a_statement_that_does_not_parse(self, monkeypatch):
+        monkeypatch.setattr(tools, "_execute", lambda *a, **k: pytest.fail("no table lookup"))
+        assert tools._queried_tables("SELEC epa FROM plays") is None
+
+
 # ── tools: team tables ──────────────────────────────────────────────────────────
 
 class TestTeamTables:
@@ -544,7 +608,7 @@ class TestTeamTables:
             tools._team_rows("team_offense_stats", ["KC"], (None, None, None, "REG"))
 
     def test_compare_teams_with_no_rows_adds_the_range_reason(self, monkeypatch):
-        monkeypatch.setattr(tools, "_team_rows", lambda *a, **k: ([], False))
+        monkeypatch.setattr(tools, "_team_rows", lambda *a, **k: [])
         monkeypatch.setattr(tools, "_range_reason", lambda *a, **k: "Season 1900 is outside the loaded range.")
         result = tools._compare_teams("KC", "BUF", 1900, None, None, "REG")
         for entry in result.values():

@@ -97,7 +97,7 @@ MIN_ARGS = {
     "nfl_separation_opportunity": {"season": 2024, "season_type": "ALL"},
     "nfl_drop_rate": {"season": 2024, "season_type": "ALL"},
     "nfl_contract_value": {"season": 2024, "season_type": "ALL"},
-    "nfl_team_records": {"team": "KC", "season": 2024}, "nfl_player_lookup": {"name": "Mahomes"},
+    "nfl_team_records": {"team": "KC", "season": 2024}, "nfl_player_lookup": {"player": "Mahomes"},
 }
 DERIVED = ["team_offense_stats", "team_defense_stats", "situational_stats", "formation_effectiveness"]
 

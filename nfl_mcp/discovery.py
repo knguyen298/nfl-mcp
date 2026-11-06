@@ -171,6 +171,10 @@ DATA_NOTES: list[str] = [
     "or SB. ALL returns the REG rows and the POST rows as separate rows, never one combined "
     "row. A database built before v0.7.0 answers STALE_DERIVED_TABLES until you run "
     "'nfl-mcp upgrade'."),
+    ("Column names differ by table. schedules and snap_counts have game_type (REG, WC, DIV, "
+    "CON, SB), not season_type. players has display_name (the full name), not full_name; "
+    "rosters and injuries have full_name. The plays column \"desc\" is an SQL keyword and must "
+    "be quoted."),
     ("nfl_roster and nfl_injuries return gsis_id on every row. nfl_injuries also returns "
     "season_type. The injuries table leaves season_type empty in some rows (every 2024 row when "
     "measured), so the tool fills it from game_type (REG stays REG, WC, DIV, CON and SB become POST)."),

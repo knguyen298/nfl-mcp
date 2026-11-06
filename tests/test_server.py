@@ -133,21 +133,21 @@ def test_create_app_lifespan_runs(monkeypatch):
 def test_team_records_is_exposed_with_its_arguments():
     tool = next(tool for tool in server_module.TOOLS if tool.name == "nfl_team_records")
     assert set(tool.inputSchema["properties"]) == {
-        "team", "season", "from_season", "to_season", "limit", "offset"}
+        "team", "season", "season_from", "season_to", "limit", "offset"}
 
 
 def test_call_tool_dispatches_team_records(monkeypatch):
     seen = {}
 
-    def fake(team=None, season=None, from_season=None, to_season=None):
-        seen.update(team=team, season=season, from_season=from_season, to_season=to_season)
+    def fake(team=None, season=None, season_from=None, season_to=None):
+        seen.update(team=team, season=season, season_from=season_from, season_to=season_to)
         return {"records": [{"season": 1996, "team": "GB", "wins": 13}], "count": 1}
 
     monkeypatch.setattr(server_module, "nfl_team_records", fake)
     result = asyncio.run(server_module.call_tool("nfl_team_records", {"team": "OAK", "season": 1996}))
     payload = json.loads(result.content[0].text)
     assert payload["count"] == 1
-    assert seen == {"team": "OAK", "season": 1996, "from_season": None, "to_season": None}
+    assert seen == {"team": "OAK", "season": 1996, "season_from": None, "season_to": None}
 
 
 def test_every_exposed_tool_has_a_handler():

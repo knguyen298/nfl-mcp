@@ -166,6 +166,7 @@ _SAMPLE_ARGS = {
 # Not in "required" (a name or an id, a player pair or a team pair), but a call needs one.
 _ENTITY_ARGS = {
     "nfl_player_stats": {"player": "Josh Allen"},
+    "nfl_player_lookup": {"player": "Josh Allen"},
     "nfl_compare": {"team1": "KC", "team2": "BUF"},
 }
 

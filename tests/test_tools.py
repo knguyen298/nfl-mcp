@@ -748,7 +748,7 @@ class TestNflTeamRecords:
              "wins": 5, "losses": 11, "ties": 0, "source": "espn"},
         ]
         with patch("nfl_mcp.tools._execute", return_value=rows):
-            result = nfl_team_records(team="IND", from_season=1970, to_season=1985)
+            result = nfl_team_records(team="IND", season_from=1970, season_to=1985)
         assert [row["club"] for row in result["records"]] == [
             "Baltimore Colts", "Indianapolis Colts",
         ]
@@ -756,7 +756,7 @@ class TestNflTeamRecords:
 
     def test_range_filters_are_passed_as_parameters(self):
         with patch("nfl_mcp.tools._execute", return_value=[]) as execute:
-            nfl_team_records(team="LV", from_season=1970, to_season=1980)
+            nfl_team_records(team="LV", season_from=1970, season_to=1980)
         sql, params = execute.call_args[0]
         assert "season >= ?" in sql and "season <= ?" in sql
         assert params == ["LV", 1970, 1980]
@@ -810,7 +810,7 @@ class TestNflTeamRecordsIntegration:
     def test_season_range_is_clipped_to_the_bounds(self):
         # CI ingests one season, so assert what a range must always guarantee rather than
         # assuming the database spans it.
-        bounded = nfl_team_records(team="PHI", from_season=2000, to_season=2024)["records"]
+        bounded = nfl_team_records(team="PHI", season_from=2000, season_to=2024)["records"]
         assert bounded
         assert {row["season"] for row in bounded} <= set(range(2000, 2025))
         assert all(row["team"] == "PHI" for row in bounded)

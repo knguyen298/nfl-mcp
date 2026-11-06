@@ -405,30 +405,39 @@ SELECT season, team, wins, losses, ties FROM team_records WHERE season = 1972 AN
 
 ## MCP Tools
 
-| Tool | Description |
-|------|-------------|
-| `nfl_schema` | Database schema reference. The default call gives a summary, the verified table relationships, data notes, and the derived tables. Pass `category` for column detail or `table` for one table's columns, grain, and join keys. |
-| `nfl_status` | Database health: total plays, loaded seasons, and per dataset the row count, newest season, newest week, and last refresh time |
-| `nfl_query` | Raw SQL SELECT for custom queries (500 row cap, 10s timeout) |
-| `nfl_search_plays` | Find plays by player, team, season, season type, situation, touchdowns, etc. |
-| `nfl_team_stats` | Pre-aggregated team offense, defense, and situational stats |
-| `nfl_player_stats` | Player stats by season and season type — passing, rushing, or receiving |
-| `nfl_compare` | Side-by-side comparison of two teams or two players |
-| `nfl_schedule` | Game schedule and results — scores, spread, weather, coaches |
-| `nfl_team_records` | Final season win-loss records per franchise, 1970–present (1970–1998 needs `--pre1999`) |
-| `nfl_roster` | Team roster by season and position. Each row has the player's `gsis_id`. |
-| `nfl_injuries` | Player injury report status by team, week, and designation. Each row has the player's `gsis_id` and a `season_type` (REG or POST). |
-| `nfl_snap_counts` | Offensive, defensive, and special teams snap counts per player |
-| `nfl_fantasy_opportunity` | Target share, air yards share, carry share, and expected fantasy points per player per week (2006–present) |
-| `nfl_fantasy_rankings` | Expert consensus rankings (ECR) — draft/dynasty/best-ball (`scope=draft`) or current-week start/sit (`scope=week`) |
-| `nfl_ftn_charting` | Aggregated FTN charting tendencies (2022–present) over scrimmage plays — play-action, RPO, screen, no-huddle, motion, trick-play rates, plus box/pass-rush/blitz counts |
-| `nfl_td_luck` | Actual vs expected touchdowns per player, season, and season type. It surfaces TD-regression candidates (most "unlucky" first). `season_type` is required: REG, POST or ALL. ALL returns the REG rows and the POST rows as separate rows, labeled by `season_type`. |
-| `nfl_role_trend` | Rolling 3-week snap / target / carry / air-yards share with current-week delta — usage trending up or down |
-| `nfl_separation_opportunity` | Next Gen Stats separation/YAC joined to fantasy opportunity (2016+) — flags receivers getting open but under-producing |
-| `nfl_drop_rate` | Catchable-target drop rate per receiver, team, season, and season type from FTN charting (2022+), plus contested targets and created receptions. `season_type` is required: REG, POST or ALL. ALL returns the REG rows and the POST rows as separate rows, labeled by `season_type`. |
-| `nfl_contract_value` | Fantasy points per $M of average per year (APY) — best value-for-money players |
-| `nfl_injury_return` | Post-return snap-share recovery (% of pre-injury baseline) at +1..+8 weeks, by normalized injury type and position |
-| `nfl_catalog` | Every table with its grain (what one row is), live row count, first and last season, join keys, derived flag, and last load time |
+A required argument is marked "(required)". The tools that take `season_type` require it.
+Pass REG, POST or ALL. Some tools also accept a playoff round code (WC, DIV, CON, SB).
+A `player` name matches exactly, ignoring case, accents, punctuation and a Jr/Sr/II suffix.
+It matches the full name, the last name or the short name (`P.Mahomes`). Part of a name
+matches nobody. If a name matches several players, the tool returns the candidates with
+their `gsis_id` and no rows. Call the tool again with `player_id` set to one `gsis_id`.
+`limit` and `offset` page the tools that return many rows.
+
+| Tool | Arguments | Description |
+|------|-----------|-------------|
+| `nfl_schema` | `category`, `table` | Database schema reference. The default call gives a summary, the verified table relationships, data notes, and the derived tables. Pass `category` for column detail or `table` for one table's columns, grain, and join keys. |
+| `nfl_status` | none | Database health: total plays, loaded seasons, and per dataset the row count, newest season, newest week, and last refresh time |
+| `nfl_query` | `sql` (required), `max_rows` | Raw SQL SELECT for custom queries (500 row cap, 10s timeout) |
+| `nfl_search_plays` | `season_type` (required), `team`, `opponent`, `player`, `player_id`, `player_role`, `season`, `season_from`, `season_to`, `week`, `play_type`, `situation`, play filters such as `down`, `qtr` and `is_touchdown`, `sort_by`, `columns`, `max_rows` | Find plays by player, team, season, season type, situation, touchdowns, etc. |
+| `nfl_team_stats` | `team` (required), `season_type` (required), `season`, `season_from`, `season_to`, `side` | Pre-aggregated team offense, defense, and situational stats, one row per team, season and season type |
+| `nfl_player_lookup` | `player` or `player_id`, `team`, `season`, `position` | Find players by name and return each candidate's `gsis_id` for the other player tools |
+| `nfl_player_stats` | `player` or `player_id`, `season_type` (required), `season`, `season_from`, `season_to`, `stat_type` | Player stats by season and season type — passing, rushing, or receiving |
+| `nfl_compare` | `player1` and `player2`, or `team1` and `team2`; `season_type` (required), `season`, `season_from`, `season_to` | Side-by-side comparison of two teams or two players |
+| `nfl_schedule` | `season_type` (required), `team`, `season`, `week` | Game schedule and results — scores, spread, weather, coaches |
+| `nfl_team_records` | `team`, `season`, `season_from`, `season_to` (at least one) | Season win-loss records per franchise, 1970–present (1970–1998 needs `--pre1999`). A season in progress shows the record to date. |
+| `nfl_roster` | `team`, `season`, `position`, `player`, `player_id` | Team roster by season and position. `position` matches the roster position or the depth chart position. Each row has the player's `gsis_id`. |
+| `nfl_injuries` | `season_type` (required), `team`, `season`, `week`, `player`, `player_id`, `report_status`, `practice_status` | Player injury report status by team, week, and designation. Each row has the player's `gsis_id` and a `season_type` (REG or POST). |
+| `nfl_snap_counts` | `season_type` (required), `player`, `player_id`, `team`, `season`, `week`, `position` | Offensive, defensive, and special teams snap counts per player |
+| `nfl_fantasy_opportunity` | `season_type` (required), `player`, `player_id`, `team`, `season`, `week`, `position` | Target share, air yards share, carry share, and expected fantasy points per player per week (2006–present) |
+| `nfl_fantasy_rankings` | `player`, `player_id`, `position`, `team`, `scope`, `ranking_set` | Expert consensus rankings (ECR) — redraft, dynasty and weekly sets (`scope=draft`) or current-week start/sit (`scope=week`). `team=FA` lists free agents. |
+| `nfl_ftn_charting` | `season_type` (required), `team`, `opponent`, `player`, `player_id`, `season`, `season_from`, `season_to`, `week` | Aggregated FTN charting tendencies (2022–present) over scrimmage plays — play-action, RPO, screen, no-huddle, motion, trick-play rates, plus box/pass-rush/blitz counts |
+| `nfl_td_luck` | `season_type` (required), `player`, `player_id`, `position`, `team`, `season` | Actual vs expected touchdowns per player, season, and season type. It surfaces TD-regression candidates (most "unlucky" first). `season_type` is required: REG, POST or ALL. ALL returns the REG rows and the POST rows as separate rows, labeled by `season_type`. |
+| `nfl_role_trend` | `season_type` (required), `player`, `player_id`, `position`, `team`, `season`, `week`, `min_snap_pct` | Rolling 3-week snap / target / carry / air-yards share with current-week delta — usage trending up or down |
+| `nfl_separation_opportunity` | `season_type` (required), `player`, `player_id`, `position`, `team`, `season`, `regression_candidate` | Next Gen Stats separation/YAC joined to fantasy opportunity (2016+) — flags receivers getting open but under-producing |
+| `nfl_drop_rate` | `season_type` (required), `player`, `player_id`, `team`, `season`, `min_targets` | Catchable-target drop rate per receiver, team, season, and season type from FTN charting (2022+), plus contested targets and created receptions. `season_type` is required: REG, POST or ALL. ALL returns the REG rows and the POST rows as separate rows, labeled by `season_type`. |
+| `nfl_contract_value` | `season_type` (required), `player`, `player_id`, `position`, `team`, `season`, `min_apy`, `max_apy` | Fantasy points per $M of average per year (APY) — best value-for-money players |
+| `nfl_injury_return` | `injury_type`, `position`, `week_post_return` | Post-return snap-share recovery (% of pre-injury baseline) at +1..+8 weeks, by injury bucket and position |
+| `nfl_catalog` | none | Every table with its grain (what one row is), live row count, first and last season, join keys, derived flag, and last load time |
 
 ### What every response carries
 

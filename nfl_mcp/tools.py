@@ -13,6 +13,7 @@ NFL MCP Server tools:
 import datetime as dt
 import difflib
 import functools
+import json
 import logging
 import math
 import os
@@ -329,7 +330,6 @@ def _find_players(
     name: str | None = None,
     *,
     gsis_id: str | None = None,
-    gsis_ids: list[str] | None = None,
     team: Sequence[str] | None = None,
     season: int | None = None,
     season_from: int | None = None,
@@ -339,8 +339,10 @@ def _find_players(
 ) -> tuple[list[dict], bool]:
     """Players matching a name, narrowed by roster team and season. Returns (candidates, truncated).
 
-    gsis_id looks one player up by id. A name matches the full name, the last name, the short name ("K.Allen"), or the first
-    name plus last name, after folding accents, punctuation and a generational suffix.
+    This is the one name rule of every player tool. gsis_id looks one player up by id. A name
+    matches exactly, after folding case, accents, punctuation and a generational suffix, the
+    full name, the last name, the short name ("K.Allen"), or the first name plus last name. A
+    part of a name ("Alle") matches nobody.
     Team (a sequence of franchise codes, see _team_codes) and season mean "has a rosters row"
     (in that season when both are given).
     """
@@ -349,9 +351,6 @@ def _find_players(
     if gsis_id is not None:
         where.append("p.gsis_id = ?")
         params.append(gsis_id)
-    if gsis_ids:
-        where.append(f"p.gsis_id IN ({', '.join('?' for _ in gsis_ids)})")
-        params.extend(gsis_ids)
     if name is not None:
         q = _fold(name, strip_suffix=True)
         if not q:
@@ -415,13 +414,18 @@ def _find_players(
     return rows[:limit], truncated
 
 
-def _ambiguous(candidates: list[dict], truncated: bool, entity: str | None = None) -> dict[str, Any]:
-    """Response for a name that matches several players. Not an error: the caller picks an id."""
+def _ambiguous(
+    candidates: list[dict], truncated: bool, entity: str | None = None, id_arg: str = "player_id",
+) -> dict[str, Any]:
+    """Response for a name that matches several players. Not an error: the caller picks an id.
+
+    id_arg is the argument of the calling tool that takes the chosen gsis_id.
+    """
     result: dict[str, Any] = {
         "ambiguous": True,
         "candidates": candidates,
         "count": len(candidates),
-        "hint": "The name matches several players. Call again with player_id set to one gsis_id.",
+        "hint": f"The name matches several players. Call again with {id_arg} set to one gsis_id.",
     }
     if entity is not None:
         result["entity"] = entity
@@ -439,6 +443,7 @@ def _resolve_player(
     season_from: int | None = None,
     season_to: int | None = None,
     entity: str | None = None,
+    id_arg: str = "player_id",
 ) -> tuple[dict | None, dict[str, Any] | None]:
     """Pick one player for a tool call. Returns (player, early_response).
 
@@ -447,7 +452,7 @@ def _resolve_player(
     an unknown id gives an error; both are returned as early_response. No match gives
     (None, None). When team or season leave nobody, the name is matched again without them:
     one player overall is used (so a player with no roster row in that season resolves) and
-    several are returned as ambiguous.
+    several are returned as ambiguous. id_arg names the argument the ambiguity hint points to.
     """
     name = None if player_name is None else str(player_name).strip()
     if not player_id and name and _GSIS_ID.fullmatch(name):
@@ -467,23 +472,33 @@ def _resolve_player(
     if len(candidates) == 1:
         return candidates[0], None
     if candidates:
-        return None, _ambiguous(candidates, truncated, entity)
+        return None, _ambiguous(candidates, truncated, entity, id_arg)
     return None, None
 
 
 @_checked
 def nfl_player_lookup(
-    name: str,
+    player: str | None = None,
     team: str | None = None,
     season: int | None = None,
     position: str | None = None,
+    player_id: str | None = None,
 ) -> dict[str, Any]:
-    """Find players by name and return their gsis_id, so other player tools can take player_id."""
-    if not name or not str(name).strip():
-        return {"error": "name is required", "code": "MISSING_NAME"}
+    """Find players by name (or one by gsis_id) and return their gsis_id, so other player
+    tools can take player_id. Several matches are the normal result, not an ambiguity."""
+    pid = str(player_id).strip() if player_id is not None else ""
+    name = str(player).strip() if player is not None else ""
+    if not pid and _GSIS_ID.fullmatch(name):
+        pid, name = name, ""
+    if not pid and not name:
+        return {"error": "player or player_id is required", "code": "MISSING_PLAYER"}
+    season = _int_arg("season", season)
     try:
-        candidates, truncated = _find_players(
-            str(name), team=_team_codes(team), season=season, position=position, limit=50)
+        if pid:
+            candidates, truncated = _find_players(gsis_id=pid, limit=1)
+        else:
+            candidates, truncated = _find_players(
+                name, team=_team_codes(team), season=season, position=position, limit=50)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.exception("Tool error")
         return {"error": str(e)}
@@ -500,56 +515,38 @@ def _like_pattern(text: str) -> str:
     return f"%{escaped}%"
 
 
-def _table_players(table: str, name_col: str, text: str, season: int | None) -> list[dict]:
-    """Distinct (player_id, name) pairs in a derived table whose name contains text."""
-    sql = (f"SELECT DISTINCT player_id, {name_col} AS name FROM {table} "
-           f"WHERE player_id IS NOT NULL AND {name_col} ILIKE ? ESCAPE '\\'")
-    params: list[Any] = [_like_pattern(text)]
-    if season is not None:
-        sql += " AND season = ?"
-        params.append(int(season))
-    return _execute(sql + " ORDER BY player_id LIMIT 26", params)
+def _no_player(key: str, player: Any) -> dict[str, Any]:
+    """Empty page of a list tool whose player name matches nobody."""
+    return {key: [], "count": 0, "truncated": False,
+            "reason": f"No player matches '{player}'. Try nfl_player_lookup."}
 
 
-def _player_filter(
+def _one_player(
     player: str | None,
     player_id: str | None,
-    table: str,
-    name_col: str,
+    key: str,
     *,
     team: Sequence[str] | None = None,
     season: int | None = None,
-) -> tuple[str | None, list[Any], dict | None, dict[str, Any] | None]:
-    """Player condition for a derived table that has a player_id column.
+) -> tuple[dict | None, dict[str, Any] | None]:
+    """The player filter of a list tool whose rows are listed under `key`. Returns
+    (player, early_response); both are None when neither argument is given.
 
-    Returns (condition, params, player, early_response). A name resolves through players:
-    one match filters on player_id and several give the ambiguous response as early_response.
-    With no match in players (a partial name such as "Alle"), the ids in the table whose
-    name_col contains the text decide: one id filters on it, several are ambiguous.
+    The name resolves through players with the one name rule (_find_players): one match
+    gives the player, so the tool filters on that player's id and never merges the rows of
+    several players. Several matches give the ambiguous response, no match an empty page with
+    a reason, and a resolver failure an error; each is returned as early_response.
     """
     if not player and not player_id:
-        return None, [], None, None
+        return None, None
     try:
         found, early = _resolve_player(player, player_id, team=team, season=season)
-        if early is None and found is None:
-            pairs = _table_players(table, name_col, str(player), season)
-            ids = [p["player_id"] for p in pairs[:25]]
-            if len(pairs) == 1:
-                found = {"gsis_id": ids[0], "display_name": pairs[0]["name"]}
-            elif pairs:
-                known, _ = _find_players(gsis_ids=ids, limit=25)
-                seen = {c["gsis_id"] for c in known}
-                known += [{"gsis_id": p["player_id"], "display_name": p["name"]}
-                          for p in pairs[:25] if p["player_id"] not in seen]
-                early = _ambiguous(known, len(pairs) > 25)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.exception("Tool error")
-        return None, [], None, {"error": str(e)}
-    if early is not None:
-        return None, [], None, early
-    if found is None:
-        return f"{name_col} ILIKE ? ESCAPE '\\'", [_like_pattern(str(player))], None, None
-    return "player_id = ?", [found["gsis_id"]], found, None
+        return None, {"error": str(e)}
+    if early is None and found is None:
+        early = _no_player(key, player)
+    return found, early
 
 
 def _with_player(result: dict[str, Any], player: dict | None) -> dict[str, Any]:
@@ -710,6 +707,13 @@ _TABLE_NOT_FOUND = re.compile(r"Table with name (?P<name>\S+) does not exist", r
 _QUOTED_NAMES = re.compile(r'"(?P<name>[^"]+)"')
 _WORDS = re.compile(r"[^a-z0-9]+")
 
+_CANDIDATE_BINDINGS = re.compile(r"Candidate bindings:(?P<names>[^\n]*)", re.IGNORECASE)
+_NEAR_DESC = re.compile(r'at or near "desc"', re.IGNORECASE)
+_DESC_HINT = (
+    'desc is an SQL keyword, so the plays column desc (the play description) must be quoted: '
+    '"desc", for example SELECT "desc" FROM plays WHERE "desc" ILIKE \'%touchdown%\'.'
+)
+
 _COLUMN_NAMES_SQL = (
     "SELECT DISTINCT column_name FROM information_schema.columns "
     "WHERE table_schema = 'main'"
@@ -717,14 +721,61 @@ _COLUMN_NAMES_SQL = (
 _TABLE_NAMES_SQL = (
     "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
 )
+# A guessed column name (or its last word) that means a column with another name. The
+# synonym is offered first when one of the queried tables has it.
+_COLUMN_SYNONYMS = {
+    "description": "desc",            # plays
+    "full_name": "display_name",      # players (rosters and injuries do have full_name)
+    "season_type": "game_type",       # schedules, snap_counts, injuries
+}
 
 
-def _live_names(sql: str) -> list[str]:
+def _live_names(sql: str, params: Sequence[Any] | None = None) -> list[str]:
     """Names straight from the live schema; empty if the lookup itself fails."""
     try:
-        return [next(iter(row.values())) for row in _execute(sql)]
+        return [next(iter(row.values())) for row in _execute(sql, params)]
     except (duckdb.Error, ValueError, TimeoutError):
         return []
+
+
+def _base_tables(node: Any) -> Iterable[str]:
+    """table_name of every BASE_TABLE reference in a json_serialize_sql tree."""
+    if isinstance(node, dict):
+        if node.get("type") == "BASE_TABLE" and node.get("table_name"):
+            yield node["table_name"]
+        for value in node.values():
+            yield from _base_tables(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _base_tables(value)
+
+
+def _queried_tables(sql: str) -> list[str] | None:
+    """Live tables the statement reads (its FROM and JOIN clauses, CTEs included).
+
+    DuckDB parses the statement (json_serialize_sql); a CTE name is not a live table, so it
+    drops out. None when the statement cannot be parsed that way.
+    """
+    match = _EXPLAIN_PREFIX.match(sql)
+    body = sql[match.end():] if match else sql
+    try:
+        with duckdb.connect() as conn:
+            tree = json.loads(conn.execute("SELECT json_serialize_sql(?)", [body]).fetchone()[0])
+    except (duckdb.Error, TypeError, ValueError):
+        return None
+    if tree.get("error"):
+        return None
+    live = {t.lower(): t for t in _live_names(_TABLE_NAMES_SQL)}
+    return list(dict.fromkeys(live[t.lower()] for t in _base_tables(tree) if t.lower() in live))
+
+
+def _suggest(unknown: str, candidates: Iterable[str], limit: int = 5) -> list[str]:
+    """_nearest, with the synonym of the guessed name first when it is a candidate."""
+    pool = {c.lower() for c in candidates if c}
+    words = [w for w in _WORDS.split(unknown.lower()) if w]
+    synonyms = [_COLUMN_SYNONYMS[k] for k in (unknown.lower(), *words[-1:]) if k in _COLUMN_SYNONYMS]
+    first = [s for s in dict.fromkeys(synonyms) if s in pool]
+    return (first + [n for n in _nearest(unknown, pool, limit) if n not in first])[:limit]
 
 
 def _similarity(unknown: str, candidate: str) -> float:
@@ -756,18 +807,38 @@ def _nearest(unknown: str, candidates: Iterable[str], limit: int = 5) -> list[st
     return sorted(unique, key=lambda c: (-_similarity(unknown, c), c))[:limit]
 
 
-def _sql_error_detail(exc: Exception) -> Dict[str, Any]:
-    """Turn a DuckDB binder/catalog error into fields the caller can act on."""
+def _sql_error_detail(exc: Exception, sql: str | None = None) -> Dict[str, Any]:
+    """Turn a DuckDB binder/catalog/parser error into fields the caller can act on.
+
+    did_you_mean for a column lists only columns of the tables the statement reads (and the
+    binder's own candidates, which are in scope), so a guess is never answered with a column
+    of an unrelated table. When the statement cannot be parsed for its tables, every live
+    column is a candidate.
+    """
     message = str(exc)
     spelled = [m.group("name") for m in _QUOTED_NAMES.finditer(message)]
+    if _NEAR_DESC.search(message):
+        return {"hint": _DESC_HINT}
 
     guessed_column = _COLUMN_NOT_FOUND.search(message)
     if guessed_column:
         unknown = guessed_column.group("name")
+        tables = _queried_tables(sql) if sql else None
+        if tables is None:
+            pool = _live_names(_COLUMN_NAMES_SQL)
+        elif tables:
+            marks = ", ".join("?" for _ in tables)
+            pool = _live_names(f"{_COLUMN_NAMES_SQL} AND table_name IN ({marks})", tables)
+        else:  # only subqueries or table functions: the binder candidates are the scope
+            pool = []
+        bound = _CANDIDATE_BINDINGS.search(message)
+        if bound:
+            pool += [m.group("name").rsplit(".", 1)[-1]
+                     for m in _QUOTED_NAMES.finditer(bound.group("names"))]
         return {
             "code": "COLUMN_NOT_FOUND",
             "unknown_column": unknown,
-            "did_you_mean": _nearest(unknown, _live_names(_COLUMN_NAMES_SQL) + spelled),
+            "did_you_mean": _suggest(unknown, pool),
             "hint": (
                 "Column names must match the schema exactly. Call "
                 "nfl_schema(table='<table>') for non-pbp tables, or "
@@ -862,7 +933,7 @@ def _statement_gate(sql: str) -> dict[str, Any] | None:
     try:
         statements = duckdb.extract_statements(sql)
     except (duckdb.Error, TypeError) as e:
-        return {"error": f"Could not parse SQL: {e}"}
+        return {"error": f"Could not parse SQL: {e}", **_sql_error_detail(e)}
     if len(statements) != 1:
         return {"error": "Send exactly one statement per call."}
     stype = statements[0].type
@@ -874,7 +945,8 @@ def _statement_gate(sql: str) -> dict[str, Any] | None:
         try:
             inner = duckdb.extract_statements(sql[match.end():])
         except (duckdb.Error, TypeError) as e:
-            return {"error": f"Could not parse SQL after EXPLAIN: {e}", "statement_type": stype.name}
+            return {"error": f"Could not parse SQL after EXPLAIN: {e}", "statement_type": stype.name,
+                    **_sql_error_detail(e)}
         if len(inner) != 1:
             return {"error": "Send exactly one statement per call.", "statement_type": stype.name}
         stype = inner[0].type
@@ -916,7 +988,7 @@ def nfl_query(sql: str, max_rows: int = 100) -> Dict[str, Any]:
         columns, rows = _fetch_capped(sql, max_rows + 1)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
-        return {"error": str(e), **_sql_error_detail(e)}
+        return {"error": str(e), **_sql_error_detail(e, sql)}
 
     truncated = len(rows) > max_rows
     rows = rows[:max_rows]
@@ -1003,7 +1075,7 @@ def _extra_play_columns(columns: Any) -> list[str]:
         raise _BadArgument("Could not read the plays schema to check columns", "SCHEMA_UNAVAILABLE")
     unknown = [c for c in columns if c.strip().lower() not in live]
     if unknown:
-        suggestions = list(dict.fromkeys(n for c in unknown for n in _nearest(c, live.values())))
+        suggestions = list(dict.fromkeys(n for c in unknown for n in _suggest(c, live.values())))
         raise _UnknownColumns(
             f"Unknown plays column(s): {', '.join(repr(c) for c in unknown)}. "
             "Call nfl_schema(category=...) for play-by-play columns.", suggestions[:5])
@@ -1186,12 +1258,6 @@ def _team_stats_filter(
     return clause, params
 
 
-_STALE_TEAM_TABLES = (
-    "Derived team tables predate season_type; the season_type filter was not applied "
-    "and rows blend REG and POST. Run 'nfl-mcp rebuild'."
-)
-
-
 class _StaleDerivedTables(Exception):
     """A season_type was asked of derived tables built before season_type existed."""
 
@@ -1228,27 +1294,22 @@ def _team_rows(
     codes: Sequence[str],
     filters: tuple[int | None, int | None, int | None, str | None],
     tail: str = "",
-) -> tuple[list[dict], bool]:
-    """Rows of one derived team table for a franchise's codes, and whether the table lacks
-    season_type (not rebuilt yet).
+) -> list[dict]:
+    """Rows of one derived team table for a franchise's codes.
 
-    On a table without season_type only REG falls back to unfiltered rows
-    (flagged by the caller); any other season_type raises _StaleDerivedTables.
+    A table built before season_type existed would blend REG and POST, so it raises
+    _StaleDerivedTables for every season_type, as the derived player tables do.
     """
     clause, params = _team_stats_filter(*filters)
     team_sql, team_params = _in_clause("team", codes)
+    sql = (f"SELECT * FROM {table} WHERE {team_sql}{clause} "
+           f"ORDER BY season_year, season_type DESC{tail}")
     try:
-        sql = (f"SELECT * FROM {table} WHERE {team_sql}{clause} "
-               f"ORDER BY season_year, season_type DESC{tail}")
-        return _execute(sql, [*team_params, *params]), False
+        return _execute(sql, [*team_params, *params])
     except duckdb.BinderException as e:
-        if "season_type" not in str(e):
+        if 'column "season_type"' not in str(e):  # the message also quotes the SQL text
             raise
-        if filters[3] != "REG":
-            raise _StaleDerivedTables() from e
-    clause, params = _team_stats_filter(*filters[:3], "ALL")
-    sql = f"SELECT * FROM {table} WHERE {team_sql}{clause} ORDER BY season_year{tail}"
-    return _execute(sql, [*team_params, *params]), True
+        raise _StaleDerivedTables() from e
 
 
 @_checked
@@ -1270,21 +1331,12 @@ def nfl_team_stats(
     _team_stats_filter(*filters)  # validate before any query
 
     try:
-        stale = False
         if side in ("offense", "both"):
-            results["offense"], old = _team_rows("team_offense_stats", codes, filters)
-            stale = stale or old
-
+            results["offense"] = _team_rows("team_offense_stats", codes, filters)
         if side in ("defense", "both"):
-            results["defense"], old = _team_rows("team_defense_stats", codes, filters)
-            stale = stale or old
-
+            results["defense"] = _team_rows("team_defense_stats", codes, filters)
         if side in ("situational", "both"):
-            results["situational"], old = _team_rows("situational_stats", codes, filters, ", situation")
-            stale = stale or old
-
-        if stale:
-            results["warning"] = _STALE_TEAM_TABLES
+            results["situational"] = _team_rows("situational_stats", codes, filters, ", situation")
         return _with_reason(
             results, any(results.get(k) for k in ("offense", "defense", "situational")),
             "team_offense_stats", season=_int_arg("season", season),
@@ -1531,11 +1583,9 @@ def _compare_teams(
     result: dict[str, Any] = {}
     for codes in (first, second):
         team = codes[0]
-        offense, old_off = _team_rows("team_offense_stats", codes, filters)
-        defense, old_def = _team_rows("team_defense_stats", codes, filters)
+        offense = _team_rows("team_offense_stats", codes, filters)
+        defense = _team_rows("team_defense_stats", codes, filters)
         entry: dict[str, Any] = {"offense": offense, "defense": defense}
-        if old_off or old_def:
-            entry["warning"] = _STALE_TEAM_TABLES
         if not offense and not defense:
             scope = f" in {season}" if season is not None else ""
             entry["reason"] = f"No {season_type} team stats for {team}{scope} with the filters given"
@@ -1559,10 +1609,10 @@ def _compare_players(
 ) -> dict[str, Any]:
     """Player side of nfl_compare: each entity is a name or a gsis id, resolved to one player."""
     entries = []
-    for entity in (player1, player2):
+    for arg, entity in (("player1", player1), ("player2", player2)):
         found, early = _resolve_player(
             entity, None, season=season, season_from=season_from, season_to=season_to,
-            entity=entity)
+            entity=entity, id_arg=arg)
         if early is not None:
             return early
         if found is None:
@@ -1803,10 +1853,13 @@ def nfl_roster(
     position: str | None = None,
     limit: int = _DEFAULT_LIMIT,
     offset: int = 0,
+    player: str | None = None,
+    player_id: str | None = None,
 ) -> Dict[str, Any]:
     """
-    Look up roster data — who was on a team's roster in a given season.
-    Returns name, gsis_id, position, status, jersey number, experience, and measurables.
+    Look up roster data — who was on a team's roster in a given season, or the roster rows
+    of one player (player or player_id). position matches position or depth_chart_position
+    exactly. Returns name, gsis_id, position, status, jersey number, experience, and measurables.
     """
     limit, offset = _page_args(limit, offset)
     season = _int_arg("season", season)
@@ -1815,12 +1868,19 @@ def nfl_roster(
     if clause:
         conditions.append(clause[0])
         params.extend(clause[1])
+    found, early = _one_player(player, player_id, "players", team=_team_codes(team), season=season)
+    if early is not None:
+        return early
+    if found is not None:
+        conditions.append("gsis_id = ?")
+        params.append(found["gsis_id"])
     if season is not None:
         conditions.append("season = ?")
         params.append(season)
     if position:
-        conditions.append("position ILIKE ?")
-        params.append(position.upper())
+        # Coarse codes (DB, DL, OL, LB) sit in position, finer ones (CB, T, ILB) in depth_chart_position.
+        conditions.append("(upper(position) = ? OR upper(depth_chart_position) = ?)")
+        params.extend([position.strip().upper()] * 2)
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
@@ -1832,7 +1892,8 @@ def nfl_roster(
     """
     try:
         rows, page = _execute_limited(sql, params, limit, offset)
-        return _with_reason({"players": rows, **page}, rows, "rosters", season=season)
+        return _with_reason(_with_player({"players": rows, **page}, found), rows, "rosters",
+                            season=season)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -1848,12 +1909,15 @@ def nfl_injuries(
     limit: int = _DEFAULT_LIMIT,
     offset: int = 0,
     season_type: str | None = None,
+    player_id: str | None = None,
+    practice_status: str | None = None,
 ) -> Dict[str, Any]:
     """
-    Look up injury report data. Filter by team, season, week, player name, or
-    report status (e.g. 'Out', 'Questionable', 'Doubtful', 'Full Participation').
-    season_type (required) is REG, POST, ALL or one round (WC, DIV, CON, SB); each row
-    carries its own season_type (REG or POST).
+    Look up injury report data. Filter by team, season, week, one player (player or
+    player_id), report status (game designation: Out, Questionable, Doubtful, Note) or
+    practice status (e.g. 'Full Participation in Practice'); both statuses match a part of
+    the stored text, ignoring case. season_type (required) is REG, POST, ALL or one round
+    (WC, DIV, CON, SB); each row carries its own season_type (REG or POST).
     """
     game_types = _game_types(season_type)
     limit, offset = _page_args(limit, offset)
@@ -1863,6 +1927,12 @@ def nfl_injuries(
     if clause:
         conditions.append(clause[0])
         params.extend(clause[1])
+    found, early = _one_player(player, player_id, "injuries", team=_team_codes(team), season=season)
+    if early is not None:
+        return early
+    if found is not None:
+        conditions.append("gsis_id = ?")
+        params.append(found["gsis_id"])
     if season is not None:
         conditions.append("season = ?")
         params.append(season)
@@ -1872,12 +1942,10 @@ def nfl_injuries(
     clause = _in_clause("game_type", game_types)
     conditions.append(clause[0])
     params.extend(clause[1])
-    if player:
-        conditions.append("full_name ILIKE ?")
-        params.append(f"%{player}%")
-    if report_status:
-        conditions.append("report_status ILIKE ?")
-        params.append(f"%{report_status}%")
+    for column, value in (("report_status", report_status), ("practice_status", practice_status)):
+        if value:
+            conditions.append(f"{column} ILIKE ? ESCAPE '\\'")
+            params.append(_like_pattern(str(value)))
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
@@ -1893,7 +1961,7 @@ def nfl_injuries(
     """
     try:
         rows, page = _execute_limited(sql, params, limit, offset)
-        return _with_reason({"injuries": rows, **page}, rows, "injuries",
+        return _with_reason(_with_player({"injuries": rows, **page}, found), rows, "injuries",
                             season=season, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -1959,14 +2027,15 @@ def nfl_schedule(
 def nfl_team_records(
     team: str | None = None,
     season: int | None = None,
-    from_season: int | None = None,
-    to_season: int | None = None,
+    season_from: int | None = None,
+    season_to: int | None = None,
     limit: int = _DEFAULT_LIMIT,
     offset: int = 0,
 ) -> Dict[str, Any]:
     """
-    PREFERRED for win-loss / standings questions. Final regular-season records per
-    franchise, 1970 to present. Teams are given by their CURRENT abbreviation, so the
+    PREFERRED for win-loss / standings questions. Regular-season records per franchise,
+    1970 to present: final records, and the record to date for a season still in progress.
+    Needs team, season or a season_from/season_to range. Teams are given by their CURRENT abbreviation, so the
     Raiders are 'LV' in every season; each row also carries `club` (the name the franchise
     played that season under) and `source_team` (the code the source used).
 
@@ -1975,10 +2044,10 @@ def nfl_team_records(
     than estimated.
     """
     limit, offset = _page_args(limit, offset)
-    season, from_season, to_season = (_int_arg(n, v) for n, v in (
-        ("season", season), ("from_season", from_season), ("to_season", to_season)))
-    if team is None and season is None and from_season is None and to_season is None:
-        return {"error": "Provide team, season, or a from_season/to_season range."}
+    season, season_from, season_to = (_int_arg(n, v) for n, v in (
+        ("season", season), ("season_from", season_from), ("season_to", season_to)))
+    if team is None and season is None and season_from is None and season_to is None:
+        return {"error": "Provide team, season, or a season_from/season_to range."}
 
     codes = _team_codes(team)
     key = codes[0] if codes else None
@@ -1997,12 +2066,12 @@ def nfl_team_records(
     if season is not None:
         conditions.append("season = ?")
         params.append(season)
-    if from_season is not None:
+    if season_from is not None:
         conditions.append("season >= ?")
-        params.append(from_season)
-    if to_season is not None:
+        params.append(season_from)
+    if season_to is not None:
         conditions.append("season <= ?")
-        params.append(to_season)
+        params.append(season_to)
     where = " AND ".join(conditions) or "1=1"
 
     sql = f"""
@@ -2049,32 +2118,28 @@ def nfl_snap_counts(
     """
     Look up snap count data — how many snaps a player or team unit played.
     Returns offense, defense, and special teams snap counts and percentages.
-    player matches the full names stored in snap_counts ('Travis Kelce' or 'Kelce'),
-    ignoring case, accents and punctuation. player_id (gsis_id) maps through
-    players.pfr_id to snap_counts.pfr_player_id. season_type is required: REG, POST (the four
-    playoff rounds), ALL (REG and POST rows, never combined), or one round WC, DIV, CON, SB.
-    offense_pct, defense_pct and st_pct are percents from 0 to 100.
+    player resolves through players with the one name rule (exact full, last or short name)
+    and player_id is a gsis_id; either maps through players.pfr_id to
+    snap_counts.pfr_player_id, so one player's rows never mix with a namesake's. season_type
+    is required: REG, POST (the four playoff rounds), ALL (REG and POST rows, never combined),
+    or one round WC, DIV, CON, SB. offense_pct, defense_pct and st_pct are percents from 0 to 100.
     """
     game_types = _game_types(season_type)
     limit, offset = _page_args(limit, offset)
     season, week = _int_arg("season", season), _int_arg("week", week)
     conditions, params = [], []
+    found, early = _one_player(player, player_id, "snap_counts", team=_team_codes(team), season=season)
+    if early is not None:
+        return early
+    if found is not None:
+        if not found["pfr_id"]:
+            return {"snap_counts": [], "count": 0, "truncated": False,
+                    "player_id": found["gsis_id"],
+                    "reason": f"No PFR id on file for {found['display_name']}, "
+                              "so snap counts cannot be matched by id."}
+        conditions.append("pfr_player_id = ?")
+        params.append(found["pfr_id"])
     try:
-        if player_id:
-            found, _ = _find_players(gsis_id=str(player_id).strip(), limit=1)
-            if not found:
-                return {"error": f"Unknown player_id '{player_id}'", "code": "UNKNOWN_PLAYER_ID"}
-            if not found[0]["pfr_id"]:
-                return {"snap_counts": [], "count": 0, "truncated": False,
-                        "player_id": found[0]["gsis_id"],
-                        "reason": f"No PFR id on file for {found[0]['display_name']}, "
-                                  "so snap counts cannot be matched by id."}
-            conditions.append("pfr_player_id = ?")
-            params.append(found[0]["pfr_id"])
-        if player:
-            query = _fold(str(player), strip_suffix=True)
-            conditions.append(f"{_fold_sql('player')} LIKE ?")
-            params.append(f"%{query}%")
         clause = _team_filter("team", team)
         if clause:
             conditions.append(clause[0])
@@ -2089,8 +2154,8 @@ def nfl_snap_counts(
         conditions.append(clause[0])
         params.extend(clause[1])
         if position:
-            conditions.append("position ILIKE ?")
-            params.append(position.upper())
+            conditions.append("upper(position) = ?")
+            params.append(position.strip().upper())
 
         where = " AND ".join(conditions)
         sql = f"""
@@ -2103,7 +2168,7 @@ def nfl_snap_counts(
             ORDER BY season, week, team, offense_snaps DESC NULLS LAST, player, pfr_player_id, rowid
         """
         rows, page = _execute_limited(sql, params, limit, offset)
-        return _with_reason({"snap_counts": rows, **page}, rows, "snap_counts",
+        return _with_reason(_with_player({"snap_counts": rows, **page}, found), rows, "snap_counts",
                             season=season, week=week)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
@@ -2140,13 +2205,12 @@ def nfl_fantasy_opportunity(
     team_clause = _team_filter("posteam", team)
     team = _team_codes(team)  # codes for the player resolver
     conditions, params = [], []
-    cond, cparams, resolved, early = _player_filter(
-        player, player_id, "ff_opportunity", "full_name", team=team, season=season)
+    resolved, early = _one_player(player, player_id, "fantasy_opportunity", team=team, season=season)
     if early is not None:
         return early
-    if cond:
-        conditions.append(cond)
-        params.extend(cparams)
+    if resolved is not None:
+        conditions.append("player_id = ?")
+        params.append(resolved["gsis_id"])
     if team_clause:
         conditions.append(team_clause[0])
         params.extend(team_clause[1])
@@ -2157,8 +2221,8 @@ def nfl_fantasy_opportunity(
         conditions.append("week = ?")
         params.append(week)
     if position:
-        conditions.append("position ILIKE ?")
-        params.append(position.upper())
+        conditions.append("upper(position) = ?")
+        params.append(position.strip().upper())
     if season_type in _PLAYOFF_ROUNDS:
         conditions.append("g.game_type = ?")
         params.append(season_type)
@@ -2199,12 +2263,14 @@ def nfl_fantasy_rankings(
     ranking_set: str | None = None,
     limit: int = _DEFAULT_LIMIT,
     offset: int = 0,
+    player_id: str | None = None,
 ) -> Dict[str, Any]:
     """
     Look up fantasy football expert consensus rankings (ECR). Two snapshots:
-    scope='draft' (preseason/dynasty/best-ball draft rankings, ff_rankings_draft) and
+    scope='draft' (redraft, dynasty and weekly ranking sets, ff_rankings_draft) and
     scope='week' (current-week start/sit rankings, ff_rankings_week). Both reflect the
     latest scrape — they are not historical/seasonal. Lower ECR = ranked higher.
+    team 'FA' is a free agent (no team).
     """
     limit, offset = _page_args(limit, offset)
     scope = (scope or "draft").lower()
@@ -2228,18 +2294,31 @@ def nfl_fantasy_rankings(
             "start_sit_grade, note, page AS ranking_set, scrape_date"
         )
 
-    if player:
-        # The ranking tables have no gsis id, so match on names with apostrophes, periods
-        # and accents folded away on both sides ("Ja'Marr Chase" finds "JaMarr Chase").
-        conditions.append(f"{_fold_sql(player_col)} LIKE ?")
-        params.append(f"%{_fold(str(player), strip_suffix=True)}%")
+    found = None
+    if player or player_id:
+        # The ranking tables have no gsis id. The name resolves through players with the one
+        # name rule, and a row belongs to that player when its folded name equals the
+        # player's folded full name ("Patrick Mahomes II" is "patrick mahomes"). A name no
+        # player has (a team defense such as 'Kansas City Chiefs') must equal a stored name.
+        try:
+            found, early = _resolve_player(player, player_id)
+        except (duckdb.Error, ValueError, TimeoutError) as e:
+            logger.exception("Tool error")
+            return {"error": str(e)}
+        if early is not None:
+            return early
+        conditions.append(f"{_fold_sql(player_col, True)} = ?")
+        params.append(_fold(found["display_name"] if found else str(player), strip_suffix=True))
     if position:
-        conditions.append("pos ILIKE ?")
-        params.append(position.upper())
-    team_clause = _team_filter("team", team)
-    if team_clause:
-        conditions.append(team_clause[0])
-        params.extend(team_clause[1])
+        conditions.append("upper(pos) = ?")
+        params.append(position.strip().upper())
+    if isinstance(team, str) and team.strip().upper() == "FA":
+        conditions.append("team = 'FA'")  # free agents: the rankings' own code, not a franchise
+    else:
+        team_clause = _team_filter("team", team)
+        if team_clause:
+            conditions.append(team_clause[0])
+            params.extend(team_clause[1])
     if ranking_set:
         conditions.append(f"{set_col} ILIKE ?")
         params.append(f"%{ranking_set}%")
@@ -2253,7 +2332,7 @@ def nfl_fantasy_rankings(
     """
     try:
         rows, page = _execute_limited(sql, params, limit, offset)
-        return {"fantasy_rankings": rows, "scope": scope, **page}
+        return _with_player({"fantasy_rankings": rows, "scope": scope, **page}, found)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -2416,16 +2495,15 @@ def nfl_td_luck(
     team_clause = _team_filter("team", team)
     team = _team_codes(team)  # codes for the player resolver
     conditions, params = [], []
-    cond, cparams, resolved, early = _player_filter(
-        player, player_id, "player_td_luck", "full_name", team=team, season=season)
+    resolved, early = _one_player(player, player_id, "td_luck", team=team, season=season)
     if early is not None:
         return early
-    if cond:
-        conditions.append(cond)
-        params.extend(cparams)
+    if resolved is not None:
+        conditions.append("player_id = ?")
+        params.append(resolved["gsis_id"])
     if position:
-        conditions.append("position ILIKE ?")
-        params.append(position.upper())
+        conditions.append("upper(position) = ?")
+        params.append(position.strip().upper())
     if team_clause:
         conditions.append(team_clause[0])
         params.extend(team_clause[1])
@@ -2486,16 +2564,15 @@ def nfl_role_trend(
     team_clause = _team_filter("team", team)
     team = _team_codes(team)  # codes for the player resolver
     conditions, params = [], []
-    cond, cparams, resolved, early = _player_filter(
-        player, player_id, "player_role_trend", "full_name", team=team, season=season)
+    resolved, early = _one_player(player, player_id, "role_trend", team=team, season=season)
     if early is not None:
         return early
-    if cond:
-        conditions.append(cond)
-        params.extend(cparams)
+    if resolved is not None:
+        conditions.append("player_id = ?")
+        params.append(resolved["gsis_id"])
     if position:
-        conditions.append("position ILIKE ?")
-        params.append(position.upper())
+        conditions.append("upper(position) = ?")
+        params.append(position.strip().upper())
     if team_clause:
         conditions.append(team_clause[0])
         params.extend(team_clause[1])
@@ -2572,16 +2649,15 @@ def nfl_separation_opportunity(
     team_clause = _team_filter("team", team)
     team = _team_codes(team)  # codes for the player resolver
     conditions, params = [], []
-    cond, cparams, resolved, early = _player_filter(
-        player, player_id, "player_separation_opportunity", "full_name", team=team, season=season)
+    resolved, early = _one_player(player, player_id, "separation_opportunity", team=team, season=season)
     if early is not None:
         return early
-    if cond:
-        conditions.append(cond)
-        params.extend(cparams)
+    if resolved is not None:
+        conditions.append("player_id = ?")
+        params.append(resolved["gsis_id"])
     if position:
-        conditions.append("position ILIKE ?")
-        params.append(position.upper())
+        conditions.append("upper(position) = ?")
+        params.append(position.strip().upper())
     if team_clause:
         conditions.append(team_clause[0])
         params.extend(team_clause[1])
@@ -2647,13 +2723,12 @@ def nfl_drop_rate(
     team_clause = _team_filter("team", team)
     team = _team_codes(team)  # codes for the player resolver
     conditions, params = [], []
-    cond, cparams, resolved, early = _player_filter(
-        player, player_id, "player_drop_rate", "player", team=team, season=season)
+    resolved, early = _one_player(player, player_id, "drop_rate", team=team, season=season)
     if early is not None:
         return early
-    if cond:
-        conditions.append(cond)
-        params.extend(cparams)
+    if resolved is not None:
+        conditions.append("player_id = ?")
+        params.append(resolved["gsis_id"])
     if team_clause:
         conditions.append(team_clause[0])
         params.extend(team_clause[1])
@@ -2715,16 +2790,15 @@ def nfl_contract_value(
     team_clause = _team_filter("team", team)
     team = _team_codes(team)  # codes for the player resolver
     conditions, params = [], []
-    cond, cparams, resolved, early = _player_filter(
-        player, player_id, "player_contract_value", "full_name", team=team, season=season)
+    resolved, early = _one_player(player, player_id, "contract_value", team=team, season=season)
     if early is not None:
         return early
-    if cond:
-        conditions.append(cond)
-        params.extend(cparams)
+    if resolved is not None:
+        conditions.append("player_id = ?")
+        params.append(resolved["gsis_id"])
     if position:
-        conditions.append("position ILIKE ?")
-        params.append(position.upper())
+        conditions.append("upper(position) = ?")
+        params.append(position.strip().upper())
     if team_clause:
         conditions.append(team_clause[0])
         params.extend(team_clause[1])

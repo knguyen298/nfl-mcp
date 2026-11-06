@@ -6,7 +6,7 @@ player_stats table in the real database (oracle b).
 
 Interface contract (shared contract plus the decisions below)
 --------------------------------------------------------------
-nfl_player_lookup(name, team=None, season=None, position=None)
+nfl_player_lookup(player=None, team=None, season=None, position=None, player_id=None)
     -> {"candidates": [{"gsis_id", "display_name", "short_name", "position", "teams",
         "first_season", "last_season", "pfr_id"}], "count": int}
     Matching is case-insensitive, accent-insensitive ("Estime" == "Estimé"),
@@ -42,15 +42,16 @@ nfl_compare(player1, player2, season=..., season_type=...)
     order, each entry the nfl_player_stats shape (player_id, player_name, seasons). If an
     entity name matches several players: {"ambiguous": True, "candidates": [...],
     "entity": <that input>} and no stats.
-nfl_snap_counts(player=None, player_id=None, ..., season_type required): name matches snap_counts.player (full
-    names) with no short-name conversion; player_id maps through players.pfr_id to
-    snap_counts.pfr_player_id.
+nfl_snap_counts(player=None, player_id=None, ..., season_type required): a name resolves
+    through players (the one name rule); the player's players.pfr_id then filters
+    snap_counts.pfr_player_id, as player_id does.
 nfl_ftn_charting(player=None, player_id=None, ..., season_type required): one player only, matched by id
     columns; a name with several matches -> {"ambiguous": True, "candidates": [...]}.
 nfl_drop_rate / nfl_td_luck / nfl_role_trend / nfl_contract_value /
 nfl_fantasy_opportunity(player=None, player_id=None, ..., season_type required): player_id filters on the
     table's player_id column; a name resolves through players first (so "Ja'Marr Chase"
-    finds the short-form "J.Chase" drop-rate row); several matches -> ambiguous.
+    finds the short-form "J.Chase" drop-rate row); several matches -> ambiguous; no
+    match -> no rows and a reason (part of a name matches nobody).
 nfl_fantasy_rankings(player=...): ff_rankings_* have no gsis id; the name match ignores
     apostrophes and periods on both sides ("Ja'Marr Chase" finds "JaMarr Chase").
 """
@@ -343,23 +344,23 @@ def _lookup_ids(**kw):
 
 @pytest.mark.parametrize("name", ["Allen", "allen", "ALLEN"])
 def test_lookup_surname_returns_all_four_allens(syn, name):
-    assert _lookup_ids(name=name) == ALLENS  # 4 Allen rows in players
+    assert _lookup_ids(player=name) == ALLENS  # 4 Allen rows in players
 
 
 def test_lookup_candidate_has_contract_keys(syn):
-    res = call("nfl_player_lookup", name="Keenan Allen")
+    res = call("nfl_player_lookup", player="Keenan Allen")
     (c,) = res["candidates"]
     assert c["gsis_id"] == KA and c["position"] == "WR" and c["pfr_id"] == "AlleKe00"
     assert {"display_name", "short_name", "teams", "first_season", "last_season"} <= set(c)
 
 
 @pytest.mark.parametrize("kw, expected", [
-    (dict(name="Josh Allen"), {JA}),
-    (dict(name="Allen", team="CHI"), {KA}),               # only Keenan has a CHI roster row
-    (dict(name="Allen", team="BUF", season=2024), {JA}),
-    (dict(name="Allen", season=2023), {JA, KA, BA}),      # Kyle has no 2023 roster row
-    (dict(name="Allen", position="WR"), {KA}),
-    (dict(name="Allen", position="QB"), {JA, BA, KY}),
+    (dict(player="Josh Allen"), {JA}),
+    (dict(player="Allen", team="CHI"), {KA}),               # only Keenan has a CHI roster row
+    (dict(player="Allen", team="BUF", season=2024), {JA}),
+    (dict(player="Allen", season=2023), {JA, KA, BA}),      # Kyle has no 2023 roster row
+    (dict(player="Allen", position="WR"), {KA}),
+    (dict(player="Allen", position="QB"), {JA, BA, KY}),
 ])
 def test_lookup_full_name_and_filters_narrow(syn, kw, expected):
     assert _lookup_ids(**kw) == expected
@@ -373,12 +374,12 @@ def test_lookup_full_name_and_filters_narrow(syn, kw, expected):
     ("Audric Estimé", AE), ("Audric Estime", AE), ("estime", AE),
 ])
 def test_lookup_suffix_punctuation_accent_variants(syn, name, gid):
-    assert _lookup_ids(name=name) == {gid}
+    assert _lookup_ids(player=name) == {gid}
 
 
 @pytest.mark.parametrize("name", ["Zzyzx Nobody", "Allenby"])
 def test_lookup_no_match_is_empty_not_error(syn, name):
-    res = call("nfl_player_lookup", name=name)
+    res = call("nfl_player_lookup", player=name)
     assert "error" not in res and res["count"] == 0 and res["candidates"] == []
 
 
@@ -532,14 +533,25 @@ def test_compare_season_without_roster_rows_is_ambiguous(syn):
 
 # ── partial names on derived tools ───────────────────────────────────────────
 
-def test_derived_tool_partial_name_matching_several_ids_is_ambiguous(syn):
+# v0.7.0: one name rule for every tool. Part of a name matches nobody, so a derived tool
+# returns no rows and a reason; it never widens to a substring match on its own table.
+
+def test_derived_tool_partial_name_matching_several_ids_matches_nobody(syn):
     res = call("nfl_td_luck", player="Alle", season=2024, season_type="REG")  # "Alle" is no player's name
-    _assert_ambiguous(res, ids={JA, KA, BA})
-    assert not res.get("td_luck")
+    assert "error" not in res and not res.get("ambiguous"), res
+    assert res["td_luck"] == [] and res["count"] == 0
+    assert "No player matches 'Alle'" in res["reason"]
 
 
-def test_derived_tool_partial_name_matching_one_id_filters_on_it(syn):
+def test_derived_tool_partial_name_matching_one_id_matches_nobody(syn):
     res = call("nfl_td_luck", player="Chas", season=2024, season_type="REG")
+    assert "error" not in res and not res.get("ambiguous"), res
+    assert res["td_luck"] == [] and res["count"] == 0
+    assert "No player matches 'Chas'" in res["reason"]
+
+
+def test_derived_tool_last_name_filters_on_the_one_player(syn):
+    res = call("nfl_td_luck", player="Chase", season=2024, season_type="REG")
     assert {r["player_id"] for r in res["td_luck"]} == {CH}
     assert res["player_id"] == CH
 
@@ -727,7 +739,7 @@ def test_real_josh_allen_2024_resolves_to_buf_qb(real_db):
 
 @pytest.mark.integration
 def test_real_lookup_josh_allen_lists_both(real_db):
-    res = call("nfl_player_lookup", name="Josh Allen")
+    res = call("nfl_player_lookup", player="Josh Allen")
     assert {c["gsis_id"] for c in res["candidates"]} == {JA, JA_C}
 
 
