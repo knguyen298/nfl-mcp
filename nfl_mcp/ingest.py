@@ -810,12 +810,18 @@ _PLAYS_COLUMNS: dict[str, str] = {
 _NOT_2PT = "COALESCE(two_point_attempt, 0) = 0"
 _NOT_NO_PLAY = "play_type IS DISTINCT FROM 'no_play'"
 _SCRIMMAGE = f"(play_type IN ('pass', 'run') AND {_NOT_2PT})"
+# The official play count and total net yards: pass and run plays plus kneels. The analytic
+# metrics (EPA, third downs, red zone, explosive plays) keep _SCRIMMAGE, without kneels.
+_TOTAL_PLAY = f"(play_type IN ('pass', 'run', 'qb_kneel') AND {_NOT_2PT})"
 _PASS_PLAY = f"(play_type = 'pass' AND pass_attempt = 1 AND COALESCE(sack, 0) = 0 AND {_NOT_2PT})"
 _PASS_ATTEMPT = f"(pass_attempt = 1 AND COALESCE(sack, 0) = 0 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
 _RUSH_PLAY = f"(rush_attempt = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
 _SACK = f"(sack = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
 _INTERCEPTION = f"(interception = 1 AND {_NOT_2PT} AND {_NOT_NO_PLAY})"
 # Yardage sums shared by the offense and defense tables (0, not NULL, when no play matches).
+# yards_per_play is total yards / total plays.
+_TOTAL_YARDS = f"COALESCE(SUM(COALESCE(yards_gained, 0)) FILTER (WHERE {_TOTAL_PLAY}), 0)"
+_YARDS_PER_PLAY = f"ROUND(AVG(COALESCE(yards_gained, 0)) FILTER (WHERE {_TOTAL_PLAY}), 2)"
 _RUSH_YARDS = (f"COALESCE(SUM(COALESCE(rushing_yards, 0) + COALESCE(lateral_rushing_yards, 0)) "
                f"FILTER (WHERE {_RUSH_PLAY}), 0)")
 _PASS_YARDS = f"COALESCE(SUM(COALESCE(passing_yards, 0)) FILTER (WHERE {_PASS_ATTEMPT}), 0)"
@@ -845,22 +851,22 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
                   "situational_stats", "formation_effectiveness"]:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
 
-    # total_plays is pass/run plays only (sacks and scrambles in; kneels, spikes, special
+    # total_plays is pass/run plays plus kneels (sacks and scrambles in; spikes, special
     # teams, no_play and two-point tries out). pass_plays excludes spikes; pass_attempts is
     # the official nflverse count (spikes in). A turnover is an interception thrown or a
     # fumble lost by the team, so a muffed punt is charged to the receiving team.
     # pass_yards is gross; sack_yards (positive) is what total_yards subtracts for sacks, so
     # net_pass_yards is the official net figure. rush_yards adds the yards after a lateral
-    # and keeps kneels, which total_yards leaves out: total_yards is rush_yards +
-    # net_pass_yards minus the kneel yards.
+    # and keeps kneels, so total_yards = rush_yards + net_pass_yards (official total net
+    # yards) except on a play whose source yards_gained differs.
     conn.execute(f"""
         CREATE TABLE team_offense_stats AS
         WITH oagg AS (
             SELECT
                 posteam AS team, season AS season_year, season_type,
-                COUNT(*) FILTER (WHERE {_SCRIMMAGE}) AS total_plays,
-                COALESCE(SUM(COALESCE(yards_gained, 0)) FILTER (WHERE {_SCRIMMAGE}), 0) AS total_yards,
-                ROUND(AVG(yards_gained) FILTER (WHERE {_SCRIMMAGE}), 2) AS yards_per_play,
+                COUNT(*) FILTER (WHERE {_TOTAL_PLAY}) AS total_plays,
+                {_TOTAL_YARDS} AS total_yards,
+                {_YARDS_PER_PLAY} AS yards_per_play,
                 COUNT(*) FILTER (WHERE {_RUSH_PLAY}) AS rush_plays,
                 COUNT(*) FILTER (WHERE {_PASS_PLAY}) AS pass_plays,
                 COUNT(*) FILTER (WHERE {_PASS_ATTEMPT}) AS pass_attempts,
@@ -920,9 +926,9 @@ def _create_aggregate_tables(conn: duckdb.DuckDBPyConnection):
         WITH dagg AS (
             SELECT
                 defteam AS team, season AS season_year, season_type,
-                COUNT(*) FILTER (WHERE {_SCRIMMAGE}) AS plays_against,
-                COALESCE(SUM(COALESCE(yards_gained, 0)) FILTER (WHERE {_SCRIMMAGE}), 0) AS yards_allowed,
-                ROUND(AVG(yards_gained) FILTER (WHERE {_SCRIMMAGE}), 2) AS yards_per_play_allowed,
+                COUNT(*) FILTER (WHERE {_TOTAL_PLAY}) AS plays_against,
+                {_TOTAL_YARDS} AS yards_allowed,
+                {_YARDS_PER_PLAY} AS yards_per_play_allowed,
                 {_RUSH_YARDS} AS rush_yards_allowed,
                 {_PASS_YARDS} AS pass_yards_allowed,
                 COUNT(*) FILTER (WHERE {_SACK}) AS sacks,

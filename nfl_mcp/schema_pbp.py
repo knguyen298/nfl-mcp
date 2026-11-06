@@ -425,7 +425,8 @@ POST, one row each, so filter it before you sum)
      yards_per_rush, yards_per_pass, touchdowns, turnovers, third_down_pct,
      red_zone_td_pct, explosive_plays, avg_epa, pass_epa, rush_epa)
     -- pass_yards is gross; net_pass_yards = pass_yards - sack_yards (sack_yards positive).
-    -- total_yards is net (sacks in) and leaves out kneels, which rush_yards counts.
+    -- total_plays and total_yards count pass and run plays plus kneels (official totals):
+    -- total_yards = rush_yards + net_pass_yards. EPA and rate columns leave kneels out.
 
   team_defense_stats
     (team, season_year, season_type, plays_against, yards_allowed, yards_per_play_allowed,

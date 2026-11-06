@@ -88,7 +88,8 @@ Measured values (read-only connections to the originals; copies for anything els
   grpF_work: team_offense_stats KC 2024 REG total_plays 1067, total_yards 5602.0,
   rush_plays 450, pass_plays 598, pass_attempts 600; team_defense_stats PHI 2024 POST
   plays_against 255, yards_allowed 1330.0, sacks 16, interceptions 6, turnovers_forced
-  13, def_touchdowns 1; situational_stats BUF 2025 REG plays per situation (below);
+  13, def_touchdowns 1 (v0.7.2 counts kneels in the totals: KC 1089 plays, 5570.0 yards,
+  5.11 per play; PHI POST 256 plays against, 1329.0 yards, 5.19 per play); situational_stats BUF 2025 REG plays per situation (below);
   team_records KC 2025 17 games, 6-11-0.
 """
 
@@ -149,11 +150,13 @@ V0_GAPS = {
 # v0.7.1 (schema version 3): team_records gains points; every older build lacks them.
 V3_GAPS = {"team_records": ["points_for", "points_against", "point_diff"]}
 # v0.7.2 (schema version 4): the team tables gain the net passing split; every older build
-# lacks it. rush_yards (and yards_per_rush) now count yards after a lateral.
+# lacks it. rush_yards (and yards_per_rush) now count yards after a lateral, and the play and
+# yard totals on both sides count kneels.
 V4_GAPS = {"team_offense_stats": ["sack_yards", "net_pass_yards"],
            "team_defense_stats": ["rush_yards_allowed", "pass_yards_allowed", "sack_yards",
                                   "net_pass_yards_allowed"]}
-V4_REDEFINED = {"rush_yards", "yards_per_rush"}
+V4_REDEFINED = {"rush_yards", "yards_per_rush", "total_plays", "total_yards", "yards_per_play",
+                "plays_against", "yards_allowed", "yards_per_play_allowed"}
 
 
 def _gap_pairs(*gaps):
@@ -784,7 +787,7 @@ def test_rebuild_derived_tables_on_grpE_v3_sources_reproduces_grpF_work(f_copy):
         assert con.execute(
             "SELECT total_plays, total_yards, rush_plays, pass_plays, pass_attempts FROM "
             "main.team_offense_stats WHERE team = 'KC' AND season_year = 2024 AND season_type = 'REG'"
-        ).fetchall() == [(1067, 5602.0, 450, 598, 600)]
+        ).fetchall() == [(1089, 5570.0, 450, 598, 600)]  # kneels in the totals since v0.7.2
     finally:
         con.close()
 
@@ -1352,11 +1355,17 @@ def test_grpE_v3_upgraded_team_tables_equal_grpF_work(v0_upgraded):
 def test_grpE_v3_upgraded_oracle_rows(v0_upgraded):
     snap = v0_upgraded.get()["snap1"]
     off = [r for r in snap["team_offense_stats"] if r[:3] == ("KC", 2024, "REG")]
-    assert len(off) == 1 and off[0][3:9] == (1067, 5602.0, 5.25, 450, 598, 600)
+    # v0.7.2: total_plays, total_yards and yards_per_play count kneels (22 for -32 yards).
+    #   SELECT count(*), sum(yards_gained) FROM plays WHERE posteam='KC' AND season=2024
+    #   AND season_type='REG' AND play_type IN ('pass','run','qb_kneel')
+    #   AND COALESCE(two_point_attempt,0)=0 on grpE_v3 -> 1089, 5570 (5.11 per play)
+    assert len(off) == 1 and off[0][3:9] == (1089, 5570.0, 5.11, 450, 598, 600)
     deff = [r for r in snap["team_defense_stats"] if r[:3] == ("PHI", 2024, "POST")]
     # plays_against, yards_allowed, yards_per_play_allowed; sacks after rush and pass yards
     # allowed (v0.7.2); interceptions, turnovers_forced, def_touchdowns after sack_yards and net.
-    assert len(deff) == 1 and deff[0][3:6] == (255, 1330.0, 5.22)
+    # Kneels in the totals (v0.7.2): the same SQL with defteam='PHI', season_type='POST'
+    # -> 256, 1329 (5.19 per play).
+    assert len(deff) == 1 and deff[0][3:6] == (256, 1329.0, 5.19)
     assert (deff[0][8], deff[0][11:14]) == (16, (6, 13, 1))
     rec = [r for r in snap["team_records"] if r[:2] == (2025, "KC")]
     # Points: SELECT SUM(pf), SUM(pa) FROM (home and away rows of schedules) WHERE

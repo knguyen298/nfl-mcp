@@ -1383,16 +1383,17 @@ def _team_rows(
 # nfl_team_stats and nfl_compare (team mode) for the blocks in the result.
 _TEAM_DEFINITIONS = {
     "offense": {
-        "total_yards": "Net yards: yards_gained summed over pass and run plays. Sacks are in, so "
-                       "yards lost on sacks are subtracted. Kneels, spikes, special teams, no_play "
-                       "rows and two-point tries are out.",
+        "total_plays": "Pass and run plays plus kneels, the official play count. Spikes, special "
+                       "teams, no_play rows and two-point tries are out.",
+        "total_yards": "Total net yards, the official figure: yards_gained summed over total_plays. "
+                       "Sacks and kneels are in. total_yards = rush_yards + net_pass_yards, except "
+                       "on a rare lateral play with a penalty where the source yards_gained differs.",
         "yards_per_play": "total_yards / total_plays.",
+        "avg_epa": "Pass and run plays only, without kneels, as are pass_epa, rush_epa, "
+                   "third_down_pct, red_zone_td_pct, explosive_plays and touchdowns.",
         "rush_yards": "rushing_yards plus yards after a lateral (lateral_rushing_yards) on "
                       "rush_attempt=1 plays, two-point tries and no_play out. Kneels and scrambles "
-                      "are in, as in the official rushing figure. Kneels are not in total_yards, so "
-                      "rush_yards + net_pass_yards = total_yards plus the kneel yards (a kneel is "
-                      "about -1 yard). On a rare lateral play with a penalty the source "
-                      "yards_gained differs too.",
+                      "are in, as in the official rushing figure.",
         "yards_per_rush": "rush_yards / rush_plays.",
         "pass_yards": "Gross passing yards: passing_yards on pass attempts (sacks, two-point tries "
                       "and no_play out). Yards lost on sacks are not subtracted.",
@@ -1403,14 +1404,16 @@ _TEAM_DEFINITIONS = {
                           "total_yards counts passing this way.",
     },
     "defense": {
-        "yards_allowed": "Net yards allowed: the opponent's yards_gained summed over its pass and "
-                         "run plays. Sacks are in, so yards the defense gained on sacks are "
-                         "subtracted. Kneels, spikes, special teams, no_play rows and two-point "
-                         "tries are out.",
+        "plays_against": "The opponent's pass and run plays plus kneels, as in total_plays.",
+        "yards_allowed": "Total net yards allowed: the opponent's yards_gained summed over "
+                         "plays_against. Sacks and kneels are in. yards_allowed = "
+                         "rush_yards_allowed + net_pass_yards_allowed, except on a rare lateral "
+                         "play with a penalty.",
         "yards_per_play_allowed": "yards_allowed / plays_against.",
+        "avg_epa_allowed": "The opponent's pass and run plays only, without kneels, as is "
+                           "third_down_stop_pct.",
         "rush_yards_allowed": "The opponent's rush_yards: rushing_yards plus yards after a lateral, "
-                              "kneels and scrambles in. rush_yards_allowed + net_pass_yards_allowed "
-                              "= yards_allowed plus the opponent's kneel yards.",
+                              "kneels and scrambles in.",
         "pass_yards_allowed": "Gross passing yards allowed: the opponent's passing_yards on pass "
                               "attempts. Yards gained on sacks are not subtracted.",
         "sacks": "Sacks made: sack=1 plays against the opponent, two-point tries and no_play out.",
@@ -1421,16 +1424,19 @@ _TEAM_DEFINITIONS = {
 }
 # A team table built before schema version 4 has no net_pass_yards (offense) or
 # net_pass_yards_allowed (defense). Its rows lack these fields, or count them another way
-# (rush_yards had no yards after a lateral), so their definitions are left out.
+# (no lateral yards in rush_yards, no kneels in the totals), so their definitions are left out.
 _TEAM_V4_MARKER = {"offense": "net_pass_yards", "defense": "net_pass_yards_allowed"}
 _TEAM_V4_FIELDS = {
-    "offense": {"rush_yards", "yards_per_rush", "sack_yards", "net_pass_yards"},
-    "defense": {"rush_yards_allowed", "pass_yards_allowed", "sack_yards", "net_pass_yards_allowed"},
+    "offense": {"total_plays", "total_yards", "yards_per_play", "rush_yards", "yards_per_rush",
+                "sack_yards", "net_pass_yards"},
+    "defense": {"plays_against", "yards_allowed", "yards_per_play_allowed", "rush_yards_allowed",
+                "pass_yards_allowed", "sack_yards", "net_pass_yards_allowed"},
 }
 _STALE_TEAM_WARNING = (
     "team_offense_stats and team_defense_stats were built by an older nfl-mcp, so sack_yards, "
     "net_pass_yards and the defense yardage split are left out. pass_yards is gross: yards lost "
-    "on sacks are not subtracted. The new fields appear after the next database update."
+    "on sacks are not subtracted. total_yards and total_plays do not count kneels yet. The new "
+    "fields appear after the next database update."
 )
 
 

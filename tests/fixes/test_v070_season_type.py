@@ -291,14 +291,18 @@ def test_team_stats_all_has_one_reg_and_one_post_row_with_plays_yards(real):
     #        COUNT(*) FILTER (WHERE play_type IN ('pass','run') AND COALESCE(two_point_attempt,0)=0)
     # FROM plays WHERE posteam='PHI' AND season=2024 GROUP BY 1
     #   -> REG 6266, 1087; POST 1453, 247
+    # v0.7.2 counts kneels (play_type 'qb_kneel') in total_yards and total_plays, the official
+    # totals: the same SQL with play_type IN ('pass','run','qb_kneel')
+    #   -> REG 6242, 1113; POST 1444, 254
     sql = ("SELECT season_type, COALESCE(SUM(COALESCE(yards_gained,0)) FILTER (WHERE play_type "
-           "IN ('pass','run') AND COALESCE(two_point_attempt,0)=0), 0), COUNT(*) FILTER (WHERE "
-           "play_type IN ('pass','run') AND COALESCE(two_point_attempt,0)=0) FROM plays "
+           "IN ('pass','run','qb_kneel') AND COALESCE(two_point_attempt,0)=0), 0), COUNT(*) "
+           "FILTER (WHERE play_type IN ('pass','run','qb_kneel') AND "
+           "COALESCE(two_point_attempt,0)=0) FROM plays "
            "WHERE posteam='PHI' AND season=2024 GROUP BY 1 ORDER BY 1")
-    assert _q(real, sql) == [("POST", 1453.0, 247), ("REG", 6266.0, 1087)]
+    assert _q(real, sql) == [("POST", 1444.0, 254), ("REG", 6242.0, 1113)]
     res = _ok("nfl_team_stats", {"team": "PHI", "season": 2024, "season_type": "ALL"})
     got = sorted((r["season_type"], r["total_yards"], r["total_plays"]) for r in res["offense"])
-    assert got == [("POST", 1453, 247), ("REG", 6266, 1087)]
+    assert got == [("POST", 1444, 254), ("REG", 6242, 1113)]
 
 
 @pytest.mark.integration
@@ -358,16 +362,16 @@ def test_player_stats_all_is_union_of_reg_and_post(real):
 
 @pytest.mark.integration
 def test_compare_teams_all_has_reg_and_post_rows(real):
-    # PHI from the team_stats SQL above (REG 6266, POST 1453). KC:
-    # same SQL with posteam='KC' -> REG 5602, POST 868
+    # PHI from the team_stats SQL above (kneels in since v0.7.2: REG 6242, POST 1444). KC:
+    # same SQL with posteam='KC' -> REG 5570, POST 855 (5602 and 868 without kneels)
     sql = ("SELECT season_type, COALESCE(SUM(COALESCE(yards_gained,0)) FILTER (WHERE play_type "
-           "IN ('pass','run') AND COALESCE(two_point_attempt,0)=0), 0) FROM plays "
+           "IN ('pass','run','qb_kneel') AND COALESCE(two_point_attempt,0)=0), 0) FROM plays "
            "WHERE posteam='KC' AND season=2024 GROUP BY 1 ORDER BY 1")
-    assert _q(real, sql) == [("POST", 868.0), ("REG", 5602.0)]
+    assert _q(real, sql) == [("POST", 855.0), ("REG", 5570.0)]
     res = _ok("nfl_compare", {"team1": "PHI", "team2": "KC", "season": 2024, "season_type": "ALL"})
     got = {team: sorted((r["season_type"], r["total_yards"]) for r in res[team]["offense"])
            for team in ("PHI", "KC")}
-    assert got == {"PHI": [("POST", 1453), ("REG", 6266)], "KC": [("POST", 868), ("REG", 5602)]}
+    assert got == {"PHI": [("POST", 1444), ("REG", 6242)], "KC": [("POST", 855), ("REG", 5570)]}
 
 
 @pytest.mark.integration
