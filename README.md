@@ -422,10 +422,10 @@ SELECT season, team, wins, losses, ties FROM team_records WHERE season = 1972 AN
 | `nfl_fantasy_opportunity` | Target share, air yards share, carry share, and expected fantasy points per player per week (2006–present) |
 | `nfl_fantasy_rankings` | Expert consensus rankings (ECR) — draft/dynasty/best-ball (`scope=draft`) or current-week start/sit (`scope=week`) |
 | `nfl_ftn_charting` | Aggregated FTN charting tendencies (2022–present) over scrimmage plays — play-action, RPO, screen, no-huddle, motion, trick-play rates, plus box/pass-rush/blitz counts |
-| `nfl_td_luck` | Actual vs expected touchdowns per player, season, and season type. It surfaces TD-regression candidates (most "unlucky" first). Each row has a `season_type` (REG or POST). Pass `season_type` to get one. Without it, both come back as separate rows. |
+| `nfl_td_luck` | Actual vs expected touchdowns per player, season, and season type. It surfaces TD-regression candidates (most "unlucky" first). `season_type` is required: REG, POST or ALL. ALL returns the REG rows and the POST rows as separate rows, labeled by `season_type`. |
 | `nfl_role_trend` | Rolling 3-week snap / target / carry / air-yards share with current-week delta — usage trending up or down |
 | `nfl_separation_opportunity` | Next Gen Stats separation/YAC joined to fantasy opportunity (2016+) — flags receivers getting open but under-producing |
-| `nfl_drop_rate` | Catchable-target drop rate per receiver, team, season, and season type from FTN charting (2022+), plus contested targets and created receptions. Each row has a `season_type` (REG or POST). Pass `season_type` to get one. Without it, both come back as separate rows. |
+| `nfl_drop_rate` | Catchable-target drop rate per receiver, team, season, and season type from FTN charting (2022+), plus contested targets and created receptions. `season_type` is required: REG, POST or ALL. ALL returns the REG rows and the POST rows as separate rows, labeled by `season_type`. |
 | `nfl_contract_value` | Fantasy points per $M of average per year (APY) — best value-for-money players |
 | `nfl_injury_return` | Post-return snap-share recovery (% of pre-injury baseline) at +1..+8 weeks, by normalized injury type and position |
 | `nfl_catalog` | Every table with its grain (what one row is), live row count, first and last season, join keys, derived flag, and last load time |

@@ -57,6 +57,10 @@ from nfl_mcp import franchises, ingest, tools
 from nfl_mcp.schema_pbp import _SCHEMA_CATEGORIES
 
 REAL_DB = Path("/tmp/grpE_v3.duckdb")
+# A database at the current schema version (2). grpE_v3 predates the season_type split of
+# the fantasy tables, so those tools answer STALE_DERIVED_TABLES there; the minimal-call test
+# needs a current database. CI's fresh 2024 ingest is one.
+CURRENT_DB = Path(os.environ.get("NFL_MCP_DB_PATH", "/tmp/ci2024/v070.duckdb"))
 
 # The 22 tools on main today. Later groups may add tools, never remove these.
 TODAY_TOOLS = {
@@ -93,6 +97,14 @@ def real_db(monkeypatch):
         pytest.skip(f"{REAL_DB} not present")
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(REAL_DB))
     return REAL_DB
+
+
+@pytest.fixture
+def current_db(monkeypatch):
+    if not CURRENT_DB.exists():
+        pytest.skip(f"{CURRENT_DB} not present")
+    monkeypatch.setenv("NFL_MCP_DB_PATH", str(CURRENT_DB))
+    return CURRENT_DB
 
 
 def _dispatch_names() -> list[str]:
@@ -149,8 +161,12 @@ _SAMPLE_ARGS = {
     "name": "Josh Allen",
     "player": "Josh Allen",
     "player_id": "00-0034857",
-    "entity1": "KC",
-    "entity2": "BUF",
+    "season_type": "ALL",
+}
+# Not in "required" (a name or an id, a player pair or a team pair), but a call needs one.
+_ENTITY_ARGS = {
+    "nfl_player_stats": {"player": "Josh Allen"},
+    "nfl_compare": {"team1": "KC", "team2": "BUF"},
 }
 
 
@@ -158,13 +174,14 @@ _SAMPLE_ARGS = {
 
 @pytest.mark.integration
 @pytest.mark.parametrize("tool_name", _dispatch_names())
-def test_dispatched_tool_minimal_call_returns_no_error(real_db, tool_name):
+def test_dispatched_tool_minimal_call_returns_no_error(current_db, tool_name):
     tool = next((t for t in _list_tools() if t.name == tool_name), None)
     assert tool is not None, f"{tool_name} is dispatched but not listed"
     schema = tool.inputSchema
     missing = [f for f in schema.get("required", []) if f not in _SAMPLE_ARGS]
     assert not missing, f"no sample value for required fields {missing}"
     args = {f: _SAMPLE_ARGS[f] for f in schema.get("required", [])}
+    args.update(_ENTITY_ARGS.get(tool_name, {}))
     if "season" in schema.get("properties", {}):
         args["season"] = 2024  # brief: pin integration calls to 2024
     result = _call_mcp(tool_name, args)
@@ -203,12 +220,12 @@ def _player_stats_oracle(display_name: str, season_type: str, position: str | No
 
 
 def _tool_season_block(name: str, player_id: str, block: str, season_type: str, **filters):
-    kwargs = {"player_name": name, "season_type": season_type, **filters}
+    kwargs = {"player": name, "season_type": season_type, **filters}
     if "stat_type" in inspect.signature(tools.nfl_player_stats).parameters:
         kwargs["stat_type"] = block
     result = tools.nfl_player_stats(**kwargs)
     if result.get("ambiguous"):
-        kwargs.pop("player_name")
+        kwargs.pop("player")
         result = tools.nfl_player_stats(player_id=player_id, **kwargs)
     assert "error" not in result, result
     rows = [r for r in result["seasons"]
@@ -527,8 +544,8 @@ def test_list_tools_every_input_schema_is_an_object():
 
 
 @pytest.mark.parametrize("name,arguments", [
-    ("nfl_schedule", {"season": "2024"}),
-    ("nfl_search_plays", {"season": "2024"}),
+    ("nfl_schedule", {"season": "2024", "season_type": "REG"}),
+    ("nfl_search_plays", {"season": "2024", "season_type": "REG"}),
     ("nfl_query", {"sql": "SELECT 1", "max_rows": 999}),
 ], ids=["schedule-season-str", "search-season-str", "query-max-rows-999"])
 def test_mcp_input_validation_rejects_bad_types(name, arguments, monkeypatch):

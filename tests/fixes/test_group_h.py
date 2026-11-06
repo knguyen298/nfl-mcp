@@ -11,12 +11,12 @@ Interface contract (beyond the shared brief)
   ff_rankings_* store LAR / JAC, so the expansion is what makes team="LA" find LAR rows.
 - Unknown code (including "" and a non-string such as 12): {"error": "Unknown team '<code>'"}
   where <code> is the value as typed. "" is an error, not "no filter".
-- season_type on nfl_schedule and on nfl_snap_counts (new parameter, same name): REG, POST,
-  WC, DIV, CON, SB, case-insensitive; POST = WC+DIV+CON+SB. Anything else:
-  {"error": ...} whose message lists the allowed values.
-- season_type on play-based tools (nfl_search_plays, nfl_player_stats, nfl_compare player
-  mode, nfl_ftn_charting): REG or POST, case-insensitive. "SB" (and WC/DIV/CON) is an
-  ERROR for these tools, not a silent map to POST, because plays only stores REG/POST.
+- season_type (v0.7.0: required, exact upper case, no default) on nfl_schedule and on
+  nfl_snap_counts: REG, POST, ALL, WC, DIV, CON, SB; POST = WC+DIV+CON+SB. Anything else,
+  including lower case: {"error": ...} whose message lists the allowed values.
+- season_type on nfl_search_plays and nfl_ftn_charting takes the same seven values (round
+  codes come from schedules.game_type). nfl_player_stats and nfl_compare are season-total
+  tools: REG, POST, ALL only, so "SB" (and WC/DIV/CON) is an ERROR for them.
 - season=0 / week=0 are applied as filters (zero rows, optionally with "reason"); they are
   never treated as "no filter". min_yards=0 is applied as yards_gained >= 0.
 - Out-of-range season or week: zero rows plus "reason" (str). A season reason names the
@@ -24,7 +24,7 @@ Interface contract (beyond the shared brief)
   (here the last loaded week, 22).
 - Boolean flags given as strings: "true"/"false" (any case) parse as booleans; any other
   non-bool value returns {"error": ...}.
-- nfl_team_stats(side="bogus") and nfl_search_plays(situation="bogus") return {"error": ...}.
+- nfl_team_stats(side="bogus", season_type="ALL") and nfl_search_plays(situation="bogus", season_type="ALL") return {"error": ...}.
 - nfl_compare team mode keys the result by canonical codes; two entities that resolve to
   the same franchise return {"error": ...}.
 """
@@ -238,29 +238,30 @@ def _build(path: Path) -> None:
                          ("player_contract_value", "apy DOUBLE, cap_pct DOUBLE, total_fp DOUBLE, "
                           "total_fp_exp DOUBLE, fp_per_million DOUBLE")):
         c.execute(f"CREATE TABLE {table} (player_id VARCHAR, full_name VARCHAR, position VARCHAR, "
-                  f"team VARCHAR, season INTEGER, {extra})")
+                  f"team VARCHAR, season INTEGER, season_type VARCHAR, {extra})")
         n_extra = extra.count("DOUBLE")
-        c.executemany(f"INSERT INTO {table} VALUES (?,?,?,?,2024{',1.0' * n_extra})", PLAYER_ROWS)
+        c.executemany(f"INSERT INTO {table} VALUES (?,?,?,?,2024,'REG'{',1.0' * n_extra})", PLAYER_ROWS)
     trend_cols = ["snap_pct", "target_share_pct", "carry_share_pct", "air_yards_share_pct"]
     trend_all = trend_cols + [f"{x}_3wk" for x in trend_cols] + [f"{x}_delta" for x in trend_cols]
     c.execute("CREATE TABLE player_role_trend (player_id VARCHAR, full_name VARCHAR, position VARCHAR, "
-              "team VARCHAR, season INTEGER, week INTEGER, "
+              "team VARCHAR, season INTEGER, season_type VARCHAR, week INTEGER, "
               + ", ".join(f"{x} DOUBLE" for x in trend_all) + ")")
-    c.executemany(f"INSERT INTO player_role_trend VALUES (?,?,?,?,2024,2{',50.0' * len(trend_all)})",
+    c.executemany(f"INSERT INTO player_role_trend VALUES (?,?,?,?,2024,'REG',2{',50.0' * len(trend_all)})",
                   PLAYER_ROWS)
     c.execute("""CREATE TABLE player_drop_rate (player_id VARCHAR, player VARCHAR, team VARCHAR,
-        season INTEGER, catchable_targets INTEGER, drops INTEGER, drop_rate_pct DOUBLE,
+        season INTEGER, season_type VARCHAR, catchable_targets INTEGER, drops INTEGER,
+        drop_rate_pct DOUBLE,
         contested_targets INTEGER, created_receptions INTEGER)""")
-    c.executemany("INSERT INTO player_drop_rate VALUES (?,?,?,2024,10,1,10.0,2,1)",
+    c.executemany("INSERT INTO player_drop_rate VALUES (?,?,?,2024,'REG',10,1,10.0,2,1)",
                   [(i, n, t) for i, n, _, t in PLAYER_ROWS])
     ffo = ["rec_attempt", "rush_attempt", "rec_air_yards", "receptions", "receptions_exp",
            "rec_yards_gained", "rush_yards_gained", "rec_touchdown", "rush_touchdown",
            "total_fantasy_points", "total_fantasy_points_exp", "total_fantasy_points_diff",
            "rec_attempt_team", "rush_attempt_team"]
     c.execute("CREATE TABLE ff_opportunity (season INTEGER, week INTEGER, posteam VARCHAR, "
-              "full_name VARCHAR, position VARCHAR, player_id VARCHAR, "
+              "full_name VARCHAR, position VARCHAR, player_id VARCHAR, game_id VARCHAR, "
               + ", ".join(f"{x} DOUBLE" for x in ffo) + ")")
-    c.executemany(f"INSERT INTO ff_opportunity VALUES (2024,2,?,?,?,?{',1.0' * len(ffo)})",
+    c.executemany(f"INSERT INTO ff_opportunity VALUES (2024,2,?,?,?,?,NULL{',1.0' * len(ffo)})",
                   [(t, n, p, i) for i, n, p, t in PLAYER_ROWS])
 
     c.execute("""CREATE TABLE team_records (season INTEGER, team VARCHAR, source_team VARCHAR,
@@ -326,21 +327,29 @@ def _n(result: dict, key: str) -> int:
     return len(rows)
 
 
+def _ftn_all(**kw):
+    """nfl_ftn_charting with season_type=ALL answers one block per type; add them up."""
+    res = tools.nfl_ftn_charting(season_type="ALL", **kw)
+    if "error" in res:
+        return res
+    return {"total_plays": sum(b["total_plays"] for b in res.get("season_types", []))}
+
+
 # tool -> (call taking a team value, result key, hand count for "KC" or None)
 TEAM_TOOLS = {
-    "nfl_search_plays": (lambda t: tools.nfl_search_plays(team=t), "rows", KC_PLAYS),
-    "nfl_team_stats": (lambda t: tools.nfl_team_stats(t, side="offense"), "offense", None),
+    "nfl_search_plays": (lambda t: tools.nfl_search_plays(team=t, season_type="ALL"), "rows", KC_PLAYS),
+    "nfl_team_stats": (lambda t: tools.nfl_team_stats(t, side="offense", season_type="ALL"), "offense", None),
     "nfl_roster": (lambda t: tools.nfl_roster(team=t), "players", 3),
-    "nfl_injuries": (lambda t: tools.nfl_injuries(team=t), "injuries", 2),
-    "nfl_schedule": (lambda t: tools.nfl_schedule(team=t), "games", 8),
-    "nfl_snap_counts": (lambda t: tools.nfl_snap_counts(team=t), "snap_counts", 7),
+    "nfl_injuries": (lambda t: tools.nfl_injuries(team=t, season_type="ALL"), "injuries", 2),
+    "nfl_schedule": (lambda t: tools.nfl_schedule(team=t, season_type="ALL"), "games", 8),
+    "nfl_snap_counts": (lambda t: tools.nfl_snap_counts(team=t, season_type="ALL"), "snap_counts", 7),
     "nfl_fantasy_rankings": (lambda t: tools.nfl_fantasy_rankings(team=t), "fantasy_rankings", 2),
-    "nfl_ftn_charting": (lambda t: tools.nfl_ftn_charting(team=t), "total_plays", 5),
-    "nfl_td_luck": (lambda t: tools.nfl_td_luck(team=t), "td_luck", 2),
-    "nfl_role_trend": (lambda t: tools.nfl_role_trend(team=t), "role_trend", 2),
-    "nfl_drop_rate": (lambda t: tools.nfl_drop_rate(team=t), "drop_rate", 2),
-    "nfl_contract_value": (lambda t: tools.nfl_contract_value(team=t), "contract_value", 2),
-    "nfl_fantasy_opportunity": (lambda t: tools.nfl_fantasy_opportunity(team=t), "fantasy_opportunity", 2),
+    "nfl_ftn_charting": (lambda t: _ftn_all(team=t), "total_plays", 5),
+    "nfl_td_luck": (lambda t: tools.nfl_td_luck(team=t, season_type="ALL"), "td_luck", 2),
+    "nfl_role_trend": (lambda t: tools.nfl_role_trend(team=t, season_type="ALL"), "role_trend", 2),
+    "nfl_drop_rate": (lambda t: tools.nfl_drop_rate(team=t, season_type="ALL"), "drop_rate", 2),
+    "nfl_contract_value": (lambda t: tools.nfl_contract_value(team=t, season_type="ALL"), "contract_value", 2),
+    "nfl_fantasy_opportunity": (lambda t: tools.nfl_fantasy_opportunity(team=t, season_type="ALL"), "fantasy_opportunity", 2),
     "nfl_team_records": (lambda t: tools.nfl_team_records(team=t), "records", 1),
 }
 
@@ -374,14 +383,14 @@ _ALIAS = [("OAK", 2), ("LV", 2), ("SD", 2), ("LAC", 2), ("STL", 2), ("LA", 2), (
 def test_search_plays_alias_returns_all_franchise_codes(db, code, expected):
     # Two rows per franchise: OAK 2019 + LV 2024, SD 2016 + LAC 2024, STL 2015 + LA 2024,
     # JAC 2019 + JAX 2024, WAS 2019 + WAS 2024.
-    res = tools.nfl_search_plays(team=code)
+    res = tools.nfl_search_plays(team=code, season_type="ALL")
     assert _n(res, "rows") == expected
     assert len({r["season"] for r in res["rows"]}) == 2
 
 
 def test_search_plays_opponent_alias_oak_finds_lv_defense(db):
     # defteam LV appears once (play 7, 2024); no OAK defteam rows -> 1
-    assert _n(tools.nfl_search_plays(opponent="oak"), "rows") == 1
+    assert _n(tools.nfl_search_plays(opponent="oak", season_type="ALL"), "rows") == 1
 
 
 @pytest.mark.parametrize("code,expected", [
@@ -410,10 +419,10 @@ def test_unknown_team_returns_error(db, tool, code):
 
 
 @pytest.mark.parametrize("value,expected", [
-    ("POST", 5), ("post", 5),
-    ("WC", 2), ("DIV", 1), ("CON", 1), ("SB", 1), ("REG", 3), ("reg", 3), ("sb", 1)])
+    ("POST", 5), ("ALL", 8),
+    ("WC", 2), ("DIV", 1), ("CON", 1), ("SB", 1), ("REG", 3)])
 def test_schedule_season_type_2024(db, value, expected):
-    # 2024: REG 3, WC 2, DIV 1, CON 1, SB 1 -> POST 5
+    # 2024: REG 3, WC 2, DIV 1, CON 1, SB 1 -> POST 5, ALL 8
     res = tools.nfl_schedule(season=2024, season_type=value)
     assert _n(res, "games") == expected
 
@@ -428,23 +437,24 @@ def test_schedule_reg_excludes_playoffs(db):
     assert {g["game_type"] for g in res["games"]} == {"REG"} and res["count"] == 3
 
 
-@pytest.mark.parametrize("value", ["XYZ", "playoffs"])
+@pytest.mark.parametrize("value", ["XYZ", "playoffs", "reg", "post", "sb", None])
 def test_schedule_unknown_season_type_lists_allowed(db, value):
     res = tools.nfl_schedule(season=2024, season_type=value)
     assert "error" in res
-    for allowed in ("REG", "POST", "WC", "DIV", "CON", "SB"):
+    for allowed in ("REG", "POST", "ALL", "WC", "DIV", "CON", "SB"):
         assert allowed in res["error"]
 
 
-@pytest.mark.parametrize("value,expected", [("POST", 5), ("post", 5), ("SB", 2), ("WC", 1), ("REG", 2)])
+@pytest.mark.parametrize("value,expected", [("POST", 5), ("ALL", 7), ("SB", 2), ("WC", 1), ("REG", 2)])
 def test_snap_counts_season_type(db, value, expected):
-    # KC 2024 snaps: REG 2, WC 1, DIV 1, CON 1, SB 2 -> POST 5
+    # KC 2024 snaps: REG 2, WC 1, DIV 1, CON 1, SB 2 -> POST 5, ALL 7
     res = tools.nfl_snap_counts(team="KC", season=2024, **{"season_type": value})
     assert _n(res, "snap_counts") == expected
 
 
-def test_snap_counts_unknown_season_type_errors(db):
-    res = tools.nfl_snap_counts(team="KC", **{"season_type": "XYZ"})
+@pytest.mark.parametrize("value", ["XYZ", "post"])
+def test_snap_counts_unknown_season_type_errors(db, value):
+    res = tools.nfl_snap_counts(team="KC", **{"season_type": value})
     assert "error" in res and "POST" in res["error"]
 
 
@@ -452,41 +462,51 @@ def test_snap_counts_unknown_season_type_errors(db):
 
 
 @pytest.mark.parametrize("value,expected", [
-    ("REG", KC_REG_PLAYS), ("reg", KC_REG_PLAYS),
-    ("POST", KC_POST_PLAYS), ("post", KC_POST_PLAYS)])
-def test_search_plays_season_type_case(db, value, expected):
+    ("REG", KC_REG_PLAYS), ("POST", KC_POST_PLAYS), ("ALL", KC_PLAYS)])
+def test_search_plays_season_type(db, value, expected):
     assert _n(tools.nfl_search_plays(team="KC", season_type=value), "rows") == expected
 
 
-def test_player_stats_season_type_lower_equals_upper(db):
-    upper = tools.nfl_player_stats(player_name="Patrick Mahomes", season_type="REG")
-    lower = tools.nfl_player_stats(player_name="Patrick Mahomes", season_type="reg")
-    assert len(upper["seasons"]) == 1  # 2024 REG only
-    assert lower["seasons"] == upper["seasons"]
+def test_player_stats_season_type_is_exact(db):
+    ok = tools.nfl_player_stats(player="Patrick Mahomes", season_type="REG")
+    assert len(ok["seasons"]) == 1  # 2024 REG only
+    bad = tools.nfl_player_stats(player="Patrick Mahomes", season_type="reg")
+    assert "error" in bad and "REG" in bad["error"]
 
 
-def test_compare_player_season_type_lower_equals_upper(db):
-    kw = dict(compare_type="player")
-    upper = tools.nfl_compare("Patrick Mahomes", "Travis Kelce", season_type="REG", **kw)
-    lower = tools.nfl_compare("Patrick Mahomes", "Travis Kelce", season_type="reg", **kw)
-    assert "error" not in upper
-    assert lower == upper
+def test_compare_player_season_type_is_exact(db):
+    ok = tools.nfl_compare(player1="Patrick Mahomes", player2="Travis Kelce", season_type="REG")
+    assert "error" not in ok
+    bad = tools.nfl_compare(player1="Patrick Mahomes", player2="Travis Kelce", season_type="reg")
+    assert "error" in bad and "REG" in bad["error"]
 
 
-@pytest.mark.parametrize("value", ["REG", "reg"])
-def test_ftn_charting_season_type_case(db, value):
-    # KC charted REG plays: 11, 12, 13, 14 -> 4
-    assert tools.nfl_ftn_charting(team="KC", season_type=value)["total_plays"] == KC_REG_PLAYS
+def test_ftn_charting_season_type(db):
+    # KC charted REG plays: 11, 12, 13, 14 -> 4; play 15 is POST
+    assert tools.nfl_ftn_charting(team="KC", season_type="REG")["total_plays"] == KC_REG_PLAYS
+    assert tools.nfl_ftn_charting(team="KC", season_type="POST")["total_plays"] == KC_POST_PLAYS
+    both = tools.nfl_ftn_charting(team="KC", season_type="ALL")["season_types"]
+    assert [(b["season_type"], b["total_plays"]) for b in both] == [("REG", 4), ("POST", 1)]
+    bad = tools.nfl_ftn_charting(team="KC", season_type="reg")
+    assert "error" in bad and "REG" in bad["error"]
 
 
-@pytest.mark.parametrize("tool", ["search_plays", "player_stats", "ftn_charting", "compare"])
-def test_plays_tools_reject_sb(db, tool):
+@pytest.mark.parametrize("tool", ["search_plays", "ftn_charting"])
+def test_per_game_plays_tools_accept_round_codes(db, tool):
+    # plays only stores REG/POST; the round comes from schedules.game_type through game_id.
     calls = {
         "search_plays": lambda: tools.nfl_search_plays(team="KC", season_type="SB"),
-        "player_stats": lambda: tools.nfl_player_stats(player_name="Patrick Mahomes", season_type="SB"),
         "ftn_charting": lambda: tools.nfl_ftn_charting(team="KC", season_type="SB"),
-        "compare": lambda: tools.nfl_compare("Patrick Mahomes", "Travis Kelce",
-                                             compare_type="player", season_type="SB"),
+    }
+    assert "error" not in calls[tool]()
+
+
+@pytest.mark.parametrize("tool", ["player_stats", "compare"])
+def test_season_total_tools_reject_round_codes(db, tool):
+    calls = {
+        "player_stats": lambda: tools.nfl_player_stats(player="Patrick Mahomes", season_type="SB"),
+        "compare": lambda: tools.nfl_compare(player1="Patrick Mahomes", player2="Travis Kelce",
+                                             season_type="SB"),
     }
     res = calls[tool]()
     assert "error" in res and "REG" in res["error"] and "POST" in res["error"]
@@ -496,12 +516,12 @@ def test_plays_tools_reject_sb(db, tool):
 
 # tool -> (call(**kw), key, unfiltered hand count)
 _ZERO = {
-    "search_plays": (lambda **k: tools.nfl_search_plays(**k), "rows", N_PLAYS),
-    "player_stats": (lambda **k: tools.nfl_player_stats(player_name="Patrick Mahomes", **k), "seasons", 2),
+    "search_plays": (lambda **k: tools.nfl_search_plays(**k, season_type="ALL"), "rows", N_PLAYS),
+    "player_stats": (lambda **k: tools.nfl_player_stats(player="Patrick Mahomes", **k, season_type="ALL"), "seasons", 2),
     "roster": (lambda **k: tools.nfl_roster(**k), "players", 6),
-    "injuries": (lambda **k: tools.nfl_injuries(**k), "injuries", 4),
-    "schedule": (lambda **k: tools.nfl_schedule(**k), "games", 11),
-    "snap_counts": (lambda **k: tools.nfl_snap_counts(**k), "snap_counts", 9),
+    "injuries": (lambda **k: tools.nfl_injuries(**k, season_type="ALL"), "injuries", 4),
+    "schedule": (lambda **k: tools.nfl_schedule(**k, season_type="ALL"), "games", 11),
+    "snap_counts": (lambda **k: tools.nfl_snap_counts(**k, season_type="ALL"), "snap_counts", 9),
 }
 
 
@@ -517,16 +537,16 @@ def test_zero_season_or_week_is_applied(db, tool, arg):
 @pytest.mark.parametrize("team,expected", [(None, N_PLAYS_NONNEG), ("KC", KC_PLAYS - 1)])
 def test_min_yards_zero_is_applied(db, team, expected):
     # Only play 12 (KC, -3 yards) is below 0, so min_yards=0 drops exactly one row.
-    assert _n(tools.nfl_search_plays(team=team, min_yards=0), "rows") == expected
+    assert _n(tools.nfl_search_plays(team=team, min_yards=0, season_type="ALL"), "rows") == expected
 
 
 # ── 7. Out-of-range season or week gives a reason ─────────────────────────────
 
 _RANGE = {
-    "search_plays": (lambda: tools.nfl_search_plays(season=2030), "rows"),
-    "player_stats": (lambda: tools.nfl_player_stats(player_name="Patrick Mahomes", season=2030), "seasons"),
-    "schedule": (lambda: tools.nfl_schedule(season=2030), "games"),
-    "team_stats": (lambda: tools.nfl_team_stats("KC", season=2030), "offense"),
+    "search_plays": (lambda: tools.nfl_search_plays(season=2030, season_type="ALL"), "rows"),
+    "player_stats": (lambda: tools.nfl_player_stats(player="Patrick Mahomes", season=2030, season_type="ALL"), "seasons"),
+    "schedule": (lambda: tools.nfl_schedule(season=2030, season_type="ALL"), "games"),
+    "team_stats": (lambda: tools.nfl_team_stats("KC", season=2030, season_type="ALL"), "offense"),
     "roster": (lambda: tools.nfl_roster(team="KC", season=2030), "players"),
 }
 
@@ -542,7 +562,7 @@ def test_season_out_of_range_reason_names_loaded_range(db, tool):
 
 @pytest.mark.parametrize("kw", [{"season": 2024, "week": 25}, {"week": 25}], ids=["2024", "any"])
 def test_week_out_of_range_reason(db, kw):
-    res = tools.nfl_search_plays(**kw)
+    res = tools.nfl_search_plays(**kw, season_type="ALL")
     assert _n(res, "rows") == 0
     assert isinstance(res.get("reason"), str) and "22" in res["reason"]  # last loaded week 22
 
@@ -550,18 +570,18 @@ def test_week_out_of_range_reason(db, kw):
 # ── 8. Empty / None / malformed arguments return an error ─────────────────────
 
 _BAD = {
-    "team_stats_none": lambda: tools.nfl_team_stats(None),
-    "team_stats_empty": lambda: tools.nfl_team_stats(""),
-    "player_stats_empty": lambda: tools.nfl_player_stats(player_name=""),
-    "player_stats_none": lambda: tools.nfl_player_stats(player_name=None),
-    "compare_team_empty": lambda: tools.nfl_compare("", ""),
-    "compare_player_empty": lambda: tools.nfl_compare("", "", compare_type="player"),
-    "search_season_abc": lambda: tools.nfl_search_plays(season="abc"),
-    "search_week_abc": lambda: tools.nfl_search_plays(week="abc"),
-    "role_trend_min_snap_x": lambda: tools.nfl_role_trend(min_snap_pct="x"),
-    "team_stats_side_bogus": lambda: tools.nfl_team_stats("KC", side="bogus"),
-    "search_situation_bogus": lambda: tools.nfl_search_plays(situation="bogus"),
-    "search_is_touchdown_maybe": lambda: tools.nfl_search_plays(is_touchdown="maybe"),
+    "team_stats_none": lambda: tools.nfl_team_stats(None, season_type="ALL"),
+    "team_stats_empty": lambda: tools.nfl_team_stats("", season_type="ALL"),
+    "player_stats_empty": lambda: tools.nfl_player_stats(player="", season_type="ALL"),
+    "player_stats_none": lambda: tools.nfl_player_stats(player=None, season_type="ALL"),
+    "compare_team_empty": lambda: tools.nfl_compare(team1="", team2="", season_type="ALL"),
+    "compare_player_empty": lambda: tools.nfl_compare(player1="", player2="", season_type="ALL"),
+    "search_season_abc": lambda: tools.nfl_search_plays(season="abc", season_type="ALL"),
+    "search_week_abc": lambda: tools.nfl_search_plays(week="abc", season_type="ALL"),
+    "role_trend_min_snap_x": lambda: tools.nfl_role_trend(min_snap_pct="x", season_type="ALL"),
+    "team_stats_side_bogus": lambda: tools.nfl_team_stats("KC", side="bogus", season_type="ALL"),
+    "search_situation_bogus": lambda: tools.nfl_search_plays(situation="bogus", season_type="ALL"),
+    "search_is_touchdown_maybe": lambda: tools.nfl_search_plays(is_touchdown="maybe", season_type="ALL"),
 }
 
 
@@ -576,20 +596,20 @@ def test_bad_argument_returns_error(db, case):
     ("true", N_TD_PLAYS), (True, N_TD_PLAYS), (False, N_PLAYS)])
 def test_is_touchdown_string_booleans_parse(db, value, expected):
     # 17 plays, 2 touchdowns (plays 11, 15)
-    assert _n(tools.nfl_search_plays(is_touchdown=value), "rows") == expected
+    assert _n(tools.nfl_search_plays(is_touchdown=value, season_type="ALL"), "rows") == expected
 
 
 # ── 9. nfl_compare team mode keys ─────────────────────────────────────────────
 
 @pytest.mark.parametrize("a,b,ka,kb", [("kc", "buf", "KC", "BUF"), (" Kc", "oak", "KC", "LV")])
 def test_compare_team_keys_are_canonical(db, a, b, ka, kb):
-    res = tools.nfl_compare(a, b)
+    res = tools.nfl_compare(team1=a, team2=b, season_type="ALL")
     assert ka in res and kb in res and a not in res and b not in res
 
 
 @pytest.mark.parametrize("a,b", [("KC", "KC"), ("KC", "kc"), ("OAK", "LV")])
 def test_compare_team_with_itself_errors(db, a, b):
-    assert "error" in tools.nfl_compare(a, b)
+    assert "error" in tools.nfl_compare(team1=a, team2=b, season_type="ALL")
 
 
 # ── 10. nfl_team_records keeps canonical_team (regression, passes today) ─────
@@ -641,18 +661,18 @@ def test_integration_schedule_kc_2024_post():
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("value", ["REG", pytest.param("reg")])
-def test_integration_schedule_kc_2024_reg(value):
+def test_integration_schedule_kc_2024_reg():
     path = _real_db()
     expected = _scalar(path, _KC_GAMES + "('REG')")
     assert expected == 17
-    assert tools.nfl_schedule(team="KC", season=2024, season_type=value)["count"] == expected
+    assert tools.nfl_schedule(team="KC", season=2024, season_type="REG")["count"] == expected
+    assert "error" in tools.nfl_schedule(team="KC", season=2024, season_type="reg")
 
 
 @pytest.mark.integration
 def test_integration_search_plays_lowercase_team():
     _real_db()
-    res = tools.nfl_search_plays(team="kc", season=2024, max_rows=5)
+    res = tools.nfl_search_plays(team="kc", season=2024, max_rows=5, season_type="ALL")
     assert len(res["rows"]) == 5 and {r["posteam"] for r in res["rows"]} == {"KC"}
 
 
@@ -712,7 +732,7 @@ def test_player_lookup_unknown_team_is_error(two_sams):
 @pytest.mark.integration
 def test_integration_td_luck_jax_and_jac_resolve_same_player():
     _real_db()
-    by_code = {code: tools.nfl_td_luck(player="Etienne", team=code, season=2024)
+    by_code = {code: tools.nfl_td_luck(player="Etienne", team=code, season=2024, season_type="ALL")
                for code in ("JAX", "JAC")}
     assert all("ambiguous" not in r for r in by_code.values()), by_code
     assert by_code["JAX"]["player_id"] == by_code["JAC"]["player_id"]

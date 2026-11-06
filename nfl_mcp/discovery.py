@@ -67,11 +67,13 @@ TABLE_INFO: dict[str, tuple[str, list[str]]] = {
                      ["team", "season"]),
     "player_td_luck": ("one row per player per season per season type (REG or POST)",
                        ["player_id"]),
-    "player_role_trend": ("one row per player per week", ["player_id"]),
-    "player_separation_opportunity": ("one row per player per season", ["player_id"]),
+    "player_role_trend": ("one row per player per week per season type (REG or POST)", ["player_id"]),
+    "player_separation_opportunity": ("one row per player per season per season type (REG or POST)",
+                                      ["player_id"]),
     "player_drop_rate": ("one row per player per team per season per season type (REG or POST)",
                          ["player_id"]),
-    "player_contract_value": ("one row per player per season", ["player_id"]),
+    "player_contract_value": ("one row per player per season per season type (REG or POST)",
+                              ["player_id"]),
     "injury_return_curve": ("one row per injury type, position and week after return",
                             ["injury_type", "position"]),
     "_schema_version": ("one row per schema version stamp (the database version is the highest)",
@@ -161,7 +163,14 @@ DATA_NOTES: list[str] = [
     "team_offense_stats, team_defense_stats, situational_stats and formation_effectiveness "
     "have separate REG and POST rows, so filter season_type before you sum. So do "
     "player_td_luck and player_drop_rate: a player with a playoff game has one row per season "
-    "type, and nfl_td_luck and nfl_drop_rate return season_type on every row."),
+    "type. Since v0.7.0 player_role_trend, player_separation_opportunity and "
+    "player_contract_value are split the same way. The tools on all five return season_type "
+    "on every row. The player_role_trend 3-week window never crosses from REG into POST."),
+    ("The tools that read season-type data require season_type, in exact upper case, with no "
+    "default. Season-total tools take REG, POST or ALL. Per-game tools also take WC, DIV, CON "
+    "or SB. ALL returns the REG rows and the POST rows as separate rows, never one combined "
+    "row. A database built before v0.7.0 answers STALE_DERIVED_TABLES until you run "
+    "'nfl-mcp upgrade'."),
     ("nfl_roster and nfl_injuries return gsis_id on every row. nfl_injuries also returns "
     "season_type. The injuries table leaves season_type empty in some rows (every 2024 row when "
     "measured), so the tool fills it from game_type (REG stays REG, WC, DIV, CON and SB become POST)."),

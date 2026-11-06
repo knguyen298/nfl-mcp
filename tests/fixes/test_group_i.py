@@ -13,12 +13,13 @@ Interface contract (beyond the shared brief)
   that names "offset" and "nfl_query").
 - Page order is each tool's existing ORDER BY (fixture sort keys are distinct, so A..G is the order);
   the fix must add a unique tiebreak so offset pages never overlap on real data with ties.
-- nfl_snap_counts rows gain "pfr_player_id" (needed to prove page coverage on real data). A call
-  without season_type covers every game_type (REG and playoffs).
+- nfl_snap_counts rows gain "pfr_player_id" (needed to prove page coverage on real data). season_type
+  is required (v0.7.0); ALL covers every game_type (REG and playoffs).
 - nfl_search_plays(..., player_id=None, player_role=None, down=None, qtr=None,
   min_yardline_100=None, max_yardline_100=None, min_score_differential=None,
   max_score_differential=None, shotgun=None, no_huddle=None, min_wp=None, max_wp=None,
-  sort_by="abs_epa", columns=None, limit=100, offset=0, max_rows=<alias of limit>).
+  sort_by="abs_epa", columns=None, limit=100, offset=0, max_rows=<alias of limit>,
+  season_type=<required>).
   Numeric bounds are inclusive. shotgun/no_huddle True -> column = 1, False -> column = 0.
 - player_role with player_id: passer -> passer_player_id; rusher -> rusher_player_id; receiver ->
   receiver_player_id; any_offense -> any of those three; defender -> any of sack, half_sack_1/2,
@@ -230,7 +231,7 @@ def plays_db(_plays_file, monkeypatch):
 
 def _search(**kw):
     kw.setdefault("season", 2024)
-    return tools.nfl_search_plays(**kw)
+    return tools.nfl_search_plays(**kw, season_type="REG")
 
 
 def _pid(row):
@@ -471,19 +472,19 @@ PAGE_SPECS = [
      "practice_secondary_injury practice_status season_type",
      lambda i, c: dict(season=2024, game_type="REG", season_type="REG", team="KC", week=1,
                        full_name=f"Inj {c}", report_status="Out"),
-     {"season": 2024}, "injuries", "full_name"),
+     {"season": 2024, "season_type": "ALL"}, "injuries", "full_name"),
     ("nfl_schedule", "schedules", "game_id season:I game_type week:I gameday gametime away_team "
      "home_team away_score:I home_score:I result:I total:I overtime:I spread_line:D total_line:D "
      "div_game:I roof surface temp:I wind:I away_coach home_coach referee stadium location",
      lambda i, c: dict(game_id=f"2024_{i + 1:02d}_BUF_KC", season=2024, game_type="REG",
                        week=i + 1, away_team="BUF", home_team="KC"),
-     {"season": 2024}, "games", "game_id"),
+     {"season": 2024, "season_type": "ALL"}, "games", "game_id"),
     ("nfl_snap_counts", "snap_counts", "game_id pfr_game_id season:I game_type week:I player "
      "pfr_player_id position team opponent offense_snaps:D offense_pct:D defense_snaps:D "
      "defense_pct:D st_snaps:D st_pct:D",
      lambda i, c: dict(game_id="2024_01_BAL_KC", season=2024, game_type="REG", week=1,
                        player=f"Snap {c}", pfr_player_id=f"SnapX{i}", team="KC", opponent="BAL",
-                       offense_snaps=70.0 - i), {"season": 2024}, "snap_counts", "player"),
+                       offense_snaps=70.0 - i), {"season": 2024, "season_type": "ALL"}, "snap_counts", "player"),
     ("nfl_fantasy_opportunity", "ff_opportunity", "season:I posteam week:D game_id player_id "
      "full_name position pass_attempt:D rec_attempt:D rush_attempt:D rec_air_yards:D receptions:D "
      "receptions_exp:D rec_yards_gained:D rush_yards_gained:D rec_touchdown:D rush_touchdown:D "
@@ -491,7 +492,7 @@ PAGE_SPECS = [
      "rec_attempt_team:D rush_attempt_team:D",
      lambda i, c: dict(season=2024, posteam="KC", week=1.0, player_id=f"00-00F000{i}",
                        full_name=f"Opp {c}", total_fantasy_points_exp=30.0 - i),
-     {"season": 2024}, "fantasy_opportunity", "full_name"),
+     {"season": 2024, "season_type": "ALL"}, "fantasy_opportunity", "full_name"),
     ("nfl_fantasy_rankings", "ff_rankings_draft", "fp_page page_type ecr_type player id pos team "
      "ecr:D sd:D best:I worst:I bye:I scrape_date sportsdata_id tm",
      lambda i, c: dict(page_type="redraft-overall", player=f"Rank {c}", pos="WR", team="KC",
@@ -500,35 +501,35 @@ PAGE_SPECS = [
      lambda i, c: dict(game_id="2024_01_BAL_KC", play_id=float(i), season=2024, week=1,
                        season_type="REG", posteam="KC", defteam="BAL", play_type="pass",
                        desc=f"Play {c}", epa=(7.0 - i) * (1 if i % 2 == 0 else -1)),
-     {"season": 2024}, "rows", "desc"),
-    ("nfl_td_luck", "player_td_luck", "player_id full_name position team season:I rec_td:D "
+     {"season": 2024, "season_type": "ALL"}, "rows", "desc"),
+    ("nfl_td_luck", "player_td_luck", "player_id full_name position team season:I season_type rec_td:D "
      "rec_td_exp:D rec_td_luck:D rush_td:D rush_td_exp:D rush_td_luck:D total_td_luck_score:D",
-     lambda i, c: dict(player_id=f"00-00L000{i}", full_name=f"Luck {c}", team="KC", season=2024,
-                       total_td_luck_score=-3.0 + i), {"season": 2024}, "td_luck", "full_name"),
-    ("nfl_role_trend", "player_role_trend", "player_id full_name position team season:I week:I "
+     lambda i, c: dict(player_id=f"00-00L000{i}", full_name=f"Luck {c}", team="KC", season=2024, season_type="REG",
+                       total_td_luck_score=-3.0 + i), {"season": 2024, "season_type": "ALL"}, "td_luck", "full_name"),
+    ("nfl_role_trend", "player_role_trend", "player_id full_name position team season:I season_type week:I "
      "snap_pct:D target_share_pct:D carry_share_pct:D air_yards_share_pct:D snap_pct_3wk:D "
      "target_share_pct_3wk:D carry_share_pct_3wk:D air_yards_share_pct_3wk:D snap_pct_delta:D "
      "target_share_pct_delta:D carry_share_pct_delta:D air_yards_share_pct_delta:D",
-     lambda i, c: dict(player_id=f"00-00T000{i}", full_name=f"Trend {c}", team="KC", season=2024,
+     lambda i, c: dict(player_id=f"00-00T000{i}", full_name=f"Trend {c}", team="KC", season=2024, season_type="REG",
                        week=5, snap_pct=50.0, snap_pct_delta=10.0 - i),
-     {"season": 2024}, "role_trend", "full_name"),
+     {"season": 2024, "season_type": "ALL"}, "role_trend", "full_name"),
     ("nfl_separation_opportunity", "player_separation_opportunity", "player_id full_name position "
-     "team season:I games:I fp_diff:D fp_diff_per_game:D td_luck:D catch_luck:D target_share_pct:D "
+     "team season:I season_type games:I fp_diff:D fp_diff_per_game:D td_luck:D catch_luck:D target_share_pct:D "
      "air_yards_share_pct:D avg_separation:D avg_yac_above_expectation:D catch_percentage:D "
      "regression_candidate:B",
-     lambda i, c: dict(player_id=f"00-00S000{i}", full_name=f"Sep {c}", team="KC", season=2024,
+     lambda i, c: dict(player_id=f"00-00S000{i}", full_name=f"Sep {c}", team="KC", season=2024, season_type="REG",
                        fp_diff_per_game=-5.0 + i, regression_candidate=False),
-     {"season": 2024}, "separation_opportunity", "full_name"),
-    ("nfl_drop_rate", "player_drop_rate", "player_id player team season:I catchable_targets:I "
+     {"season": 2024, "season_type": "ALL"}, "separation_opportunity", "full_name"),
+    ("nfl_drop_rate", "player_drop_rate", "player_id player team season:I season_type catchable_targets:I "
      "drops:I drop_rate_pct:D contested_targets:I created_receptions:I",
-     lambda i, c: dict(player_id=f"00-00D000{i}", player=f"D.{c}", team="KC", season=2024,
+     lambda i, c: dict(player_id=f"00-00D000{i}", player=f"D.{c}", team="KC", season=2024, season_type="REG",
                        catchable_targets=50, drop_rate_pct=20.0 - i),
-     {"season": 2024}, "drop_rate", "player"),
-    ("nfl_contract_value", "player_contract_value", "player_id full_name position team season:I "
+     {"season": 2024, "season_type": "ALL"}, "drop_rate", "player"),
+    ("nfl_contract_value", "player_contract_value", "player_id full_name position team season:I season_type "
      "apy:D cap_pct:D total_fp:D total_fp_exp:D fp_per_million:D",
-     lambda i, c: dict(player_id=f"00-00V000{i}", full_name=f"Val {c}", team="KC", season=2024,
+     lambda i, c: dict(player_id=f"00-00V000{i}", full_name=f"Val {c}", team="KC", season=2024, season_type="REG",
                        apy=5.0, fp_per_million=50.0 - i),
-     {"season": 2024}, "contract_value", "full_name"),
+     {"season": 2024, "season_type": "ALL"}, "contract_value", "full_name"),
     ("nfl_injury_return", "injury_return_curve", "injury_type position week_post_return:I "
      "avg_snap_pct_recovery:D median_snap_pct_recovery:D sample_size:I",
      lambda i, c: dict(injury_type=f"Inj {c}", position="WR", week_post_return=1,
@@ -627,7 +628,8 @@ def test_bad_limit_returns_error(page_db, spec, bad):
 
 @pytest.mark.parametrize("tool, list_key", [("nfl_roster", "players"), ("nfl_search_plays", "rows")])
 def test_default_limit_is_100(page_db, tool, list_key):
-    res = getattr(tools, tool)(season=2023)  # 120 matching rows in the fixture
+    kw = {"season_type": "ALL"} if tool == "nfl_search_plays" else {}
+    res = getattr(tools, tool)(season=2023, **kw)  # 120 matching rows in the fixture
     assert (len(res[list_key]), res["count"], res["truncated"]) == (100, 100, True)
 
 
@@ -666,7 +668,7 @@ def _mark(*marks):
 def test_real_snap_counts_kc_2024_first_page_truncated():
     direct = _real("SELECT COUNT(*) FROM snap_counts WHERE team='KC' AND season=2024")[0][0]
     assert direct > 500  # 933 in grpE_v3 (all game types)
-    res = tools.nfl_snap_counts(team="KC", season=2024, limit=500)
+    res = tools.nfl_snap_counts(team="KC", season=2024, limit=500, season_type="ALL")
     assert (res["count"], res["truncated"]) == (500, True)
 
 
@@ -675,8 +677,8 @@ def test_real_snap_counts_kc_2024_two_pages_cover_every_row_once():
     direct = _real("SELECT COUNT(DISTINCT (week, pfr_player_id)) , COUNT(*) FROM snap_counts "
                    "WHERE team='KC' AND season=2024")[0]
     assert direct[0] == direct[1]  # (week, pfr_player_id) is unique here
-    p1 = tools.nfl_snap_counts(team="KC", season=2024, limit=500)
-    p2 = tools.nfl_snap_counts(team="KC", season=2024, limit=500, offset=500)
+    p1 = tools.nfl_snap_counts(team="KC", season=2024, limit=500, season_type="ALL")
+    p2 = tools.nfl_snap_counts(team="KC", season=2024, limit=500, offset=500, season_type="ALL")
     assert (p2["count"], p2["truncated"]) == (direct[1] - 500, False)
     keys = [(r["week"], r["pfr_player_id"]) for r in p1["snap_counts"] + p2["snap_counts"]]
     assert len(keys) == len(set(keys)) == direct[1]
@@ -694,20 +696,19 @@ def test_real_roster_2024_truncation_matches_direct_count(team):
 
 
 @_mark(*integration)
-@pytest.mark.parametrize("season_type", [None, "REG", "POST"])
+@pytest.mark.parametrize("season_type", ["ALL", "REG", "POST"])
 def test_real_butker_kicker_field_goals_match_player_stats(season_type):
     gsis = _real("SELECT gsis_id FROM players WHERE display_name='Harrison Butker'")[0][0]
-    st = " AND season_type=?" if season_type else ""
-    extra = [season_type] if season_type else []
+    st = " AND season_type=?" if season_type != "ALL" else ""
+    extra = [season_type] if season_type != "ALL" else []
     # oracle c: field_goal rows with his kicker id; oracle b: official player_stats fg_att
     direct = _real("SELECT COUNT(*) FROM plays WHERE season=2024 AND play_type='field_goal' "
                    "AND kicker_player_id=?" + st, [gsis] + extra)[0][0]
     official = _real("SELECT SUM(fg_att) FROM player_stats WHERE season=2024 AND player_id=?" + st,
                      [gsis] + extra)[0][0]
     assert direct == official > 0
-    kw = {"season_type": season_type} if season_type else {}
     res = tools.nfl_search_plays(season=2024, player_role="kicker", player_id=gsis,
-                                 play_type="field_goal", limit=500, **kw)
+                                 play_type="field_goal", limit=500, season_type=season_type)
     assert res["count"] == direct
     assert all(r["play_type"] == "field_goal" for r in res["rows"])
 
@@ -718,7 +719,7 @@ def test_real_mahomes_passer_week1_matches_direct_count():
     direct = _real("SELECT COUNT(*) FROM plays WHERE season=2024 AND week=1 "
                    "AND passer_player_id=?", [gsis])[0][0]
     res = tools.nfl_search_plays(season=2024, week=1, player_role="passer", player_id=gsis,
-                                 limit=500)
+                                 limit=500, season_type="REG")
     assert res["count"] == direct > 0
     assert all(r["passer_player_id"] == gsis for r in res["rows"])
 
@@ -733,7 +734,7 @@ def test_real_schema_enum_equals_distinct_play_types():
 @_mark(*integration)
 @pytest.mark.parametrize("ptype", sorted(REAL_PLAY_TYPES))
 def test_real_play_type_accepted_and_exclusive(ptype):
-    res = tools.nfl_search_plays(season=2024, week=1, play_type=ptype, max_rows=5)
+    res = tools.nfl_search_plays(season=2024, week=1, play_type=ptype, max_rows=5, season_type="REG")
     assert "error" not in res and res["rows"]
     assert {r["play_type"] for r in res["rows"]} == {ptype}
 
@@ -762,14 +763,14 @@ def test_player_id_with_trimmed_players_table_is_used_as_given(plays_db):
 
 @_mark(*integration)
 def test_real_unknown_player_id_returns_unknown_player_id_error():
-    res = tools.nfl_search_plays(season=2024, player_id="00-9999999")
+    res = tools.nfl_search_plays(season=2024, player_id="00-9999999", season_type="REG")
     assert res.get("code") == "UNKNOWN_PLAYER_ID" and "rows" not in res
-    same = tools.nfl_player_stats(player_id="00-9999999", season=2024)
+    same = tools.nfl_player_stats(player_id="00-9999999", season=2024, season_type="REG")
     assert same.get("code") == res["code"]
 
 
 @_mark(*integration)
 def test_real_known_player_id_still_searches():
     gsis = _real("SELECT gsis_id FROM players WHERE display_name='Patrick Mahomes'")[0][0]
-    res = tools.nfl_search_plays(season=2024, week=1, player_id=gsis, player_role="passer", limit=5)
+    res = tools.nfl_search_plays(season=2024, week=1, player_id=gsis, player_role="passer", limit=5, season_type="REG")
     assert "error" not in res and res["rows"]

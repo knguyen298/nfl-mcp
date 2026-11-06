@@ -11,10 +11,11 @@ Interface contract
   right after full_name. The old keys stay.
 - nfl_injuries.season_type is the table value, else derived from game_type: REG is REG and
   WC, DIV, CON, SB are POST. (The 2024 rows have an empty season_type in the table.)
-- nfl_td_luck and nfl_drop_rate rows gain season_type (after season). Both take an optional
-  season_type: REG or POST, case-insensitive, None means both (the same default and
-  validation as nfl_search_plays and nfl_player_stats, which use _play_season_type). Any other
-  value is INVALID_ARGUMENT.
+- nfl_td_luck and nfl_drop_rate rows gain season_type (after season). v0.7.0: both require
+  season_type, exact upper case, one of REG, POST, ALL (ALL returns the REG rows and the POST
+  rows, one row per type). A missing value, lower case or any other value is INVALID_ARGUMENT
+  and lists the valid values. A database whose derived player tables lack season_type answers
+  STALE_DERIVED_TABLES ("run nfl-mcp upgrade") for every value.
 - ORDER BY has season_type DESC (REG first) before rowid.
 """
 
@@ -121,14 +122,14 @@ def test_injury_row_carries_gsis_id(real):
     assert _one(real, "SELECT gsis_id, report_status FROM injuries WHERE team='KC' AND "
                       "season=2024 AND week=18 AND full_name='Patrick Mahomes'") == [
         ("00-0033873", "Doubtful")]
-    res = tools.nfl_injuries(team="KC", season=2024, week=18, player="Mahomes")
+    res = tools.nfl_injuries(team="KC", season=2024, week=18, player="Mahomes", season_type="REG")
     assert [(r["gsis_id"], r["report_status"]) for r in res["injuries"]] == [
         ("00-0033873", "Doubtful")]
 
 
 @pytest.mark.integration
 def test_injury_keys_order(real):
-    res = tools.nfl_injuries(team="KC", season=2024, week=18, player="Mahomes")
+    res = tools.nfl_injuries(team="KC", season=2024, week=18, player="Mahomes", season_type="REG")
     assert list(res["injuries"][0]) == [
         "full_name", "gsis_id", "position", "team", "season", "week", "season_type",
         "report_primary_injury", "report_secondary_injury", "report_status",
@@ -142,7 +143,7 @@ def test_injury_season_type_from_table_when_present(full):
     #   tool reads game_type only: a 2024-only ingest has no season_type column at all.
     assert _one(full, "SELECT game_type FROM injuries WHERE season=2025 AND "
                       "week=19 AND team='BUF' AND full_name='Cam Lewis'") == [("WC",)]
-    res = tools.nfl_injuries(team="BUF", season=2025, week=19, player="Cam Lewis")
+    res = tools.nfl_injuries(team="BUF", season=2025, week=19, player="Cam Lewis", season_type="POST")
     assert [r["season_type"] for r in res["injuries"]] == ["POST"]
 
 
@@ -152,13 +153,13 @@ def test_injury_season_type_derived_when_table_is_null(real):
     #   AND full_name='Zay Flowers'  -> (NULL, 'DIV')  so the tool says POST
     assert _one(real, "SELECT game_type FROM injuries WHERE season=2024 AND "
                       "week=20 AND team='BAL' AND full_name='Zay Flowers'") == [("DIV",)]
-    res = tools.nfl_injuries(team="BAL", season=2024, week=20, player="Zay Flowers")
+    res = tools.nfl_injuries(team="BAL", season=2024, week=20, player="Zay Flowers", season_type="ALL")
     assert [r["season_type"] for r in res["injuries"]] == ["POST"]
     # SELECT season_type, game_type FROM injuries WHERE season=2024 AND week=9 AND team='KC'
     #   AND full_name='Patrick Mahomes'  -> (NULL, 'REG')  so the tool says REG
     assert _one(real, "SELECT game_type FROM injuries WHERE season=2024 AND "
                       "week=9 AND team='KC' AND full_name='Patrick Mahomes'") == [("REG",)]
-    res = tools.nfl_injuries(team="KC", season=2024, week=9, player="Mahomes")
+    res = tools.nfl_injuries(team="KC", season=2024, week=9, player="Mahomes", season_type="REG")
     assert [r["season_type"] for r in res["injuries"]] == ["REG"]
 
 
@@ -174,7 +175,7 @@ def test_injury_season_type_never_empty_and_matches_game_type(real):
     seen: dict[str, int] = {}
     offset = 0
     while True:
-        res = tools.nfl_injuries(season=2024, limit=500, offset=offset)
+        res = tools.nfl_injuries(season=2024, limit=500, offset=offset, season_type="ALL")
         for r in res["injuries"]:
             seen[r["season_type"]] = seen.get(r["season_type"], 0) + 1
         if not res["truncated"]:
@@ -198,7 +199,7 @@ def test_td_luck_player_has_both_season_types(real):
     #   AND season=2024 GROUP BY 1  -> POST 1, REG 1
     assert dict(_one(real, "SELECT season_type, count(*) FROM player_td_luck WHERE "
                            "player_id=? AND season=2024 GROUP BY 1", [STAFFORD])) == {"POST": 1, "REG": 1}
-    res = tools.nfl_td_luck(player_id=STAFFORD, season=2024)
+    res = tools.nfl_td_luck(player_id=STAFFORD, season=2024, season_type="ALL")
     got = {r["season_type"]: r["total_td_luck_score"] for r in res["td_luck"]}
     # SELECT season_type, total_td_luck_score FROM player_td_luck WHERE player_id='00-0026498'
     #   AND season=2024  -> POST -0.09, REG -0.52
@@ -208,7 +209,7 @@ def test_td_luck_player_has_both_season_types(real):
 
 @pytest.mark.integration
 def test_td_luck_rows_carry_season_type_key_after_season(real):
-    res = tools.nfl_td_luck(player_id=STAFFORD, season=2024)
+    res = tools.nfl_td_luck(player_id=STAFFORD, season=2024, season_type="REG")
     assert list(res["td_luck"][0]) == [
         "player_id", "full_name", "position", "team", "season", "season_type", "rec_td",
         "rec_td_exp", "rec_td_luck", "rush_td", "rush_td_exp", "rush_td_luck",
@@ -216,24 +217,24 @@ def test_td_luck_rows_carry_season_type_key_after_season(real):
 
 
 @pytest.mark.integration
-def test_td_luck_default_returns_both_types(real):
+def test_td_luck_all_returns_both_types(real):
     # SELECT count(*) FROM player_td_luck WHERE season=2024  -> 750 (REG 599, POST 151)
     assert _one(real, "SELECT count(*) FROM player_td_luck WHERE season=2024") == [(750,)]
     assert dict(_one(real, "SELECT season_type, count(*) FROM player_td_luck WHERE season=2024 "
                            "GROUP BY 1")) == {"REG": 599, "POST": 151}
-    res = tools.nfl_td_luck(season=2024, limit=500)
+    res = tools.nfl_td_luck(season=2024, limit=500, season_type="ALL")
     assert res["count"] == 500 and res["truncated"] is True
-    res = tools.nfl_td_luck(season=2024, limit=500, offset=500)
+    res = tools.nfl_td_luck(season=2024, limit=500, offset=500, season_type="ALL")
     assert res["count"] == 250 and res["truncated"] is False
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("value,expected", [
-    ("REG", 599), ("POST", 151), ("reg", 599), (" post ", 151)])
+    ("REG", 599), ("POST", 151)])
 def test_td_luck_season_type_filter(real, value, expected):
     # SELECT count(*) FROM player_td_luck WHERE season=2024 AND season_type='REG'   -> 599
     # SELECT count(*) FROM player_td_luck WHERE season=2024 AND season_type='POST'  -> 151
-    sql_value = value.strip().upper()
+    sql_value = value
     assert _one(real, "SELECT count(*) FROM player_td_luck WHERE season=2024 AND "
                       "season_type=?", [sql_value]) == [(expected,)]
     rows = _all_rows(tools.nfl_td_luck, "td_luck", season=2024, season_type=value)
@@ -261,9 +262,9 @@ def test_td_luck_order_is_stable_reg_before_post(full):
                                              "player_id=? ORDER BY total_td_luck_score ASC, season, "
                                              "season_type DESC", [STAFFORD])]
     assert expected == [(2025, "REG"), (2026, "REG"), (2024, "REG"), (2024, "POST"), (2025, "POST")]
-    first = tools.nfl_td_luck(player_id=STAFFORD)["td_luck"]
+    first = tools.nfl_td_luck(player_id=STAFFORD, season_type="ALL")["td_luck"]
     assert [(r["season"], r["season_type"]) for r in first] == expected
-    assert tools.nfl_td_luck(player_id=STAFFORD)["td_luck"] == first
+    assert tools.nfl_td_luck(player_id=STAFFORD, season_type="ALL")["td_luck"] == first
 
 
 @pytest.mark.integration
@@ -294,37 +295,37 @@ def test_drop_rate_player_has_both_season_types(full):
     #   AND season=2025  -> POST 5, REG 24
     assert dict(_one(full, "SELECT season_type, catchable_targets FROM player_drop_rate "
                            "WHERE player_id=? AND season=2025", [JUSZCZYK])) == {"POST": 5, "REG": 24}
-    res = tools.nfl_drop_rate(player_id=JUSZCZYK, season=2025)
+    res = tools.nfl_drop_rate(player_id=JUSZCZYK, season=2025, season_type="ALL")
     assert {r["season_type"]: r["catchable_targets"] for r in res["drop_rate"]} == {"POST": 5, "REG": 24}
     assert res["count"] == 2
 
 
 @pytest.mark.integration
 def test_drop_rate_rows_carry_season_type_key_after_season(full):
-    res = tools.nfl_drop_rate(player_id=JUSZCZYK, season=2025)
+    res = tools.nfl_drop_rate(player_id=JUSZCZYK, season=2025, season_type="REG")
     assert list(res["drop_rate"][0]) == [
         "player_id", "player", "team", "season", "season_type", "catchable_targets", "drops",
         "drop_rate_pct", "contested_targets", "created_receptions"]
 
 
 @pytest.mark.integration
-def test_drop_rate_default_returns_both_types(real):
+def test_drop_rate_all_returns_both_types(real):
     # SELECT count(*) FROM player_drop_rate WHERE season=2024  -> 602 (REG 486, POST 116)
     assert dict(_one(real, "SELECT season_type, count(*) FROM player_drop_rate WHERE season=2024 "
                            "GROUP BY 1")) == {"REG": 486, "POST": 116}
-    first = tools.nfl_drop_rate(season=2024, limit=500)
+    first = tools.nfl_drop_rate(season=2024, limit=500, season_type="ALL")
     assert first["count"] == 500 and first["truncated"] is True
-    second = tools.nfl_drop_rate(season=2024, limit=500, offset=500)
+    second = tools.nfl_drop_rate(season=2024, limit=500, offset=500, season_type="ALL")
     assert second["count"] == 102 and second["truncated"] is False
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("value,expected", [
-    ("REG", 486), ("POST", 116), ("Reg", 486), ("post", 116)])
+    ("REG", 486), ("POST", 116)])
 def test_drop_rate_season_type_filter(real, value, expected):
     # SELECT count(*) FROM player_drop_rate WHERE season=2024 AND season_type='REG'   -> 486
     # SELECT count(*) FROM player_drop_rate WHERE season=2024 AND season_type='POST'  -> 116
-    sql_value = value.upper()
+    sql_value = value
     assert _one(real, "SELECT count(*) FROM player_drop_rate WHERE season=2024 AND "
                       "season_type=?", [sql_value]) == [(expected,)]
     rows = _all_rows(tools.nfl_drop_rate, "drop_rate", season=2024, season_type=value)
@@ -351,7 +352,7 @@ def test_drop_rate_order_is_stable_reg_before_post(full):
                                              "WHERE player_id=? ORDER BY drop_rate_pct DESC NULLS "
                                              "LAST, season, season_type DESC", [JUSZCZYK])]
     assert expected == [(2024, "REG"), (2025, "REG"), (2025, "POST"), (2026, "REG")]
-    rows = tools.nfl_drop_rate(player_id=JUSZCZYK)["drop_rate"]
+    rows = tools.nfl_drop_rate(player_id=JUSZCZYK, season_type="ALL")["drop_rate"]
     assert [(r["season"], r["season_type"]) for r in rows] == expected
 
 
@@ -369,12 +370,13 @@ def test_drop_rate_paging_with_season_type(full):
 # ── 5. invalid season_type (no database needed) ───────────────────────────────
 
 @pytest.mark.parametrize("tool", [tools.nfl_td_luck, tools.nfl_drop_rate])
-@pytest.mark.parametrize("value", ["SB", "ALL", "bogus", "", 7])
+@pytest.mark.parametrize("value", ["SB", "WC", "bogus", "", 7, "reg", "Post", " REG ", None])
 def test_invalid_season_type_is_invalid_argument(tool, value, monkeypatch, tmp_path):
+    # Checked before any database read: the file does not exist.
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(tmp_path / "missing.duckdb"))
     res = tool(season=2024, season_type=value)
     assert res["code"] == "INVALID_ARGUMENT"
-    assert "season_type" in res["error"] and "REG or POST" in res["error"]
+    assert "season_type" in res["error"] and "REG, POST, ALL" in res["error"]
 
 
 # ── 6. schema, descriptions and discovery facts ───────────────────────────────
@@ -386,8 +388,9 @@ def _tool(name):
 @pytest.mark.parametrize("name", ["nfl_td_luck", "nfl_drop_rate"])
 def test_schema_has_season_type_enum_without_default(name):
     prop = _tool(name).inputSchema["properties"]["season_type"]
-    assert prop["enum"] == ["REG", "POST"]
+    assert prop["enum"] == ["REG", "POST", "ALL"]
     assert "default" not in prop
+    assert "season_type" in _tool(name).inputSchema["required"]
 
 
 @pytest.mark.parametrize("name", ["nfl_td_luck", "nfl_drop_rate"])
@@ -440,26 +443,15 @@ def stale_db(tmp_path, monkeypatch):
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))
 
 
-def test_stale_td_luck_default_answers_with_warning(stale_db):
-    res = tools.nfl_td_luck(season=2024)
-    assert [r["player_id"] for r in res["td_luck"]] == ["00-0000002", "00-0000001"]
-    assert all("season_type" not in r for r in res["td_luck"])
-    assert "nfl-mcp rebuild" in res["warning"]
-
-
-def test_stale_drop_rate_default_answers_with_warning(stale_db):
-    res = tools.nfl_drop_rate(season=2024)
-    assert [r["player_id"] for r in res["drop_rate"]] == ["00-0000001", "00-0000002"]
-    assert all("season_type" not in r for r in res["drop_rate"])
-    assert "nfl-mcp rebuild" in res["warning"]
-
-
-@pytest.mark.parametrize("tool", [tools.nfl_td_luck, tools.nfl_drop_rate])
-@pytest.mark.parametrize("value", ["REG", "POST"])
-def test_stale_tables_refuse_a_named_season_type(stale_db, tool, value):
+@pytest.mark.parametrize("tool,key", [(tools.nfl_td_luck, "td_luck"),
+                                      (tools.nfl_drop_rate, "drop_rate")])
+@pytest.mark.parametrize("value", ["REG", "POST", "ALL"])
+def test_stale_tables_refuse_every_season_type(stale_db, tool, key, value):
+    # Rows without a season_type would blend REG and POST, so no rows come back at all.
     res = tool(season=2024, season_type=value)
     assert res["code"] == "STALE_DERIVED_TABLES"
-    assert "nfl-mcp rebuild" in res["error"]
+    assert "nfl-mcp upgrade" in res["error"]
+    assert key not in res
 
 
 def test_stale_fallback_does_not_hide_other_binder_errors(tmp_path, monkeypatch):
@@ -467,8 +459,9 @@ def test_stale_fallback_does_not_hide_other_binder_errors(tmp_path, monkeypatch)
 
     path = tmp_path / "broken.duckdb"
     con = duckdb.connect(str(path))
-    con.execute("CREATE TABLE player_td_luck (player_id VARCHAR, season INTEGER)")
+    # season_type is there; full_name is not. That is a broken table, not a stale one.
+    con.execute("CREATE TABLE player_td_luck (player_id VARCHAR, season INTEGER, season_type VARCHAR)")
     con.close()
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))
-    res = tools.nfl_td_luck(season=2024)
-    assert "full_name" in res["error"] and "warning" not in res
+    res = tools.nfl_td_luck(season=2024, season_type="REG")
+    assert "full_name" in res["error"] and res.get("code") != "STALE_DERIVED_TABLES"

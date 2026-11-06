@@ -1031,7 +1031,8 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
     """),
 
     # 2. Rolling 3-week role trend — snap / target / carry / air-yards share with
-    #    a trailing 3-week average and the current-week delta vs that average.
+    #    a trailing 3-week average and the current-week delta vs that average. The window
+    #    runs inside one season_type, so a playoff average never reaches into REG weeks.
     #    Snap counts join through players.gsis_id -> players.pfr_id -> snap_counts.pfr_player_id.
     ("player_role_trend", ["ff_opportunity", "snap_counts", "players"], """
         WITH base AS (
@@ -1041,12 +1042,13 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
                 o.position,
                 o.posteam                                   AS team,
                 CAST(o.season AS INTEGER)                   AS season,
+                o.season_type,
                 CAST(o.week AS INTEGER)                      AS week,
                 ROUND(100.0 * s.offense_pct, 2)             AS snap_pct,
                 ROUND(100.0 * o.rec_attempt  / NULLIF(o.rec_attempt_team, 0), 2)   AS target_share_pct,
                 ROUND(100.0 * o.rush_attempt / NULLIF(o.rush_attempt_team, 0), 2)  AS carry_share_pct,
                 ROUND(100.0 * o.rec_air_yards / NULLIF(o.rec_air_yards_team, 0), 2) AS air_yards_share_pct
-            FROM ff_opportunity o
+            FROM {ff_typed} o
             LEFT JOIN (
                 SELECT gsis_id, MAX(pfr_id) AS pfr_id
                 FROM players
@@ -1060,7 +1062,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
             WHERE o.player_id IS NOT NULL
         )
         SELECT
-            player_id, full_name, position, team, season, week,
+            player_id, full_name, position, team, season, season_type, week,
             snap_pct, target_share_pct, carry_share_pct, air_yards_share_pct,
             ROUND(AVG(snap_pct)            OVER w, 2) AS snap_pct_3wk,
             ROUND(AVG(target_share_pct)    OVER w, 2) AS target_share_pct_3wk,
@@ -1071,22 +1073,24 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
             ROUND(carry_share_pct     - AVG(carry_share_pct)     OVER w, 2) AS carry_share_pct_delta,
             ROUND(air_yards_share_pct - AVG(air_yards_share_pct) OVER w, 2) AS air_yards_share_pct_delta
         FROM base
-        WINDOW w AS (PARTITION BY player_id, season ORDER BY week ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+        WINDOW w AS (PARTITION BY player_id, season, season_type ORDER BY week ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
     """),
 
     # 3. Separation-adjusted opportunity — joins Next Gen Stats receiving (2016+) to
     #    fantasy opportunity to flag separation-creators who underproduced (regression up).
+    #    One row per player, season and season_type; Next Gen Stats rows join on the same type.
     ("player_separation_opportunity", ["ff_opportunity", "nextgen_stats_receiving"], """
         WITH ng AS (
             SELECT
                 player_gsis_id,
                 season,
+                season_type,
                 AVG(avg_separation)              AS avg_separation,
                 AVG(avg_yac_above_expectation)   AS avg_yac_above_expectation,
                 AVG(catch_percentage)            AS catch_percentage
             FROM nextgen_stats_receiving
             WHERE week > 0 AND player_gsis_id IS NOT NULL
-            GROUP BY player_gsis_id, season
+            GROUP BY player_gsis_id, season, season_type
         ),
         opp AS (
             SELECT
@@ -1095,6 +1099,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
                 ANY_VALUE(position)    AS position,
                 ANY_VALUE(posteam)     AS team,
                 CAST(season AS INTEGER) AS season,
+                season_type,
                 COUNT(DISTINCT week)   AS games,
                 SUM(total_fantasy_points_diff) AS fp_diff,
                 ROUND(SUM(total_fantasy_points_diff) / NULLIF(COUNT(DISTINCT week), 0), 3) AS fp_diff_per_game,
@@ -1102,12 +1107,12 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
                 ROUND(SUM(receptions_diff), 3)    AS catch_luck,
                 ROUND(100.0 * SUM(rec_attempt)  / NULLIF(SUM(rec_attempt_team), 0), 2)  AS target_share_pct,
                 ROUND(100.0 * SUM(rec_air_yards) / NULLIF(SUM(rec_air_yards_team), 0), 2) AS air_yards_share_pct
-            FROM ff_opportunity
+            FROM {ff_typed}
             WHERE player_id IS NOT NULL
-            GROUP BY player_id, CAST(season AS INTEGER)
+            GROUP BY player_id, CAST(season AS INTEGER), season_type
         )
         SELECT
-            opp.player_id, opp.full_name, opp.position, opp.team, opp.season,
+            opp.player_id, opp.full_name, opp.position, opp.team, opp.season, opp.season_type,
             opp.games, opp.fp_diff, opp.fp_diff_per_game, opp.td_luck, opp.catch_luck,
             opp.target_share_pct, opp.air_yards_share_pct,
             ROUND(ng.avg_separation, 3)            AS avg_separation,
@@ -1116,6 +1121,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
             (ng.avg_separation > 2.5 AND opp.fp_diff_per_game < -1.5 AND opp.td_luck < -1.0) AS regression_candidate
         FROM opp
         JOIN ng ON ng.player_gsis_id = opp.player_id AND ng.season = opp.season
+                      AND ng.season_type = opp.season_type
     """),
 
     # 4. Drop rate — catchable-target drop rate from FTN charting (2022+) joined to plays.
@@ -1143,7 +1149,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
 
     # 5. Contract value efficiency — fantasy points per $M of average per year (APY),
     #    using the contract in force that season: the latest year_signed <= season,
-    #    ties broken by the larger APY.
+    #    ties broken by the larger APY. One row per player, season and season_type.
     ("player_contract_value", ["contracts", "ff_opportunity"], """
         WITH opp AS (
             SELECT
@@ -1152,11 +1158,12 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
                 ANY_VALUE(position)    AS position,
                 ANY_VALUE(posteam)     AS team,
                 CAST(season AS INTEGER) AS season,
+                season_type,
                 SUM(total_fantasy_points)     AS total_fp,
                 SUM(total_fantasy_points_exp) AS total_fp_exp
-            FROM ff_opportunity
+            FROM {ff_typed}
             WHERE player_id IS NOT NULL
-            GROUP BY player_id, CAST(season AS INTEGER)
+            GROUP BY player_id, CAST(season AS INTEGER), season_type
         ),
         ranked AS (
             SELECT
@@ -1165,7 +1172,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
                 c.apy          AS apy,
                 c.apy_cap_pct  AS cap_pct,
                 ROW_NUMBER() OVER (
-                    PARTITION BY opp.player_id, opp.season
+                    PARTITION BY opp.player_id, opp.season, opp.season_type
                     ORDER BY c.year_signed DESC, c.apy DESC NULLS LAST, c.apy_cap_pct DESC NULLS LAST
                 ) AS rn
             FROM opp
@@ -1179,6 +1186,7 @@ _FANTASY_TABLES: list[tuple[str, list[str], str]] = [
             COALESCE(position, contract_position) AS position,
             team,
             season,
+            season_type,
             ROUND(apy, 4)       AS apy,
             ROUND(cap_pct, 4)   AS cap_pct,
             ROUND(total_fp, 2)     AS total_fp,

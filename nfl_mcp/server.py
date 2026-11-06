@@ -172,6 +172,33 @@ def _log_call(name: str, arguments: dict, started: float, result: Any, failure: 
     logger.info(" ".join(parts))
 
 
+# season_type is required in every tool that has season-type data, with no default. Season-total
+# tools take REG, POST or ALL; per-game tools also take one playoff round. The tool code checks
+# the value again, so a client that skips the schema check gets the same error.
+def _season_type_property(rounds: bool) -> dict[str, Any]:
+    if rounds:
+        return {
+            "type": "string",
+            "enum": ["REG", "POST", "ALL", "WC", "DIV", "CON", "SB"],
+            "description": (
+                "Required, no default. Exact upper-case value: REG (regular season), POST (all "
+                "four playoff rounds), ALL (the REG rows and the POST rows, one row per season "
+                "type, each labeled season_type, never combined) or one round: WC (wild card), "
+                "DIV (divisional), CON (conference), SB (Super Bowl)."
+            ),
+        }
+    return {
+        "type": "string",
+        "enum": ["REG", "POST", "ALL"],
+        "description": (
+            "Required, no default. Exact upper-case value: REG (regular season), POST "
+            "(playoffs) or ALL (the REG rows and the POST rows, one row per season type, each "
+            "labeled season_type, never combined). Playoff rounds (WC, DIV, CON, SB) are not "
+            "valid here."
+        ),
+    }
+
+
 TOOLS = [
     Tool(
         name="nfl_schema",
@@ -310,11 +337,7 @@ TOOLS = [
                     "type": "integer",
                     "description": "Week number (1-22)",
                 },
-                "season_type": {
-                    "type": "string",
-                    "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Playoff rounds (WC, DIV, CON, SB) are not valid here.",
-                },
+                "season_type": _season_type_property(True),
                 "play_type": {
                     "type": "string",
                     "enum": ["pass", "run", "field_goal", "punt", "kickoff", "extra_point",
@@ -390,6 +413,7 @@ TOOLS = [
                     "maximum": 500,
                 },
             },
+            "required": ["season_type"],
         },
     ),
     Tool(
@@ -424,17 +448,9 @@ TOOLS = [
                     "description": "Which stats to return (default: both offense + defense + situational)",
                     "default": "both",
                 },
-                "season_type": {
-                    "type": "string",
-                    "enum": ["REG", "POST", "ALL"],
-                    "description": (
-                        "REG (regular season, default), POST (playoffs), or ALL for both "
-                        "(one row per season and season type, never summed together)"
-                    ),
-                    "default": "REG",
-                },
+                "season_type": _season_type_property(False),
             },
-            "required": ["team"],
+            "required": ["team", "season_type"],
         },
     ),
     Tool(
@@ -485,19 +501,20 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "player_name": {
+                "player": {
                     "type": "string",
                     "description": (
                         "Player name, e.g. 'Patrick Mahomes' or 'Mahomes', or a gsis_id such as "
                         "'00-0034857'. With `season` set, only players on a roster that season "
-                        "are considered. Ignored when player_id is given."
+                        "are considered. Ignored when player_id is given. Give player or "
+                        "player_id; a call with neither is an error."
                     ),
                 },
                 "player_id": {
                     "type": "string",
                     "description": (
                         "Player gsis_id, e.g. '00-0034857' (from nfl_player_lookup). "
-                        "Takes precedence over player_name."
+                        "Takes precedence over player."
                     ),
                 },
                 "season": {
@@ -512,44 +529,43 @@ TOOLS = [
                     "type": "integer",
                     "description": "End of season range (inclusive)",
                 },
-                "season_type": {
-                    "type": "string",
-                    "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Omit for one row per type. Playoff rounds (WC, DIV, CON, SB) are not valid here.",
-                },
+                "season_type": _season_type_property(False),
                 "stat_type": {
                     "type": "string",
                     "enum": ["passing", "rushing", "receiving"],
                     "description": "Return only this block (default: all three).",
                 },
             },
-            "required": ["player_name"],
+            "required": ["season_type"],
         },
     ),
     Tool(
         name="nfl_compare",
         description=(
             "PREFERRED for any comparison question. Side-by-side stats for two teams "
-            "or two players in a single call. Always use this instead of calling "
+            "or two players in a single call: pass player1 and player2, or team1 and team2 "
+            "(one pair per call). Always use this instead of calling "
             "nfl_team_stats or nfl_player_stats twice when the user asks to compare, "
             "rank, or contrast two teams or two players against each other."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "entity1": {
+                "player1": {
                     "type": "string",
-                    "description": "First team abbreviation or player name. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
+                    "description": "First player: a name or a gsis_id. Use with player2; do not mix with team1 or team2.",
                 },
-                "entity2": {
+                "player2": {
                     "type": "string",
-                    "description": "Second team abbreviation or player name. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work.",
+                    "description": "Second player: a name or a gsis_id. Use with player1; do not mix with team1 or team2.",
                 },
-                "compare_type": {
+                "team1": {
                     "type": "string",
-                    "enum": ["team", "player"],
-                    "description": "Whether comparing teams or players (default: team)",
-                    "default": "team",
+                    "description": "First team abbreviation. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work. Use with team2; do not mix with player1 or player2.",
+                },
+                "team2": {
+                    "type": "string",
+                    "description": "Second team abbreviation. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work. Use with team1; do not mix with player1 or player2.",
                 },
                 "season": {
                     "type": "integer",
@@ -563,17 +579,9 @@ TOOLS = [
                     "type": "integer",
                     "description": "End of season range (inclusive)",
                 },
-                "season_type": {
-                    "type": "string",
-                    "enum": ["REG", "POST"],
-                    "description": (
-                        "Filter by season type: REG (regular season) or POST (playoffs). "
-                        "Team mode defaults to REG; a team with no rows for the filter "
-                        "returns empty lists and a reason."
-                    ),
-                },
+                "season_type": _season_type_property(False),
             },
-            "required": ["entity1", "entity2"],
+            "required": ["season_type"],
         },
     ),
     Tool(
@@ -642,7 +650,9 @@ TOOLS = [
                     "type": "string",
                     "description": "Injury designation: 'Out', 'Questionable', 'Doubtful', 'Full Participation In Practice'",
                 },
+                "season_type": _season_type_property(True),
             },
+            "required": ["season_type"],
         },
     ),
     Tool(
@@ -667,15 +677,9 @@ TOOLS = [
                     "type": "integer",
                     "description": "Week number (1–22).",
                 },
-                "season_type": {
-                    "type": "string",
-                    "enum": ["REG", "POST", "WC", "DIV", "CON", "SB"],
-                    "description": (
-                        "Season type filter: REG, POST (all four playoff rounds), or one round: "
-                        "WC (wild card), DIV (divisional), CON (conference), SB (Super Bowl)."
-                    ),
-                },
+                "season_type": _season_type_property(True),
             },
+            "required": ["season_type"],
         },
     ),
     Tool(
@@ -715,15 +719,9 @@ TOOLS = [
                     "type": "string",
                     "description": "Position filter (e.g. TE, WR, CB).",
                 },
-                "season_type": {
-                    "type": "string",
-                    "enum": ["REG", "POST", "WC", "DIV", "CON", "SB"],
-                    "description": (
-                        "Season type filter: REG, POST (all four playoff rounds), or one round: "
-                        "WC (wild card), DIV (divisional), CON (conference), SB (Super Bowl)."
-                    ),
-                },
+                "season_type": _season_type_property(True),
             },
+            "required": ["season_type"],
         },
     ),
     Tool(
@@ -764,7 +762,9 @@ TOOLS = [
                     "type": "string",
                     "description": "Position filter (e.g. WR, RB, TE).",
                 },
+                "season_type": _season_type_property(True),
             },
+            "required": ["season_type"],
         },
     ),
     Tool(
@@ -859,12 +859,9 @@ TOOLS = [
                     "type": "integer",
                     "description": "Week number (1–22).",
                 },
-                "season_type": {
-                    "type": "string",
-                    "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG or POST. Playoff rounds (WC, DIV, CON, SB) are not valid here.",
-                },
+                "season_type": _season_type_property(True),
             },
+            "required": ["season_type"],
         },
     ),
     Tool(
@@ -885,13 +882,10 @@ TOOLS = [
                 "position": {"type": "string", "description": "Position filter (e.g. WR, RB, TE)."},
                 "team": {"type": "string", "description": "Team abbreviation (e.g. KC). Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work."},
                 "season": {"type": "integer", "description": "Exact season year."},
-                "season_type": {
-                    "type": "string",
-                    "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Omit for both; each row says which it is.",
-                },
+                "season_type": _season_type_property(False),
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
             },
+            "required": ["season_type"],
         },
     ),
     Tool(
@@ -913,8 +907,10 @@ TOOLS = [
                 "season": {"type": "integer", "description": "Exact season year."},
                 "week": {"type": "integer", "description": "Week number."},
                 "min_snap_pct": {"type": "number", "description": "Minimum snap % (0–100) for the week."},
+                "season_type": _season_type_property(True),
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
             },
+            "required": ["season_type"],
         },
     ),
     Tool(
@@ -938,8 +934,10 @@ TOOLS = [
                     "type": "boolean",
                     "description": "If true, only return flagged positive-regression candidates.",
                 },
+                "season_type": _season_type_property(False),
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
             },
+            "required": ["season_type"],
         },
     ),
     Tool(
@@ -958,14 +956,11 @@ TOOLS = [
                 "player_id": {"type": "string", "description": "Player gsis_id (from nfl_player_lookup). Takes precedence over a name."},
                 "team": {"type": "string", "description": "Team abbreviation. Case-insensitive; historical codes (OAK, SD, STL, JAC, WSH) also work."},
                 "season": {"type": "integer", "description": "Exact season year (2022+)."},
-                "season_type": {
-                    "type": "string",
-                    "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs). Omit for both; each row says which it is.",
-                },
+                "season_type": _season_type_property(False),
                 "min_targets": {"type": "integer", "description": "Minimum catchable targets to qualify."},
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
             },
+            "required": ["season_type"],
         },
     ),
     Tool(
@@ -987,8 +982,10 @@ TOOLS = [
                 "season": {"type": "integer", "description": "Exact season year."},
                 "min_apy": {"type": "number", "description": "Minimum APY in $millions."},
                 "max_apy": {"type": "number", "description": "Maximum APY in $millions."},
+                "season_type": _season_type_property(False),
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
             },
+            "required": ["season_type"],
         },
     ),
     Tool(

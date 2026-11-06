@@ -8,6 +8,8 @@ must hold adds a step here and raises SCHEMA_VERSION.
 
 Version 1 is the shape after groups D, E and F: season_type and the new columns on the
 derived tables, a season on every depth_charts row, and every REQUIRED_COLUMNS table.
+Version 2 (v0.7.0) adds season_type to player_role_trend, player_separation_opportunity and
+player_contract_value. The derived_tables step rebuilds them from local raw tables.
 """
 
 import datetime
@@ -20,7 +22,7 @@ from .required_columns import REQUIRED_COLUMNS
 
 logger = logging.getLogger("nfl-mcp")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _VERSION_DDL = (
     "CREATE TABLE IF NOT EXISTS _schema_version "

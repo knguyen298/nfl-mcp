@@ -81,16 +81,22 @@ ID_FIELDS = {
     "nfl_team_records": "team",
 }
 MIN_ARGS = {
-    "nfl_query": {"sql": "SELECT 1 AS a"}, "nfl_search_plays": {"team": "KC", "season": 2024},
-    "nfl_team_stats": {"team": "KC", "season": 2024},
-    "nfl_player_stats": {"player_name": "P.Mahomes", "season": 2024},
-    "nfl_compare": {"entity1": "KC", "entity2": "BUF", "season": 2024},
-    "nfl_roster": {"team": "KC", "season": 2024}, "nfl_injuries": {"team": "KC", "season": 2024},
-    "nfl_schedule": {"team": "KC", "season": 2024}, "nfl_snap_counts": {"team": "KC", "season": 2024},
-    "nfl_fantasy_opportunity": {"team": "KC", "season": 2024},
-    "nfl_ftn_charting": {"team": "KC", "season": 2024}, "nfl_td_luck": {"season": 2024},
-    "nfl_role_trend": {"season": 2024}, "nfl_separation_opportunity": {"season": 2024},
-    "nfl_drop_rate": {"season": 2024}, "nfl_contract_value": {"season": 2024},
+    "nfl_query": {"sql": "SELECT 1 AS a"},
+    "nfl_search_plays": {"team": "KC", "season": 2024, "season_type": "ALL"},
+    "nfl_team_stats": {"team": "KC", "season": 2024, "season_type": "ALL"},
+    "nfl_player_stats": {"player": "P.Mahomes", "season": 2024, "season_type": "ALL"},
+    "nfl_compare": {"team1": "KC", "team2": "BUF", "season": 2024, "season_type": "ALL"},
+    "nfl_roster": {"team": "KC", "season": 2024},
+    "nfl_injuries": {"team": "KC", "season": 2024, "season_type": "ALL"},
+    "nfl_schedule": {"team": "KC", "season": 2024, "season_type": "ALL"},
+    "nfl_snap_counts": {"team": "KC", "season": 2024, "season_type": "ALL"},
+    "nfl_fantasy_opportunity": {"team": "KC", "season": 2024, "season_type": "ALL"},
+    "nfl_ftn_charting": {"team": "KC", "season": 2024, "season_type": "ALL"},
+    "nfl_td_luck": {"season": 2024, "season_type": "ALL"},
+    "nfl_role_trend": {"season": 2024, "season_type": "ALL"},
+    "nfl_separation_opportunity": {"season": 2024, "season_type": "ALL"},
+    "nfl_drop_rate": {"season": 2024, "season_type": "ALL"},
+    "nfl_contract_value": {"season": 2024, "season_type": "ALL"},
     "nfl_team_records": {"team": "KC", "season": 2024}, "nfl_player_lookup": {"name": "Mahomes"},
 }
 DERIVED = ["team_offense_stats", "team_defense_stats", "situational_stats", "formation_effectiveness"]
@@ -394,8 +400,8 @@ def test_data_as_of_present_on_real_db(real_db, name):
 
 
 @pytest.mark.parametrize("name,args,expected", [
-    ("nfl_schedule", {"season": 2025}, SCHEDULES_MAX),  # schedules only: 08:00:05, not global 12:30
-    ("nfl_schedule", {"team": "KC"}, SCHEDULES_MAX),
+    ("nfl_schedule", {"season": 2025, "season_type": "ALL"}, SCHEDULES_MAX),  # schedules only: 08:00:05, not global 12:30
+    ("nfl_schedule", {"team": "KC", "season_type": "ALL"}, SCHEDULES_MAX),
     ("nfl_status", {}, GLOBAL_MAX),  # reads everything
 ])
 def test_data_as_of_equals_max_loaded_at_of_tables_read(synth, name, args, expected):
@@ -405,7 +411,7 @@ def test_data_as_of_equals_max_loaded_at_of_tables_read(synth, name, args, expec
 @pytest.mark.integration
 def test_data_as_of_schedule_real_db(real_db):
     want = real_db.execute("SELECT MAX(loaded_at) FROM _ingest_metadata WHERE table_name='schedules'").fetchone()[0]
-    assert _as_utc_naive(tools.nfl_schedule(team="KC", season=2024).get("data_as_of")) == want
+    assert _as_utc_naive(tools.nfl_schedule(team="KC", season=2024, season_type="REG").get("data_as_of")) == want
 
 
 class _SpyConn:
@@ -464,10 +470,10 @@ def test_data_as_of_changes_after_symlink_swap(tmp_path, monkeypatch):
     link = tmp_path / "live.duckdb"
     link.symlink_to(a)
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(link))
-    assert _as_utc_naive(tools.nfl_schedule().get("data_as_of")) == SCHEDULES_MAX
+    assert _as_utc_naive(tools.nfl_schedule(season_type="REG").get("data_as_of")) == SCHEDULES_MAX
     link.unlink()
     link.symlink_to(b)  # the container's A/B swap repoints the same path
-    assert _as_utc_naive(tools.nfl_schedule().get("data_as_of")) == SCHEDULES_MAX + dt.timedelta(hours=2)
+    assert _as_utc_naive(tools.nfl_schedule(season_type="REG").get("data_as_of")) == SCHEDULES_MAX + dt.timedelta(hours=2)
 
 
 # ── 4. nfl_status per dataset ─────────────────────────────────────────────────
@@ -530,7 +536,7 @@ def test_no_tool_declares_output_schema():
     assert not bad, bad
 
 
-@pytest.mark.parametrize("name,args", [("nfl_status", {}), ("nfl_schedule", {"season": 2025})])
+@pytest.mark.parametrize("name,args", [("nfl_status", {}), ("nfl_schedule", {"season": 2025, "season_type": "ALL"})])
 def test_call_tool_structured_content_matches_text(synth, name, args):
     res = _handle(types.CallToolRequest(method="tools/call",
                                         params=types.CallToolRequestParams(name=name, arguments=args)))
@@ -767,10 +773,10 @@ def test_data_as_of_empty_result_is_cached(tmp_path, monkeypatch):
     log: list[str] = []
     real_connect = duckdb.connect
     monkeypatch.setattr(duckdb, "connect", lambda *a, **k: _SpyConn(real_connect(*a, **k), log))
-    assert "data_as_of" not in tools.nfl_schedule(season=2024)
+    assert "data_as_of" not in tools.nfl_schedule(season=2024, season_type="REG")
     assert any("_ingest_metadata" in s for s in log)
     log.clear()
-    assert "data_as_of" not in tools.nfl_schedule(season=2024)
+    assert "data_as_of" not in tools.nfl_schedule(season=2024, season_type="REG")
     assert not [s for s in log if "_ingest_metadata" in s], log
 
 

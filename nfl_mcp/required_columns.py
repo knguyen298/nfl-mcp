@@ -41,7 +41,7 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
     ],
     # nfl_injuries
     "injuries": [
-        "full_name", "position", "team", "season", "week", "report_primary_injury",
+        "full_name", "position", "team", "season", "week", "game_type", "report_primary_injury",
         "report_secondary_injury", "report_status", "practice_primary_injury",
         "practice_secondary_injury", "practice_status",
     ],
@@ -66,9 +66,9 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
     "situational_stats": [
         "team", "season_year", "season_type", "situation", "conversion_rule",
     ],
-    # nfl_fantasy_opportunity
+    # nfl_fantasy_opportunity (the round comes from schedules through game_id)
     "ff_opportunity": [
-        "season", "week", "posteam", "full_name", "position", "player_id", "rec_attempt",
+        "season", "week", "game_id", "posteam", "full_name", "position", "player_id", "rec_attempt",
         "rush_attempt", "rec_air_yards", "receptions", "receptions_exp",
         "rec_yards_gained", "rush_yards_gained", "rec_touchdown", "rush_touchdown",
         "total_fantasy_points", "total_fantasy_points_exp", "total_fantasy_points_diff",
@@ -96,14 +96,14 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
         "rec_td_luck", "rush_td", "rush_td_exp", "rush_td_luck", "total_td_luck_score",
     ],
     "player_role_trend": [
-        "player_id", "full_name", "position", "team", "season", "week", "snap_pct",
+        "player_id", "full_name", "position", "team", "season", "season_type", "week", "snap_pct",
         "target_share_pct", "carry_share_pct", "air_yards_share_pct", "snap_pct_3wk",
         "target_share_pct_3wk", "carry_share_pct_3wk", "air_yards_share_pct_3wk",
         "snap_pct_delta", "target_share_pct_delta", "carry_share_pct_delta",
         "air_yards_share_pct_delta",
     ],
     "player_separation_opportunity": [
-        "player_id", "full_name", "position", "team", "season", "games", "fp_diff",
+        "player_id", "full_name", "position", "team", "season", "season_type", "games", "fp_diff",
         "fp_diff_per_game", "td_luck", "catch_luck", "target_share_pct",
         "air_yards_share_pct", "avg_separation", "avg_yac_above_expectation",
         "catch_percentage", "regression_candidate",
@@ -113,7 +113,7 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
         "drop_rate_pct", "contested_targets", "created_receptions",
     ],
     "player_contract_value": [
-        "player_id", "full_name", "position", "team", "season", "apy", "cap_pct",
+        "player_id", "full_name", "position", "team", "season", "season_type", "apy", "cap_pct",
         "total_fp", "total_fp_exp", "fp_per_million",
     ],
     "injury_return_curve": [

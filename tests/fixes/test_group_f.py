@@ -41,7 +41,7 @@ Interface contract (beyond the shared brief)
 * player_contract_value: contract in force = latest year_signed <= season (ties: max apy).
 * player_role_trend, injury_return_curve: snap_counts joined via players.gsis_id -> players.pfr_id ->
   snap_counts.pfr_player_id, not by name.
-* nfl_team_stats(..., season_type="REG") filters by season_type; nfl_compare(compare_type="team",
+* nfl_team_stats(..., season_type="REG") filters by season_type; nfl_compare(team1, team2,
   season_type=...) filters too. A team with no rows for the filter gets
   {"offense": [], "defense": [], "reason": str} under its key.
 """
@@ -621,7 +621,7 @@ def test_team_stats_tool_filters_season_type_synthetic(tool_db, season_type, tou
 
 
 def test_compare_team_post_empty_for_non_playoff_team_synthetic(tool_db):
-    res = tools.nfl_compare("KC", "CLE", compare_type="team", season=2024, season_type="POST")
+    res = tools.nfl_compare(team1="KC", team2="CLE", season=2024, season_type="POST")
     assert [r["season_type"] for r in res["KC"]["offense"]] == ["POST"]
     assert res["CLE"]["offense"] == [] and res["CLE"].get("reason")  # CLE has no POST plays
 
@@ -700,8 +700,8 @@ def _no_playoff_team_2024(conn):
 
 @pytest.mark.integration
 def test_compare_team_post_differs_from_reg_kc(real):
-    reg = tools.nfl_compare("KC", "DET", compare_type="team", season=2024, season_type="REG")
-    post = tools.nfl_compare("KC", "DET", compare_type="team", season=2024, season_type="POST")
+    reg = tools.nfl_compare(team1="KC", team2="DET", season=2024, season_type="REG")
+    post = tools.nfl_compare(team1="KC", team2="DET", season=2024, season_type="POST")
     assert post["KC"]["offense"][0]["pass_attempts"] == _official(real, "KC", "POST")["pass_attempts"]
     assert post["KC"]["offense"][0]["pass_attempts"] != reg["KC"]["offense"][0]["pass_attempts"]
 
@@ -709,7 +709,7 @@ def test_compare_team_post_differs_from_reg_kc(real):
 @pytest.mark.integration
 def test_compare_team_post_empty_with_reason_for_non_playoff_team(real):
     other = _no_playoff_team_2024(real)  # derived from schedules, not from the tool
-    res = tools.nfl_compare("KC", other, compare_type="team", season=2024, season_type="POST")
+    res = tools.nfl_compare(team1="KC", team2=other, season=2024, season_type="POST")
     assert res["KC"]["offense"]
     assert res[other]["offense"] == [] and res[other].get("reason")
 
@@ -729,11 +729,11 @@ def stale_db(tmp_path, monkeypatch):
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))
 
 
-def test_stale_tables_default_reg_returns_rows_with_warning(stale_db):
-    res = tools.nfl_team_stats("KC", 2024, side="offense")
+def test_stale_tables_reg_returns_rows_with_warning(stale_db):
+    res = tools.nfl_team_stats("KC", 2024, side="offense", season_type="REG")
     assert [r["touchdowns"] for r in res["offense"]] == [50]
     assert "nfl-mcp rebuild" in res["warning"]
-    cmp = tools.nfl_compare("KC", "BUF", compare_type="team", season=2024)
+    cmp = tools.nfl_compare(team1="KC", team2="BUF", season=2024, season_type="REG")
     assert cmp["KC"]["offense"] and "nfl-mcp rebuild" in cmp["KC"]["warning"]
 
 
@@ -741,5 +741,5 @@ def test_stale_tables_explicit_post_returns_error_with_code(stale_db):
     expected = {"error": "Derived team tables are stale; run `nfl-mcp rebuild`",
                 "code": "STALE_DERIVED_TABLES"}
     assert tools.nfl_team_stats("KC", 2024, season_type="POST") == expected
-    assert tools.nfl_compare("KC", "BUF", compare_type="team", season=2024,
+    assert tools.nfl_compare(team1="KC", team2="BUF", season=2024,
                              season_type="POST") == expected

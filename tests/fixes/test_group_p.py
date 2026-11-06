@@ -45,6 +45,7 @@ RAW = ["plays", "schedules", "rosters", "injuries", "snap_counts", "players", "p
 EXTRA = {"depth_charts": ["season", "club_code", "gsis_id"],
          "participation": ["nflverse_game_id", "play_id", "possession_team"]}
 
+CUR = 2  # migrate.SCHEMA_VERSION since v0.7.0; version 1 is the schema of v0.6.x (a valid old slot)
 PRODUCTION_NEW = {"depth_charts": 2173176, "injury_return_curve": 1172}
 PRODUCTION_CURRENT = {"depth_charts": 2911328, "injury_return_curve": 1215}
 PRODUCTION_FAIL = ("depth_charts has 2173176 rows, current slot has 2911328; "
@@ -99,9 +100,9 @@ def pair(tmp_path):
 @pytest.fixture(scope="module")
 def production(tmp_path_factory):
     """The production shape: current slot at version 0 (no _schema_version, as v0.4.0
-    left it), new slot at version 1, with the production row counts."""
+    left it), new slot at the current version, with the production row counts."""
     root = tmp_path_factory.mktemp("production")
-    return (build_slot(root / "new.duckdb", version=1, rows=PRODUCTION_NEW),
+    return (build_slot(root / "new.duckdb", version=CUR, rows=PRODUCTION_NEW),
             build_slot(root / "current.duckdb", version=None, rows=PRODUCTION_CURRENT))
 
 
@@ -134,9 +135,9 @@ def test_production_upgrade_passes_every_check(production):
 def test_production_upgrade_names_both_shrunk_tables_in_detail(production):
     detail = floor(*production).detail
     assert ("depth_charts has 2173176 rows, current slot has 2911328 (allowed: the current "
-            "slot is schema version 0, and the upgrade to 1 rewrote this table)") in detail
+            f"slot is schema version 0, and the upgrade to {CUR} rewrote this table)") in detail
     assert ("injury_return_curve has 1172 rows, current slot has 1215 (allowed: the current "
-            "slot is schema version 0, and the upgrade to 1 rewrote this table)") in detail
+            f"slot is schema version 0, and the upgrade to {CUR} rewrote this table)") in detail
 
 
 def test_production_upgrade_cli_exits_zero(production):
@@ -148,13 +149,13 @@ def test_production_upgrade_cli_exits_zero(production):
 
 
 def test_production_shrink_at_same_version_fails_as_before(pair):
-    result = floor(*pair(1, 1, PRODUCTION_NEW, PRODUCTION_CURRENT))
+    result = floor(*pair(CUR, CUR, PRODUCTION_NEW, PRODUCTION_CURRENT))
     assert not result.ok
     assert result.detail == PRODUCTION_FAIL
 
 
 def test_production_shrink_at_same_version_cli_exits_one(pair):
-    new, current = pair(1, 1, PRODUCTION_NEW, PRODUCTION_CURRENT)
+    new, current = pair(CUR, CUR, PRODUCTION_NEW, PRODUCTION_CURRENT)
     code, out = cli("--db", new, "--current", current)
     assert code == 1
     assert f"FAIL row_count_floor: {PRODUCTION_FAIL}" in out
@@ -164,31 +165,31 @@ def test_production_shrink_at_same_version_cli_exits_one(pair):
 # ── 2. which tables the allowance covers ───────────────────────────────────────
 
 
-@pytest.mark.parametrize("current_version", [None, (), 0])
+@pytest.mark.parametrize("current_version", [None, (), 0, 1])
 @pytest.mark.parametrize("table", REWRITTEN)
 def test_rewritten_table_may_shrink_across_upgrade(pair, table, current_version):
-    result = floor(*pair(1, current_version, {table: 50}))
+    result = floor(*pair(CUR, current_version, {table: 50}))
     assert result.ok, result.detail
     assert f"{table} has 50 rows, current slot has 100 (allowed" in result.detail
 
 
 @pytest.mark.parametrize("table", REWRITTEN)
 def test_rewritten_table_shrink_at_same_version_fails(pair, table):
-    result = floor(*pair(1, 1, {table: 50}))
+    result = floor(*pair(CUR, CUR, {table: 50}))
     assert not result.ok
     assert result.detail == f"{table} has 50 rows, current slot has 100"
 
 
 @pytest.mark.parametrize("table", RAW)
 def test_raw_table_shrink_across_upgrade_still_fails(pair, table):
-    result = floor(*pair(1, None, {table: 50}))
+    result = floor(*pair(CUR, None, {table: 50}))
     assert not result.ok
     assert result.detail == f"{table} has 50 rows, current slot has 100"
 
 
 @pytest.mark.parametrize("table", ["plays", "rosters", "participation"])
 def test_raw_table_shrink_across_upgrade_cli_exits_one(pair, table):
-    new, current = pair(1, None, {table: 50, "depth_charts": 50})
+    new, current = pair(CUR, None, {table: 50, "depth_charts": 50})
     code, out = cli("--db", new, "--current", current)
     assert code == 1
     line = next(x for x in out.splitlines() if x.startswith("FAIL row_count_floor:"))
@@ -198,20 +199,20 @@ def test_raw_table_shrink_across_upgrade_cli_exits_one(pair, table):
 
 
 def test_raw_shrink_within_tolerance_across_upgrade_ok(pair):
-    result = floor(*pair(1, None, {"plays": 99, "rosters": 99}))
+    result = floor(*pair(CUR, None, {"plays": 99, "rosters": 99}))
     assert result.ok, result.detail
     assert "allowed" not in result.detail
 
 
 def test_upgrade_without_shrink_keeps_the_usual_detail(pair):
-    upgraded, same = floor(*pair(1, None)), floor(*pair(1, 1))
+    upgraded, same = floor(*pair(CUR, None)), floor(*pair(CUR, CUR))
     assert upgraded.ok and same.ok
     assert upgraded.detail == same.detail
     assert "allowed" not in same.detail
 
 
 def test_empty_snapshot_table_still_fails_across_upgrade(pair):
-    result = floor(*pair(1, None, {"ff_rankings_week": 0}))
+    result = floor(*pair(CUR, None, {"ff_rankings_week": 0}))
     assert not result.ok
     assert has_word(result.detail, "ff_rankings_week")
 
@@ -221,7 +222,7 @@ def test_empty_snapshot_table_still_fails_across_upgrade(pair):
 
 @pytest.mark.parametrize("current_version", ["text", "error"])
 def test_unreadable_current_version_gets_no_allowance(pair, current_version):
-    result = floor(*pair(1, current_version, {"depth_charts": 50}))
+    result = floor(*pair(CUR, current_version, {"depth_charts": 50}))
     assert not result.ok
     assert "depth_charts has 50 rows, current slot has 100" in result.detail
     assert "cannot read the current slot's schema version" in result.detail
@@ -229,7 +230,7 @@ def test_unreadable_current_version_gets_no_allowance(pair, current_version):
 
 @pytest.mark.parametrize("current_version", ["text", "error"])
 def test_unreadable_current_version_cli_exits_one(pair, current_version):
-    new, current = pair(1, current_version, {"injury_return_curve": 50})
+    new, current = pair(CUR, current_version, {"injury_return_curve": 50})
     code, out = cli("--db", new, "--current", current)
     assert code == 1
     assert "FAIL row_count_floor: injury_return_curve has 50 rows" in out
@@ -237,17 +238,17 @@ def test_unreadable_current_version_cli_exits_one(pair, current_version):
 
 @pytest.mark.parametrize("current_version", ["text", "error"])
 def test_unreadable_current_version_without_shrink_ok(pair, current_version):
-    assert floor(*pair(1, current_version)).ok
+    assert floor(*pair(CUR, current_version)).ok
 
 
 def test_unreadable_current_version_raw_shrink_has_plain_detail(pair):
-    result = floor(*pair(1, "text", {"rosters": 50}))
+    result = floor(*pair(CUR, "text", {"rosters": 50}))
     assert not result.ok
     assert result.detail == "rosters has 50 rows, current slot has 100"
 
 
 def test_current_newer_than_new_gets_no_allowance(pair):
-    result = floor(*pair(1, 2, {"depth_charts": 50}))
+    result = floor(*pair(CUR, CUR + 1, {"depth_charts": 50}))
     assert not result.ok
     assert result.detail == "depth_charts has 50 rows, current slot has 100"
 

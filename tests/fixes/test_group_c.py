@@ -256,7 +256,7 @@ def test_success_is_not_flagged(synth_db, clean_env):
 @pytest.mark.parametrize("tool, args", [
     ("nfl_query", {"sql": "SELECT 1", "bogus": 1}),
     ("nfl_team_records", {"team": "GB", "bogus": 1}),
-    ("nfl_schedule", {"bogus": 1}),
+    ("nfl_schedule", {"season_type": "REG", "bogus": 1}),
 ])
 def test_unknown_argument_lists_valid_names(tool, args, synth_db, clean_env):
     valid = set(next(t for t in server.TOOLS if t.name == tool).inputSchema["properties"])

@@ -158,3 +158,10 @@ def test_every_exposed_tool_has_a_handler():
         payload = json.loads(asyncio.run(server_module.call_tool(name, {})).content[0].text)
         # Only the server reports UNKNOWN_TOOL.
         assert payload.get("code") != "UNKNOWN_TOOL", name
+
+
+def test_failure_from_result_keeps_data_as_of():
+    payload = server_module._failure_from_result(
+        "nfl_schedule", {"error": "boom", "code": "TOOL_ERROR", "data_as_of": "2024-09-01T00:00:00Z"})
+    assert payload["data_as_of"] == "2024-09-01T00:00:00Z"
+    assert payload["error"] == "boom" and "data_as_of" not in payload["details"]

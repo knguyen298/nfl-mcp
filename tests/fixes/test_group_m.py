@@ -33,7 +33,7 @@ Contract corrections (the tests follow these, not the spec text)
    refuse it as "newer".
 
 Interface contract (shared contract plus the choices made here)
-- nfl_mcp.migrate: SCHEMA_VERSION == 1; check(conn); upgrade(conn, *, fetch=True);
+- nfl_mcp.migrate: SCHEMA_VERSION == 2 (v0.7.0; 1 before); check(conn); upgrade(conn, *, fetch=True);
   stamp_if_current(conn). Status objects expose the attribute names in the spec
   (version, target, steps, upgrade_needed, newer; Step.name/needed/needs_network/detail;
   result.before/after/ran/failed/pending/stamped).
@@ -121,6 +121,9 @@ V0_DB = Path("/tmp/grpE_v3.duckdb")
 V053_DB = Path.home() / ".nfl-mcp" / "nflread.duckdb"
 F_DB = Path("/tmp/grpF_work.duckdb")
 
+CUR = 2  # migrate.SCHEMA_VERSION since v0.7.0 (the season_type split of the fantasy tables)
+
+V2_TABLES = ["player_role_trend", "player_separation_opportunity", "player_contract_value"]
 STEPS = ["derived_tables", "depth_charts_season", "raw_columns"]
 DERIVED = ["team_offense_stats", "team_defense_stats", "situational_stats", "team_records",
            "player_td_luck", "player_role_trend", "player_separation_opportunity",
@@ -138,6 +141,10 @@ V0_GAPS = {
     # Group N: measured in /tmp/grpE_v3.duckdb, information_schema has no season_type here.
     "player_td_luck": ["season_type"],
     "player_drop_rate": ["season_type"],
+    # v0.7.0 (schema version 2): the three fantasy tables are split by season_type as well.
+    "player_role_trend": ["season_type"],
+    "player_separation_opportunity": ["season_type"],
+    "player_contract_value": ["season_type"],
 }
 V0_NULL_DEPTH = 1_280_630
 
@@ -338,7 +345,7 @@ def v0_synth(tmp_path, name="v0.duckdb"):
                     derived="v0", depth="legacy")
 
 
-def current_synth(tmp_path, name="current.duckdb", versions=(1,)):
+def current_synth(tmp_path, name="current.duckdb", versions=(CUR,)):
     """Structurally current (every step not needed), stamped with `versions`."""
     return build_db(tmp_path / name, derived="current", depth="stamped", versions=versions)
 
@@ -716,14 +723,15 @@ def test_v053_shape_measurements(v053_copy):
 
 
 @pytest.mark.integration
-def test_grpF_work_has_every_required_column(f_copy):
+def test_grpF_work_lacks_only_the_v2_season_type_columns(f_copy):
     con = _ro(f_copy)
     try:
         cols = _columns(con)
     finally:
         con.close()
     assert sorted((t, c) for t, need in REQUIRED_COLUMNS.items()
-                  for c in need if c not in cols.get(t, set())) == []
+                  for c in need if c not in cols.get(t, set())) == sorted(
+        (t, "season_type") for t in V2_TABLES)
 
 
 @pytest.mark.integration
@@ -754,22 +762,27 @@ def test_rebuild_derived_tables_on_grpE_v3_sources_reproduces_grpF_work(f_copy):
 
 @pytest.mark.integration
 def test_validate_existing_checks_pass_on_grpF_work_against_itself(f_copy):
+    # Every existing check passes but required_columns, which names the three v2 columns
+    # (grpF_work predates the season_type split of the fantasy tables).
     from nfl_mcp.validate import run_checks
     results = [r for r in run_checks(f_copy, f_copy) if r.name in EXISTING_CHECKS]
     assert {r.name for r in results} == EXISTING_CHECKS
-    assert [f"{r.name} {r.detail}" for r in results if not r.ok] == []
+    failed = {r.name: r.detail for r in results if not r.ok}
+    assert set(failed) == {"required_columns"}, failed
+    for table in V2_TABLES:
+        assert f"{table}.season_type" in failed["required_columns"], failed
 
 
 # ═══ 2. migrate.check ══════════════════════════════════════════════════════════
 
 
-def test_schema_version_constant_is_1():
-    assert _migrate().SCHEMA_VERSION == 1
+def test_schema_version_constant_is_2():
+    assert _migrate().SCHEMA_VERSION == CUR == 2
 
 
 def test_check_v0_synthetic_reports_every_step(tmp_path):
     status = _status(v0_synth(tmp_path))
-    assert (status.version, status.target, status.newer, status.upgrade_needed) == (0, 1, False, True)
+    assert (status.version, status.target, status.newer, status.upgrade_needed) == (0, CUR, False, True)
     assert [s.name for s in status.steps] == STEPS
     assert [s.needs_network for s in status.steps] == [False, True, True]
     assert _needed(status) == STEPS
@@ -788,9 +801,51 @@ def test_check_v0_synthetic_details(tmp_path):
 
 def test_check_current_database_needs_nothing(tmp_path):
     status = _status(current_synth(tmp_path))
-    assert (status.version, status.target, status.newer, status.upgrade_needed) == (1, 1, False, False)
+    assert (status.version, status.target, status.newer, status.upgrade_needed) == (CUR, CUR, False, False)
     assert [s.name for s in status.steps] == STEPS
     assert _needed(status) == []
+
+
+def v1_synth(tmp_path, name="v1.duckdb"):
+    """A database stamped version 1 whose fantasy tables lack season_type (built before v0.7.0)."""
+    path = current_synth(tmp_path, name, versions=(1,))
+    with _rw(path) as con:
+        for table in V2_TABLES:
+            con.execute(f'ALTER TABLE {table} DROP COLUMN "season_type"')
+    return path
+
+
+def test_check_version_1_database_needs_the_derived_tables_step(tmp_path):
+    status = _status(v1_synth(tmp_path))
+    assert (status.version, status.target, status.newer, status.upgrade_needed) == (1, CUR, False, True)
+    assert _needed(status) == ["derived_tables"]
+    step = _step(status, "derived_tables")
+    assert not step.needs_network
+    for table in V2_TABLES:
+        assert f"{table}.season_type" in step.detail, step.detail
+    assert "team_offense_stats" not in step.detail, step.detail
+
+
+def test_upgrade_version_1_database_rebuilds_derived_tables_and_stamps_2(tmp_path, monkeypatch):
+    path = v1_synth(tmp_path)
+    fake = FakeNfl().install(monkeypatch)
+    result = _upgrade(path)
+    assert (result.ran, result.failed, result.pending, result.stamped) == (["derived_tables"], [], [], True)
+    assert fake.calls == []  # derived tables are rebuilt from the local raw tables
+    assert _versions(path) == [1, CUR]
+    con = _ro(path)
+    try:
+        cols = _columns(con)
+        assert all("season_type" in cols[t] for t in V2_TABLES)
+    finally:
+        con.close()
+    assert not _status(path).upgrade_needed
+
+
+def test_cli_check_version_1_database_exits_3(tmp_path):
+    result, out = _cli("upgrade", "--check", "--db", v1_synth(tmp_path))
+    assert result.exit_code == 3, out
+    assert "NEEDED" in _line(out, "derived_tables") and "(network)" not in _line(out, "derived_tables")
 
 
 @pytest.mark.parametrize("versions", [None, ()])
@@ -803,8 +858,8 @@ def test_check_structurally_current_but_unstamped_is_version_0(tmp_path, version
 
 
 def test_check_version_is_max_of_rows(tmp_path):
-    status = _status(current_synth(tmp_path, versions=(1, 2)))
-    assert (status.version, status.newer) == (2, True)
+    status = _status(current_synth(tmp_path, versions=(CUR, CUR + 1)))
+    assert (status.version, status.newer) == (CUR + 1, True)
 
 
 def test_check_missing_derived_table_names_it(tmp_path):
@@ -819,7 +874,7 @@ def test_check_missing_derived_table_names_it(tmp_path):
 
 def test_check_depth_charts_without_season_column_is_needed(tmp_path):
     # 4 rows of the 2025 shape and no season column at all: every row lacks a season.
-    status = _status(build_db(tmp_path / "d.duckdb", depth="noseason", versions=(1,)))
+    status = _status(build_db(tmp_path / "d.duckdb", depth="noseason", versions=(CUR,)))
     step = _step(status, "depth_charts_season")
     assert step.needed and step.needs_network
     assert _has_word(_digits(step.detail), 4)
@@ -828,14 +883,14 @@ def test_check_depth_charts_without_season_column_is_needed(tmp_path):
 
 def test_check_without_depth_charts_table_does_not_need_restamp(tmp_path):
     # Correction 3.
-    status = _status(build_db(tmp_path / "d.duckdb", depth=None, versions=(1,)))
+    status = _status(build_db(tmp_path / "d.duckdb", depth=None, versions=(CUR,)))
     assert not _step(status, "depth_charts_season").needed
     assert not status.upgrade_needed
 
 
 def test_check_raw_missing_column_and_static_table(tmp_path):
     path = build_db(tmp_path / "r.duckdb", drop_tables={"ff_rankings_week"},
-                    drop_columns={"rosters": ["college"]}, versions=(1,))
+                    drop_columns={"rosters": ["college"]}, versions=(CUR,))
     status = _status(path)
     assert _needed(status) == ["raw_columns"]
     detail = _step(status, "raw_columns").detail
@@ -869,7 +924,7 @@ def test_check_works_read_only_and_leaves_file_untouched(tmp_path):
 def test_check_grpE_v3_steps_and_version():
     _need(V0_DB)
     status = _status(V0_DB)
-    assert (status.version, status.target, status.newer, status.upgrade_needed) == (0, 1, False, True)
+    assert (status.version, status.target, status.newer, status.upgrade_needed) == (0, CUR, False, True)
     assert [s.name for s in status.steps] == STEPS
     assert [s.needs_network for s in status.steps] == [False, True, True]
     assert _needed(status) == ["derived_tables", "depth_charts_season"]
@@ -931,10 +986,15 @@ def test_check_v053_details(v053_copy):
 
 
 @pytest.mark.integration
-def test_check_grpF_work_needs_only_the_depth_restamp(f_copy):
+def test_check_grpF_work_needs_the_v2_derived_columns_and_the_depth_restamp(f_copy):
+    # grpF_work was built before v0.7.0: its three fantasy tables lack season_type.
     status = _status(f_copy)
     assert status.version == 0
-    assert _needed(status) == ["depth_charts_season"]
+    assert _needed(status) == ["derived_tables", "depth_charts_season"]
+    derived = _step(status, "derived_tables").detail
+    for table in V2_TABLES:
+        assert f"{table}.season_type" in derived, derived
+    assert "team_offense_stats" not in derived, derived
 
 
 # ═══ 3. migrate.upgrade ════════════════════════════════════════════════════════
@@ -947,9 +1007,9 @@ def test_full_upgrade_runs_every_step_and_stamps(tmp_path, monkeypatch):
     assert result.ran == STEPS
     assert (result.failed, result.pending, result.stamped) == ([], [], True)
     assert result.before.version == 0 and _needed(result.before) == STEPS
-    assert (result.after.version, result.after.upgrade_needed) == (1, False)
+    assert (result.after.version, result.after.upgrade_needed) == (CUR, False)
     assert _needed(result.after) == []
-    assert _versions(path) == [1]
+    assert _versions(path) == [CUR]
 
 
 def test_full_upgrade_fills_in_the_data(tmp_path, monkeypatch):
@@ -981,7 +1041,7 @@ def test_check_after_full_upgrade_reports_current(tmp_path, monkeypatch):
     FakeNfl().install(monkeypatch)
     _upgrade(path)
     status = _status(path)
-    assert (status.version, status.upgrade_needed, status.newer) == (1, False, False)
+    assert (status.version, status.upgrade_needed, status.newer) == (CUR, False, False)
     assert _needed(status) == []
     con = _ro(path)
     try:
@@ -998,7 +1058,7 @@ def test_second_upgrade_runs_nothing_and_stamps_nothing(tmp_path, monkeypatch):
     again = _upgrade(path)
     assert (again.ran, again.failed, again.pending, again.stamped) == ([], [], [], False)
     assert len(fake.calls) == n_calls
-    assert _versions(path) == [1]
+    assert _versions(path) == [CUR]
 
 
 def test_failed_depth_fetch_keeps_legacy_rows_and_later_steps_run(tmp_path, monkeypatch):
@@ -1030,7 +1090,7 @@ def test_failed_upgrade_retried_later_completes(tmp_path, monkeypatch):
     FakeNfl().install(monkeypatch)
     result = _upgrade(path)
     assert result.ran == ["depth_charts_season"]
-    assert result.stamped and _versions(path) == [1]
+    assert result.stamped and _versions(path) == [CUR]
 
 
 def test_upgrade_no_fetch_runs_only_derived_tables(tmp_path, monkeypatch):
@@ -1050,7 +1110,7 @@ def test_upgrade_no_fetch_stamps_when_only_derived_tables_needed(tmp_path, monke
     FakeNfl().install(monkeypatch)
     result = _upgrade(path, fetch=False)
     assert (result.ran, result.pending, result.stamped) == (["derived_tables"], [], True)
-    assert _versions(path) == [1]
+    assert _versions(path) == [CUR]
 
 
 def test_upgrade_on_unstamped_current_database_only_stamps(tmp_path, monkeypatch):
@@ -1060,7 +1120,7 @@ def test_upgrade_on_unstamped_current_database_only_stamps(tmp_path, monkeypatch
     result = _upgrade(path)
     assert (result.ran, result.failed, result.stamped) == ([], [], True)
     assert fake.calls == []
-    assert _versions(path) == [1]
+    assert _versions(path) == [CUR]
 
 
 # ── raw_columns ──
@@ -1115,7 +1175,7 @@ def test_raw_missing_column_and_table_reingest_both(tmp_path, monkeypatch):
     _upgrade(path)
     assert fake.seasons("load_snap_counts") == {2023}
     assert [c[2].get("type") for c in fake.named("load_ff_rankings")] == ["draft"]
-    assert _versions(path) == [1]
+    assert _versions(path) == [CUR]
 
 
 def test_missing_derived_source_table_is_complete_after_two_runs(tmp_path, monkeypatch):
@@ -1125,7 +1185,7 @@ def test_missing_derived_source_table_is_complete_after_two_runs(tmp_path, monke
     FakeNfl().install(monkeypatch)
     _upgrade(path)
     _upgrade(path)
-    assert _versions(path) == [1]
+    assert _versions(path) == [CUR]
     con = _ro(path)
     try:
         assert {"players", "player_role_trend", "injury_return_curve"} <= set(_columns(con))
@@ -1171,17 +1231,18 @@ def test_derived_failure_before_raw_columns_is_cleared_by_the_rebuild_after(tmp_
 
 
 def test_newer_database_is_reported(tmp_path):
-    status = _status(build_db(tmp_path / "n.duckdb", derived="v0", depth="legacy", versions=(2,)))
-    assert (status.version, status.target, status.newer) == (2, 1, True)
+    status = _status(build_db(tmp_path / "n.duckdb", derived="v0", depth="legacy",
+                                 versions=(CUR + 1,)))
+    assert (status.version, status.target, status.newer) == (CUR + 1, CUR, True)
 
 
 def test_upgrade_refuses_newer_database_and_changes_nothing(tmp_path, monkeypatch):
-    path = build_db(tmp_path / "n.duckdb", derived="v0", depth="legacy", versions=(2,))
+    path = build_db(tmp_path / "n.duckdb", derived="v0", depth="legacy", versions=(CUR + 1,))
     fake = FakeNfl().install(monkeypatch)
     result = _upgrade(path)
     assert result.failed and result.ran == [] and result.stamped is False
     assert fake.calls == []
-    assert _versions(path) == [2]
+    assert _versions(path) == [CUR + 1]
     con = _ro(path)
     try:
         assert "season_type" not in _columns(con)["team_offense_stats"]
@@ -1198,14 +1259,14 @@ def test_stamp_if_current_stamps_once(tmp_path):
     with _rw(path) as con:
         assert _migrate().stamp_if_current(con) is True
         assert _migrate().stamp_if_current(con) is False
-    assert _versions(path) == [1]
+    assert _versions(path) == [CUR]
 
 
 def test_stamp_if_current_on_stamped_database_adds_no_row(tmp_path):
     path = current_synth(tmp_path)
     with _rw(path) as con:
         assert _migrate().stamp_if_current(con) is False
-    assert _versions(path) == [1]
+    assert _versions(path) == [CUR]
 
 
 def test_stamp_if_current_logs_one_warning_when_the_check_raises(tmp_path, monkeypatch, caplog):
@@ -1299,13 +1360,13 @@ def _ingest(path, datasets=INGEST_DATASETS):
     return _quiet(ing.run_ingest_datasets, datasets, start=2024, end=2024, db_path=str(path))
 
 
-def test_fresh_ingest_without_failures_ends_at_version_1(tmp_path, monkeypatch):
+def test_fresh_ingest_without_failures_ends_at_the_current_version(tmp_path, monkeypatch):
     path = tmp_path / "fresh.duckdb"
     FakeNfl().install(monkeypatch)
     assert _ingest(path) == []
-    assert _versions(path) == [1]
+    assert _versions(path) == [CUR]
     status = _status(path)
-    assert (status.version, status.upgrade_needed) == (1, False)
+    assert (status.version, status.upgrade_needed) == (CUR, False)
 
 
 def test_second_clean_ingest_adds_no_version_row(tmp_path, monkeypatch):
@@ -1313,7 +1374,7 @@ def test_second_clean_ingest_adds_no_version_row(tmp_path, monkeypatch):
     FakeNfl().install(monkeypatch)
     _ingest(path)
     _ingest(path)
-    assert _versions(path) == [1]
+    assert _versions(path) == [CUR]
 
 
 def test_ingest_with_a_failure_stays_unstamped(tmp_path, monkeypatch):
@@ -1357,11 +1418,11 @@ def test_cli_check_old_exits_3_and_prints_each_step(tmp_path):
     assert "NEEDED (network)" in _line(out, "depth_charts_season")
     assert "NEEDED (network)" in _line(out, "raw_columns")
     version = [line for line in out.splitlines() if re.search(r"version", line, re.IGNORECASE)]
-    assert any(_has_word(v, 0) and _has_word(v, 1) for v in version), out
+    assert any(_has_word(v, 0) and _has_word(v, CUR) for v in version), out
 
 
 def test_cli_check_newer_exits_1(tmp_path):
-    result, out = _cli("upgrade", "--check", "--db", current_synth(tmp_path, versions=(2,)))
+    result, out = _cli("upgrade", "--check", "--db", current_synth(tmp_path, versions=(CUR + 1,)))
     assert result.exit_code == 1, out
 
 
@@ -1397,10 +1458,10 @@ def test_cli_upgrade_full_exits_0_and_stamps(tmp_path, monkeypatch):
     assert result.exit_code == 0, out
     for name in STEPS:
         assert name in out
-    assert _versions(path) == [1]
+    assert _versions(path) == [CUR]
     again, out2 = _cli("upgrade", "--db", path)
     assert again.exit_code == 0, out2
-    assert _versions(path) == [1]
+    assert _versions(path) == [CUR]
 
 
 def test_cli_upgrade_no_fetch_exits_3_when_network_steps_remain(tmp_path, monkeypatch):
@@ -1422,7 +1483,7 @@ def test_cli_upgrade_no_fetch_exits_0_when_nothing_needs_network(tmp_path, monke
     FakeNfl().install(monkeypatch)
     result, out = _cli("upgrade", "--db", path, "--no-fetch")
     assert result.exit_code == 0, out
-    assert _versions(path) == [1]
+    assert _versions(path) == [CUR]
 
 
 def test_cli_upgrade_failed_step_exits_1(tmp_path, monkeypatch):
@@ -1435,11 +1496,11 @@ def test_cli_upgrade_failed_step_exits_1(tmp_path, monkeypatch):
 
 
 def test_cli_upgrade_newer_exits_1_and_changes_nothing(tmp_path, monkeypatch):
-    path = build_db(tmp_path / "n.duckdb", derived="v0", versions=(2,))
+    path = build_db(tmp_path / "n.duckdb", derived="v0", versions=(CUR + 1,))
     fake = FakeNfl().install(monkeypatch)
     result, out = _cli("upgrade", "--db", path)
     assert result.exit_code == 1, out
-    assert fake.calls == [] and _versions(path) == [2]
+    assert fake.calls == [] and _versions(path) == [CUR + 1]
 
 
 def _read_only_or_skip(path):
@@ -1546,7 +1607,7 @@ def test_serve_current_database_logs_no_warning(tmp_path, monkeypatch, caplog):
 
 
 def test_serve_newer_database_warns_and_starts(tmp_path, monkeypatch, caplog):
-    result, started, warnings = _serve(monkeypatch, caplog, current_synth(tmp_path, versions=(2,)))
+    result, started, warnings = _serve(monkeypatch, caplog, current_synth(tmp_path, versions=(CUR + 1,)))
     assert result.exit_code == 0 and started == [8000]
     assert [w for w in warnings if "newer" in w.lower()], warnings
 
@@ -1586,14 +1647,14 @@ def _doctor(monkeypatch, tmp_path, db_path):
 
 def test_doctor_shows_old_schema_version_and_needed_steps(tmp_path, monkeypatch):
     line = _doctor(monkeypatch, tmp_path, v0_synth(tmp_path))
-    assert _has_word(line, 0) and _has_word(line, 1), line
+    assert _has_word(line, 0) and _has_word(line, CUR), line
     for name in STEPS:
         assert name in line, line
 
 
 def test_doctor_shows_current_schema_version(tmp_path, monkeypatch):
     line = _doctor(monkeypatch, tmp_path, current_synth(tmp_path))
-    assert _has_word(line, 1), line
+    assert _has_word(line, CUR), line
     assert not any(name in line for name in STEPS), line
 
 
@@ -1611,16 +1672,16 @@ def _schema_check(path):
 def test_validate_schema_version_fails_for_version_0(tmp_path, versions):
     r = _schema_check(current_synth(tmp_path, versions=versions))
     assert not r.ok
-    assert _has_word(r.detail, 0) and _has_word(r.detail, 1) and "nfl-mcp upgrade" in r.detail
+    assert _has_word(r.detail, 0) and _has_word(r.detail, CUR) and "nfl-mcp upgrade" in r.detail
 
 
 def test_validate_schema_version_fails_for_newer(tmp_path):
-    r = _schema_check(current_synth(tmp_path, versions=(2,)))
+    r = _schema_check(current_synth(tmp_path, versions=(CUR + 1,)))
     assert not r.ok
-    assert _has_word(r.detail, 2) and _has_word(r.detail, 1) and "nfl-mcp upgrade" in r.detail
+    assert _has_word(r.detail, CUR + 1) and _has_word(r.detail, CUR) and "nfl-mcp upgrade" in r.detail
 
 
-def test_validate_schema_version_passes_for_1(tmp_path):
+def test_validate_schema_version_passes_for_current(tmp_path):
     from nfl_mcp.validate import run_checks
     path = current_synth(tmp_path)
     assert _schema_check(path).ok

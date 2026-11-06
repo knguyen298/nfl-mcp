@@ -415,11 +415,15 @@ class TestToolArguments:
         assert raised.value.as_error()["code"] == "SCHEMA_UNAVAILABLE"
 
     def test_team_stats_filter_rejects_an_unknown_season_type(self):
-        with pytest.raises(tools._BadArgument, match="Unknown season_type 'BOGUS'"):
+        with pytest.raises(tools._BadArgument, match="Unknown season_type 'bogus'"):
             tools._team_stats_filter(None, None, None, "bogus")
 
+    def test_team_stats_filter_requires_a_season_type(self):
+        with pytest.raises(tools._BadArgument, match="season_type is required"):
+            tools._team_stats_filter(None, None, None, None)
+
     def test_search_plays_player_role_needs_a_player(self):
-        result = tools.nfl_search_plays(player_role="passer")
+        result = tools.nfl_search_plays(player_role="passer", season_type="REG")
         assert result["code"] == "MISSING_PLAYER"
 
 
@@ -483,33 +487,33 @@ class TestToolPlayers:
 class TestSearchPlaysPlayerResolution:
     def test_resolver_error_by_name_is_returned(self, monkeypatch):
         monkeypatch.setattr(tools, "_resolve_player", _raise(duckdb.Error("players broke")))
-        assert tools.nfl_search_plays(player="Smith")["error"] == "players broke"
+        assert tools.nfl_search_plays(player="Smith", season_type="REG")["error"] == "players broke"
 
     def test_ambiguous_name_is_returned_as_is(self, monkeypatch):
         ambiguous = {"ambiguous": True, "candidates": [], "count": 0}
         monkeypatch.setattr(tools, "_resolve_player", lambda *a, **k: (None, ambiguous))
-        assert tools.nfl_search_plays(player="Smith") == ambiguous
+        assert tools.nfl_search_plays(player="Smith", season_type="REG") == ambiguous
 
     def test_unknown_name_gives_an_empty_result_with_a_reason(self, monkeypatch):
         monkeypatch.setattr(tools, "_resolve_player", lambda *a, **k: (None, None))
-        result = tools.nfl_search_plays(player="Nobody")
+        result = tools.nfl_search_plays(player="Nobody", season_type="REG")
         assert result["rows"] == [] and "No player matches 'Nobody'" in result["reason"]
 
     def test_resolver_error_by_id_is_returned(self, monkeypatch):
         monkeypatch.setattr(tools, "_resolve_player", _raise(duckdb.IOException("disk broke")))
-        assert tools.nfl_search_plays(player_id="00-0000001")["error"] == "disk broke"
+        assert tools.nfl_search_plays(player_id="00-0000001", season_type="REG")["error"] == "disk broke"
 
 
 class TestSnapCountsPlayerId:
     def test_unknown_player_id(self, monkeypatch):
         monkeypatch.setattr(tools, "_find_players", lambda *a, **k: ([], False))
-        result = tools.nfl_snap_counts(player_id="00-0000000")
+        result = tools.nfl_snap_counts(player_id="00-0000000", season_type="REG")
         assert result["code"] == "UNKNOWN_PLAYER_ID"
 
     def test_player_without_a_pfr_id_has_no_snap_counts(self, monkeypatch):
         found = [{"gsis_id": "00-0000001", "display_name": "Some Player", "pfr_id": None}]
         monkeypatch.setattr(tools, "_find_players", lambda *a, **k: (found, False))
-        result = tools.nfl_snap_counts(player_id="00-0000001")
+        result = tools.nfl_snap_counts(player_id="00-0000001", season_type="REG")
         assert result["snap_counts"] == [] and result["player_id"] == "00-0000001"
         assert "No PFR id on file for Some Player" in result["reason"]
 
@@ -517,18 +521,18 @@ class TestSnapCountsPlayerId:
 class TestFtnAndSeparationPlayers:
     def test_ftn_charting_returns_a_resolver_error(self, monkeypatch):
         monkeypatch.setattr(tools, "_resolve_player", _raise(duckdb.Error("players broke")))
-        assert tools.nfl_ftn_charting(player="Smith")["error"] == "players broke"
+        assert tools.nfl_ftn_charting(player="Smith", season_type="REG")["error"] == "players broke"
 
     def test_ftn_charting_for_an_unknown_player_is_empty_with_a_reason(self, monkeypatch):
         monkeypatch.setattr(tools, "_resolve_player", lambda *a, **k: (None, None))
-        result = tools.nfl_ftn_charting(player="Nobody")
+        result = tools.nfl_ftn_charting(player="Nobody", season_type="REG")
         assert result["charting"] == {} and result["total_plays"] == 0
         assert "No player matches 'Nobody'" in result["reason"]
 
     def test_separation_opportunity_returns_an_ambiguous_player(self, monkeypatch):
         ambiguous = {"ambiguous": True, "candidates": [], "count": 0}
         monkeypatch.setattr(tools, "_resolve_player", lambda *a, **k: (None, ambiguous))
-        assert tools.nfl_separation_opportunity(player_id="00-0000001") == ambiguous
+        assert tools.nfl_separation_opportunity(player_id="00-0000001", season_type="REG") == ambiguous
 
 
 # ── tools: team tables ──────────────────────────────────────────────────────────
@@ -537,12 +541,12 @@ class TestTeamTables:
     def test_team_rows_re_raises_a_binder_error_that_is_not_about_season_type(self, monkeypatch):
         monkeypatch.setattr(tools, "_execute", _raise(duckdb.BinderException("column 'zzz' not found")))
         with pytest.raises(duckdb.BinderException, match="zzz"):
-            tools._team_rows("team_offense_stats", ["KC"], (None, None, None, None))
+            tools._team_rows("team_offense_stats", ["KC"], (None, None, None, "REG"))
 
     def test_compare_teams_with_no_rows_adds_the_range_reason(self, monkeypatch):
         monkeypatch.setattr(tools, "_team_rows", lambda *a, **k: ([], False))
         monkeypatch.setattr(tools, "_range_reason", lambda *a, **k: "Season 1900 is outside the loaded range.")
-        result = tools._compare_teams("KC", "BUF", 1900, None, None, None)
+        result = tools._compare_teams("KC", "BUF", 1900, None, None, "REG")
         for entry in result.values():
             assert entry["reason"].endswith(". Season 1900 is outside the loaded range.")
 
@@ -727,3 +731,25 @@ def test_add_version_column_on_old_metadata_table():
     assert ingest._has_version_column(con)
     ingest._add_version_column(con)  # a second run leaves the column as it is
     assert ingest._has_version_column(con)
+
+
+# ── tools: derived fantasy tables built before the season_type split (schema version 1) ──
+
+@pytest.mark.parametrize("tool,table", [
+    (tools.nfl_role_trend, "player_role_trend"),
+    (tools.nfl_separation_opportunity, "player_separation_opportunity"),
+    (tools.nfl_contract_value, "player_contract_value"),
+])
+@pytest.mark.parametrize("season_type", ["REG", "POST", "ALL"])
+def test_version_1_fantasy_tables_answer_stale_for_every_season_type(
+        tool, table, season_type, tmp_path, monkeypatch):
+    from nfl_mcp.required_columns import REQUIRED_COLUMNS
+    path = tmp_path / "v1.duckdb"
+    con = duckdb.connect(str(path))
+    cols = [c for c in REQUIRED_COLUMNS[table] if c != "season_type"]
+    con.execute(f"CREATE TABLE {table} ({', '.join(f'{c} VARCHAR' for c in cols)})")
+    con.close()
+    monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))
+    res = tool(season=2024, season_type=season_type)
+    assert res["code"] == "STALE_DERIVED_TABLES"
+    assert "nfl-mcp upgrade" in res["error"]

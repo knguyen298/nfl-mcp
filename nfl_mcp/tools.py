@@ -20,7 +20,7 @@ import re
 import threading
 import time
 import unicodedata
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
 from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any, Dict
@@ -163,39 +163,40 @@ def _team_filter(column: str, value: Any, name: str = "team") -> tuple[str, list
 
 _PLAYOFF_ROUNDS = ("WC", "DIV", "CON", "SB")
 _GAME_TYPES = ("REG", *_PLAYOFF_ROUNDS)
+# season_type is required, exact and upper case. Season-total tools (derived team and player
+# tables, player stats) take REG, POST or ALL; per-game tools also take one playoff round.
+_TOTAL_SEASON_TYPES = ("REG", "POST", "ALL")
+_GAME_SEASON_TYPES = ("REG", "POST", "ALL", *_PLAYOFF_ROUNDS)
 
 
-def _game_types(value: Any) -> tuple[str, ...] | None:
-    """game_type values for a schedules or snap_counts season_type: POST is WC, DIV, CON and SB."""
+def _season_type_arg(value: Any, allowed: Sequence[str] = _TOTAL_SEASON_TYPES) -> str:
+    """The season_type of a call: one of `allowed`, exact and upper case. There is no default."""
+    listed = ", ".join(allowed)
     if value is None:
+        raise _BadArgument(f"season_type is required. Use one of: {listed}.")
+    if not isinstance(value, str) or value not in allowed:
+        raise _BadArgument(f"Unknown season_type {value!r}. Use one of: {listed}.")
+    return value
+
+
+def _game_types(value: Any) -> tuple[str, ...]:
+    """game_type values of a per-game season_type: ALL is every type, POST the four rounds."""
+    key = _season_type_arg(value, _GAME_SEASON_TYPES)
+    if key == "ALL":
+        return _GAME_TYPES
+    return _PLAYOFF_ROUNDS if key == "POST" else (key,)
+
+
+def _plays_season_type(season_type: str, prefix: str = "") -> tuple[str, list[str]] | None:
+    """(clause, params) for a validated season_type on plays, or None for ALL.
+
+    plays.season_type is REG or POST only; a round code takes its games from schedules.game_type.
+    """
+    if season_type == "ALL":
         return None
-    key = value.strip().upper() if isinstance(value, str) else None
-    if key == "POST":
-        return _PLAYOFF_ROUNDS
-    if key in _GAME_TYPES:
-        return (key,)
-    raise _BadArgument(f"Unknown season_type '{value}'. Use one of: REG, POST, WC, DIV, CON, SB.")
-
-
-def _play_season_type(value: Any) -> str | None:
-    """REG or POST for the plays table (season_type there is only REG or POST), else an error."""
-    if value is None:
-        return None
-    key = value.strip().upper() if isinstance(value, str) else None
-    if key in ("REG", "POST"):
-        return key
-    raise _BadArgument(
-        f"Unknown season_type '{value}'. Use REG or POST; plays are stored as REG or POST only.")
-
-
-def _derived_season_type(value: Any) -> str | None:
-    """REG or POST for the derived player tables (nfl_td_luck, nfl_drop_rate), None for both."""
-    if value is None:
-        return None
-    key = value.strip().upper() if isinstance(value, str) else None
-    if key in ("REG", "POST"):
-        return key
-    raise _BadArgument(f"Unknown season_type '{value}'. Use REG or POST.")
+    if season_type in _PLAYOFF_ROUNDS:
+        return f"{prefix}game_id IN (SELECT game_id FROM schedules WHERE game_type = ?)", [season_type]
+    return f"{prefix}season_type = ?", [season_type]
 
 
 def _range_reason(
@@ -458,7 +459,7 @@ def _resolve_player(
             return None, {"error": f"Unknown player_id '{pid}'", "code": "UNKNOWN_PLAYER_ID"}
         return found[0], None
     if not name:
-        return None, {"error": "player_name or player_id is required", "code": "MISSING_PLAYER"}
+        return None, {"error": "player or player_id is required", "code": "MISSING_PLAYER"}
     filters = {"team": team, "season": season, "season_from": season_from, "season_to": season_to}
     candidates, truncated = _find_players(name, **filters)
     if not candidates and any(v is not None for v in filters.values()):
@@ -965,7 +966,7 @@ _PLAY_SORTS = {
     "game_order": "game_id ASC, play_id ASC",
 }
 _PLAY_COLUMNS = (
-    "game_id", "play_id", "season", "week", "posteam", "defteam", "qtr", "down", "ydstogo",
+    "game_id", "play_id", "season", "week", "season_type", "posteam", "defteam", "qtr", "down", "ydstogo",
     "play_type", "yards_gained", "epa", "wpa", '"desc"', "passer_player_name",
     "passer_player_id", "rusher_player_name", "rusher_player_id", "receiver_player_name",
     "receiver_player_id", "touchdown", "interception",
@@ -1045,13 +1046,13 @@ def nfl_search_plays(
     offset: int = 0,
 ) -> Dict[str, Any]:
     """Search for plays using structured filters instead of raw SQL. max_rows is an alias of limit."""
+    season_type = _season_type_arg(season_type, _GAME_SEASON_TYPES)
     limit, offset = _page_args(
         limit if max_rows is None else max_rows, offset, "limit" if max_rows is None else "max_rows")
     season, season_from, season_to = (_int_arg(n, v) for n, v in (
         ("season", season), ("season_from", season_from), ("season_to", season_to)))
     week, min_yards, down, qtr = (_int_arg(n, v) for n, v in (
         ("week", week), ("min_yards", min_yards), ("down", down), ("qtr", qtr)))
-    season_type = _play_season_type(season_type)
     play_type = _choice_arg("play_type", play_type, _PLAY_TYPES)
     situation = _choice_arg("situation", situation, tuple(_SITUATIONS))
     role = _choice_arg("player_role", player_role, tuple(_ROLE_COLUMNS))
@@ -1108,11 +1109,18 @@ def nfl_search_plays(
         params.extend([gsis_id] * len(id_columns))
     for column, op, value in (
         ("season", "=", season), ("season", ">=", season_from), ("season", "<=", season_to),
-        ("week", "=", week), ("season_type", "=", season_type), ("play_type", "=", play_type),
-        ("down", "=", down), ("qtr", "=", qtr),
+        ("week", "=", week),
     ):
         if value is not None:
             conditions.append(f"{column} {op} ?")
+            params.append(value)
+    clause = _plays_season_type(season_type)
+    if clause:
+        conditions.append(clause[0])
+        params.extend(clause[1])
+    for column, value in (("play_type", play_type), ("down", down), ("qtr", qtr)):
+        if value is not None:
+            conditions.append(f"{column} = ?")
             params.append(value)
     if situation:
         conditions.append(_SITUATIONS[situation])
@@ -1154,7 +1162,10 @@ def _team_stats_filter(
     season_to: int | None,
     season_type: str | None,
 ) -> tuple[str, list[Any]]:
-    """WHERE fragment and params for the derived team tables ('ALL' keeps both season types)."""
+    """WHERE fragment and params for the derived team tables ('ALL' keeps both season types).
+
+    season_type is required; a missing or invalid one raises before any query.
+    """
     clause = ""
     params: list[Any] = []
     season, season_from, season_to = (_int_arg(n, v) for n, v in (
@@ -1168,9 +1179,7 @@ def _team_stats_filter(
     if season_to is not None:
         clause += " AND season_year <= ?"
         params.append(season_to)
-    season_type = "REG" if season_type is None else str(season_type).strip().upper()
-    if season_type not in ("REG", "POST", "ALL"):
-        raise _BadArgument(f"Unknown season_type '{season_type}'. Use REG, POST or ALL.")
+    season_type = _season_type_arg(season_type)
     if season_type != "ALL":
         clause += " AND season_type = ?"
         params.append(season_type)
@@ -1184,7 +1193,7 @@ _STALE_TEAM_TABLES = (
 
 
 class _StaleDerivedTables(Exception):
-    """A season_type other than REG was asked of derived tables built before season_type existed."""
+    """A season_type was asked of derived tables built before season_type existed."""
 
 
 _STALE_ERROR = {
@@ -1193,36 +1202,25 @@ _STALE_ERROR = {
 }
 
 
-_STALE_PLAYER_TABLES = (
-    "Derived player tables predate season_type; rows blend REG and POST and carry no "
-    "season_type. Run 'nfl-mcp rebuild'."
-)
 _STALE_PLAYER_ERROR = {
-    "error": "Derived player tables are stale; run `nfl-mcp rebuild`",
+    "error": "Derived player tables are stale; run `nfl-mcp upgrade`",
     "code": "STALE_DERIVED_TABLES",
 }
 
 
 def _season_typed_page(
-    build_sql: Callable[[bool], str],
-    params: list[Any],
-    limit: int,
-    offset: int,
-    season_type: str | None,
-) -> tuple[list[dict], dict, bool]:
-    """(rows, page, stale) for a derived player table. build_sql(has_season_type) gives the SQL.
+    sql: str, params: list[Any], limit: int, offset: int,
+) -> tuple[list[dict], dict]:
+    """One page of a derived player table that must carry season_type.
 
-    A table built before season_type existed still answers a call without season_type (flagged
-    stale). A call that names a season_type raises _StaleDerivedTables on such a table.
+    A table built before season_type existed (schema version 1) raises _StaleDerivedTables.
     """
     try:
-        return (*_execute_limited(build_sql(True), params, limit, offset), False)
+        return _execute_limited(sql, params, limit, offset)
     except duckdb.BinderException as e:
         if 'column "season_type"' not in str(e):  # the message also quotes the SQL text
             raise
-        if season_type is not None:
-            raise _StaleDerivedTables() from e
-    return (*_execute_limited(build_sql(False), params, limit, offset), True)
+        raise _StaleDerivedTables() from e
 
 
 def _team_rows(
@@ -1234,7 +1232,7 @@ def _team_rows(
     """Rows of one derived team table for a franchise's codes, and whether the table lacks
     season_type (not rebuilt yet).
 
-    On a table without season_type only the default REG falls back to unfiltered rows
+    On a table without season_type only REG falls back to unfiltered rows
     (flagged by the caller); any other season_type raises _StaleDerivedTables.
     """
     clause, params = _team_stats_filter(*filters)
@@ -1246,7 +1244,7 @@ def _team_rows(
     except duckdb.BinderException as e:
         if "season_type" not in str(e):
             raise
-        if (filters[3] or "REG").upper() != "REG":
+        if filters[3] != "REG":
             raise _StaleDerivedTables() from e
     clause, params = _team_stats_filter(*filters[:3], "ALL")
     sql = f"SELECT * FROM {table} WHERE {team_sql}{clause} ORDER BY season_year{tail}"
@@ -1260,9 +1258,10 @@ def nfl_team_stats(
     season_from: int | None = None,
     season_to: int | None = None,
     side: str = "both",
-    season_type: str = "REG",
+    season_type: str | None = None,
 ) -> Dict[str, Any]:
     """Get pre-aggregated team stats (offense, defense, or both) for REG, POST, or ALL games."""
+    _season_type_arg(season_type)
     codes = _team_codes(team, required=True)
     side = _choice_arg("side", "both" if side is None else side,
                        ("offense", "defense", "situational", "both"))
@@ -1442,14 +1441,17 @@ def _player_seasons(
     season: int | None,
     season_from: int | None,
     season_to: int | None,
-    season_type: str | None,
+    season_type: str,
 ) -> list[dict[str, Any]]:
-    """Per season and season type passing, rushing and receiving stats for one gsis_id."""
+    """Per season and season type passing, rushing and receiving stats for one gsis_id.
+
+    season_type is REG, POST or ALL; ALL gives the REG row and the POST row of each season.
+    """
     sql = _PLAYER_STATS_SQL
     params: list[Any] = [gsis_id]
     season, season_from, season_to = (_int_arg(n, v) for n, v in (
         ("season", season), ("season_from", season_from), ("season_to", season_to)))
-    season_type = _play_season_type(season_type)
+    season_type = _season_type_arg(season_type)
     if season is not None:
         sql += " AND season = ?"
         params.append(season)
@@ -1459,7 +1461,7 @@ def _player_seasons(
     if season_to is not None:
         sql += " AND season <= ?"
         params.append(season_to)
-    if season_type:
+    if season_type != "ALL":
         sql += " AND season_type = ?"
         params.append(season_type)
     sql += (" GROUP BY season, season_type"
@@ -1472,7 +1474,7 @@ _STAT_BLOCKS = ("passing", "rushing", "receiving")
 
 @_checked
 def nfl_player_stats(
-    player_name: str | None = None,
+    player: str | None = None,
     player_id: str | None = None,
     season: int | None = None,
     season_from: int | None = None,
@@ -1484,35 +1486,35 @@ def nfl_player_stats(
 
     A name that matches several players returns ambiguous candidates; pass player_id then.
     """
+    season_type = _season_type_arg(season_type)
     if stat_type is not None and stat_type not in _STAT_BLOCKS:
         return {"error": f"Unknown stat_type: {stat_type}. Use 'passing', 'rushing', or 'receiving'."}
     season, season_from, season_to = (_int_arg(n, v) for n, v in (
         ("season", season), ("season_from", season_from), ("season_to", season_to)))
-    season_type = _play_season_type(season_type)
     try:
-        player, early = _resolve_player(
-            player_name, player_id, season=season, season_from=season_from, season_to=season_to)
+        found, early = _resolve_player(
+            player, player_id, season=season, season_from=season_from, season_to=season_to)
         if early is not None:
             return early
-        if player is None:
-            return {"player_id": None, "player_name": player_name, "seasons": [],
-                    "reason": f"No player matches '{player_name}'. Try nfl_player_lookup."}
-        seasons = _player_seasons(player["gsis_id"], season, season_from, season_to, season_type)
+        if found is None:
+            return {"player_id": None, "player_name": player, "seasons": [],
+                    "reason": f"No player matches '{player}'. Try nfl_player_lookup."}
+        seasons = _player_seasons(found["gsis_id"], season, season_from, season_to, season_type)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
     if stat_type:
         seasons = [{k: v for k, v in s.items() if k not in _STAT_BLOCKS or k == stat_type}
                    for s in seasons]
-    result = {"player_id": player["gsis_id"], "player_name": player["display_name"],
+    result = {"player_id": found["gsis_id"], "player_name": found["display_name"],
               "seasons": seasons, "definitions": dict(_STAT_DEFINITIONS)}
     return _with_reason(result, seasons, "plays",
                         season=season, season_from=season_from, season_to=season_to)
 
 
 def _compare_teams(
-    entity1: str,
-    entity2: str,
+    team1: str,
+    team2: str,
     season: int | None,
     season_from: int | None,
     season_to: int | None,
@@ -1521,12 +1523,11 @@ def _compare_teams(
     """Team side of nfl_compare: offense and defense rows for each team under one filter."""
     filters = (season, season_from, season_to, season_type)
     _team_stats_filter(*filters)  # validate before any query
-    shown = "REG" if season_type is None else str(season_type).strip().upper()
-    first, second = (_team_codes(e, n, required=True)
-                     for e, n in ((entity1, "entity1"), (entity2, "entity2")))
+    first, second = (_team_codes(t, n, required=True)
+                     for t, n in ((team1, "team1"), (team2, "team2")))
     if first[0] == second[0]:
         raise _BadArgument(
-            f"'{entity1}' and '{entity2}' are the same franchise ({first[0]}). Compare two different teams.")
+            f"'{team1}' and '{team2}' are the same franchise ({first[0]}). Compare two different teams.")
     result: dict[str, Any] = {}
     for codes in (first, second):
         team = codes[0]
@@ -1537,7 +1538,7 @@ def _compare_teams(
             entry["warning"] = _STALE_TEAM_TABLES
         if not offense and not defense:
             scope = f" in {season}" if season is not None else ""
-            entry["reason"] = f"No {shown} team stats for {team}{scope} with the filters given"
+            entry["reason"] = f"No {season_type} team stats for {team}{scope} with the filters given"
             outside = _range_reason(
                 "team_offense_stats", season_col="season_year", season=_int_arg("season", season),
                 season_from=_int_arg("season_from", season_from),
@@ -1549,8 +1550,8 @@ def _compare_teams(
 
 
 def _compare_players(
-    entity1: str,
-    entity2: str,
+    player1: str,
+    player2: str,
     season: int | None,
     season_from: int | None,
     season_to: int | None,
@@ -1558,46 +1559,54 @@ def _compare_players(
 ) -> dict[str, Any]:
     """Player side of nfl_compare: each entity is a name or a gsis id, resolved to one player."""
     entries = []
-    for entity in (entity1, entity2):
-        player, early = _resolve_player(
+    for entity in (player1, player2):
+        found, early = _resolve_player(
             entity, None, season=season, season_from=season_from, season_to=season_to,
             entity=entity)
         if early is not None:
             return early
-        if player is None:
+        if found is None:
             entries.append({"player_id": None, "player_name": entity, "seasons": [],
                             "reason": f"No player matches '{entity}'. Try nfl_player_lookup."})
             continue
-        seasons = _player_seasons(player["gsis_id"], season, season_from, season_to, season_type)
+        seasons = _player_seasons(found["gsis_id"], season, season_from, season_to, season_type)
         entries.append(_with_reason(
-            {"player_id": player["gsis_id"], "player_name": player["display_name"], "seasons": seasons},
+            {"player_id": found["gsis_id"], "player_name": found["display_name"], "seasons": seasons},
             seasons, "plays", season=_int_arg("season", season),
             season_from=_int_arg("season_from", season_from), season_to=_int_arg("season_to", season_to)))
     return {"players": entries, "definitions": dict(_STAT_DEFINITIONS)}
 
 
+_COMPARE_PAIRS = "Use player1 and player2, or team1 and team2."
+
+
+def _given(value: Any) -> bool:
+    return value is not None and bool(str(value).strip())
+
+
 @_checked
 def nfl_compare(
-    entity1: str,
-    entity2: str,
-    compare_type: str = "team",
+    player1: str | None = None,
+    player2: str | None = None,
+    team1: str | None = None,
+    team2: str | None = None,
     season: int | None = None,
     season_from: int | None = None,
     season_to: int | None = None,
     season_type: str | None = None,
 ) -> Dict[str, Any]:
-    """Side-by-side comparison of two teams or players.
+    """Side-by-side comparison of two players (player1, player2) or two teams (team1, team2).
 
-    Team mode reads the derived team tables for season_type (REG by default, POST, or ALL).
+    Team mode reads the derived team tables for season_type (REG, POST, or ALL).
     """
+    season_type = _season_type_arg(season_type)
+    pair = [_given(v) for v in (player1, player2, team1, team2)]
+    if pair not in ([True, True, False, False], [False, False, True, True]):
+        raise _BadArgument(f"{_COMPARE_PAIRS} A call takes exactly one pair, both names of it.")
     try:
-        if compare_type == "team":
-            return _compare_teams(entity1, entity2, season, season_from, season_to, season_type)
-        elif compare_type == "player":
-            return _compare_players(entity1, entity2, season, season_from, season_to, season_type)
-        else:
-            return {"error": "compare_type must be 'team' or 'player'"}
-
+        if pair[0]:
+            return _compare_players(player1, player2, season, season_from, season_to, season_type)
+        return _compare_teams(team1, team2, season, season_from, season_to, season_type)
     except _StaleDerivedTables:
         return dict(_STALE_ERROR)
     except (duckdb.Error, ValueError, TimeoutError) as e:
@@ -1838,11 +1847,15 @@ def nfl_injuries(
     report_status: str | None = None,
     limit: int = _DEFAULT_LIMIT,
     offset: int = 0,
+    season_type: str | None = None,
 ) -> Dict[str, Any]:
     """
     Look up injury report data. Filter by team, season, week, player name, or
     report status (e.g. 'Out', 'Questionable', 'Doubtful', 'Full Participation').
+    season_type (required) is REG, POST, ALL or one round (WC, DIV, CON, SB); each row
+    carries its own season_type (REG or POST).
     """
+    game_types = _game_types(season_type)
     limit, offset = _page_args(limit, offset)
     season, week = _int_arg("season", season), _int_arg("week", week)
     conditions, params = [], []
@@ -1856,6 +1869,9 @@ def nfl_injuries(
     if week is not None:
         conditions.append("week = ?")
         params.append(week)
+    clause = _in_clause("game_type", game_types)
+    conditions.append(clause[0])
+    params.extend(clause[1])
     if player:
         conditions.append("full_name ILIKE ?")
         params.append(f"%{player}%")
@@ -1894,12 +1910,13 @@ def nfl_schedule(
     offset: int = 0,
 ) -> Dict[str, Any]:
     """
-    Look up game schedules and results. Filter by team, season, week, or season type.
+    Look up game schedules and results. Filter by team, season, week, or season type
+    (required: REG, POST, ALL or one round WC, DIV, CON, SB). Each game carries its game_type.
     Returns scores, spread lines, weather, stadium, and coaching info.
     """
+    game_types = _game_types(season_type)
     limit, offset = _page_args(limit, offset)
     season, week = _int_arg("season", season), _int_arg("week", week)
-    game_types = _game_types(season_type)
     conditions, params = [], []
     codes = _team_codes(team)
     if codes:
@@ -1912,12 +1929,11 @@ def nfl_schedule(
     if week is not None:
         conditions.append("week = ?")
         params.append(week)
-    if game_types:
-        clause = _in_clause("game_type", game_types)
-        conditions.append(clause[0])
-        params.extend(clause[1])
+    clause = _in_clause("game_type", game_types)
+    conditions.append(clause[0])
+    params.extend(clause[1])
 
-    where = " AND ".join(conditions) if conditions else "1=1"
+    where = " AND ".join(conditions)
     sql = f"""
         SELECT game_id, season, week, game_type, gameday, gametime,
                away_team, home_team, away_score, home_score, result,
@@ -2035,12 +2051,13 @@ def nfl_snap_counts(
     Returns offense, defense, and special teams snap counts and percentages.
     player matches the full names stored in snap_counts ('Travis Kelce' or 'Kelce'),
     ignoring case, accents and punctuation. player_id (gsis_id) maps through
-    players.pfr_id to snap_counts.pfr_player_id. season_type is REG, POST, WC, DIV, CON or SB
-    (POST is the four playoff rounds). Without season_type every game type is included.
+    players.pfr_id to snap_counts.pfr_player_id. season_type is required: REG, POST (the four
+    playoff rounds), ALL (REG and POST rows, never combined), or one round WC, DIV, CON, SB.
+    offense_pct, defense_pct and st_pct are percents from 0 to 100.
     """
+    game_types = _game_types(season_type)
     limit, offset = _page_args(limit, offset)
     season, week = _int_arg("season", season), _int_arg("week", week)
-    game_types = _game_types(season_type)
     conditions, params = [], []
     try:
         if player_id:
@@ -2068,19 +2085,19 @@ def nfl_snap_counts(
         if week is not None:
             conditions.append("week = ?")
             params.append(week)
-        if game_types:
-            clause = _in_clause("game_type", game_types)
-            conditions.append(clause[0])
-            params.extend(clause[1])
+        clause = _in_clause("game_type", game_types)
+        conditions.append(clause[0])
+        params.extend(clause[1])
         if position:
             conditions.append("position ILIKE ?")
             params.append(position.upper())
 
-        where = " AND ".join(conditions) if conditions else "1=1"
+        where = " AND ".join(conditions)
         sql = f"""
             SELECT player, pfr_player_id, position, team, opponent, season, week, game_type,
-                   offense_snaps, offense_pct, defense_snaps, defense_pct,
-                   st_snaps, st_pct
+                   offense_snaps, ROUND(100 * offense_pct, 1) AS offense_pct, defense_snaps,
+                   ROUND(100 * defense_pct, 1) AS defense_pct,
+                   st_snaps, ROUND(100 * st_pct, 1) AS st_pct
             FROM snap_counts
             WHERE {where}
             ORDER BY season, week, team, offense_snaps DESC NULLS LAST, player, pfr_player_id, rowid
@@ -2093,6 +2110,12 @@ def nfl_snap_counts(
         return {"error": str(e)}
 
 
+# season_type of an ff_opportunity row (aliased o, joined to schedules as g): REG when the game
+# is a regular-season game, POST for any playoff round. Without a schedules row the week decides.
+_FF_SEASON_TYPE = ("CASE WHEN g.game_type IS NULL THEN CASE WHEN o.week > 18 THEN 'POST' ELSE 'REG' END "
+                   "WHEN g.game_type = 'REG' THEN 'REG' ELSE 'POST' END")
+
+
 @_checked
 def nfl_fantasy_opportunity(
     player: str | None = None,
@@ -2103,11 +2126,15 @@ def nfl_fantasy_opportunity(
     player_id: str | None = None,
     limit: int = _DEFAULT_LIMIT,
     offset: int = 0,
+    season_type: str | None = None,
 ) -> Dict[str, Any]:
     """
     Look up fantasy football opportunity data — target share, air yards share,
     carry share, and opportunity scores per player per week. Available 2006–present.
+    season_type (required) is REG, POST, ALL or one round (WC, DIV, CON, SB); the round of a
+    game comes from schedules through game_id. Each row carries its season_type (REG or POST).
     """
+    season_type = _season_type_arg(season_type, _GAME_SEASON_TYPES)
     limit, offset = _page_args(limit, offset)
     season, week = _int_arg("season", season), _int_arg("week", week)
     team_clause = _team_filter("posteam", team)
@@ -2125,25 +2152,34 @@ def nfl_fantasy_opportunity(
         params.extend(team_clause[1])
     if season is not None:
         conditions.append("season = ?")
-        params.append(season)
+        params.append(str(season))
     if week is not None:
         conditions.append("week = ?")
         params.append(week)
     if position:
         conditions.append("position ILIKE ?")
         params.append(position.upper())
+    if season_type in _PLAYOFF_ROUNDS:
+        conditions.append("g.game_type = ?")
+        params.append(season_type)
+    elif season_type != "ALL":
+        conditions.append(f"{_FF_SEASON_TYPE} = ?")
+        params.append(season_type)
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
-        SELECT season, week, posteam, full_name, position, player_id,
+        SELECT CAST(season AS INTEGER) AS season, CAST(week AS INTEGER) AS week,
+               {_FF_SEASON_TYPE} AS season_type, posteam, full_name, position, player_id,
                rec_attempt, rush_attempt, rec_air_yards,
                receptions, receptions_exp, rec_yards_gained, rush_yards_gained,
                rec_touchdown, rush_touchdown,
                total_fantasy_points, total_fantasy_points_exp, total_fantasy_points_diff,
                rec_attempt_team, rush_attempt_team
-        FROM ff_opportunity
+        FROM ff_opportunity o
+        LEFT JOIN (SELECT game_id, ANY_VALUE(game_type) AS game_type FROM schedules GROUP BY game_id) g
+          ON g.game_id = o.game_id
         WHERE {where}
-        ORDER BY season DESC, week DESC, total_fantasy_points_exp DESC NULLS LAST, player_id, rowid
+        ORDER BY season DESC, week DESC, total_fantasy_points_exp DESC NULLS LAST, player_id, o.rowid
     """
     try:
         rows, page = _execute_limited(sql, params, limit, offset)
@@ -2243,14 +2279,16 @@ def nfl_ftn_charting(
     team/player/season context. Offensive perspective (team = posteam).
     player (a name) or player_id (gsis_id) selects one player, matched on the passer,
     rusher and receiver id columns; a name matching several players is ambiguous.
+    season_type (required) is REG, POST, ALL or one round (WC, DIV, CON, SB). ALL returns one
+    result per season type in season_types and no combined total.
     """
+    season_type = _season_type_arg(season_type, _GAME_SEASON_TYPES)
     conditions = ["f.nflverse_game_id = p.game_id", "f.nflverse_play_id = p.play_id",
                   "p.play_type IN ('pass', 'run')"]
     params: list[Any] = []
     season, season_from, season_to = (_int_arg(n, v) for n, v in (
         ("season", season), ("season_from", season_from), ("season_to", season_to)))
     week = _int_arg("week", week)
-    season_type = _play_season_type(season_type)
     for column, value, label in (("p.posteam", team, "team"), ("p.defteam", opponent, "opponent")):
         clause = _team_filter(column, value, label)
         if clause:
@@ -2286,13 +2324,16 @@ def nfl_ftn_charting(
     if week is not None:
         conditions.append("p.week = ?")
         params.append(week)
-    if season_type:
-        conditions.append("p.season_type = ?")
-        params.append(season_type)
+    clause = _plays_season_type(season_type, "p.")
+    if clause:
+        conditions.append(clause[0])
+        params.extend(clause[1])
 
+    by_type = season_type == "ALL"
     where = " AND ".join(conditions)
     sql = f"""
         SELECT
+            {"p.season_type," if by_type else ""}
             COUNT(*) AS total_plays,
             SUM(CASE WHEN f.is_play_action THEN 1 ELSE 0 END) AS play_action,
             SUM(CASE WHEN f.is_rpo THEN 1 ELSE 0 END) AS rpo,
@@ -2305,6 +2346,7 @@ def nfl_ftn_charting(
             AVG(CASE WHEN p.play_type = 'pass' THEN f.n_blitzers END) AS avg_blitzers
         FROM ftn_charting f, plays p
         WHERE {where}
+        {"GROUP BY p.season_type ORDER BY CASE p.season_type WHEN 'REG' THEN 0 ELSE 1 END" if by_type else ""}
     """
     try:
         rows = _execute(sql, params if params else None)
@@ -2312,11 +2354,22 @@ def nfl_ftn_charting(
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
 
-    agg = rows[0] if rows else {}
-    total = agg.get("total_plays") or 0
-    if not total:
+    rows = [r for r in rows if r.get("total_plays")]
+    if not rows:
         return _with_reason(_with_player({"charting": {}, "total_plays": 0}, resolved), None, "plays",
                             season=season, season_from=season_from, season_to=season_to, week=week)
+    if by_type:
+        # One result per season type; a total across REG and POST is never computed.
+        return _with_player(
+            {"season_types": [{"season_type": r["season_type"], "total_plays": r["total_plays"],
+                               "charting": _charting_block(r)} for r in rows]}, resolved)
+    return _with_player({"charting": _charting_block(rows[0]), "total_plays": rows[0]["total_plays"]},
+                        resolved)
+
+
+def _charting_block(agg: dict[str, Any]) -> dict[str, Any]:
+    """The charting rates of one aggregate row of nfl_ftn_charting."""
+    total = agg["total_plays"]
 
     def _pct(n: Any) -> float:
         return round(100.0 * (n or 0) / total, 1)
@@ -2324,21 +2377,18 @@ def nfl_ftn_charting(
     def _avg(v: Any) -> float | None:
         return round(v, 2) if v is not None else None
 
-    return _with_player({
-        "charting": {
-            "total_plays": total,
-            "play_action": {"plays": agg.get("play_action") or 0, "pct": _pct(agg.get("play_action"))},
-            "rpo": {"plays": agg.get("rpo") or 0, "pct": _pct(agg.get("rpo"))},
-            "screen_pass": {"plays": agg.get("screen_pass") or 0, "pct": _pct(agg.get("screen_pass"))},
-            "no_huddle": {"plays": agg.get("no_huddle") or 0, "pct": _pct(agg.get("no_huddle"))},
-            "motion": {"plays": agg.get("motion") or 0, "pct": _pct(agg.get("motion"))},
-            "trick_play": {"plays": agg.get("trick_play") or 0, "pct": _pct(agg.get("trick_play"))},
-            "avg_defenders_in_box": _avg(agg.get("avg_defenders_in_box")),
-            "avg_pass_rushers": _avg(agg.get("avg_pass_rushers")),
-            "avg_blitzers": _avg(agg.get("avg_blitzers")),
-        },
+    return {
         "total_plays": total,
-    }, resolved)
+        "play_action": {"plays": agg.get("play_action") or 0, "pct": _pct(agg.get("play_action"))},
+        "rpo": {"plays": agg.get("rpo") or 0, "pct": _pct(agg.get("rpo"))},
+        "screen_pass": {"plays": agg.get("screen_pass") or 0, "pct": _pct(agg.get("screen_pass"))},
+        "no_huddle": {"plays": agg.get("no_huddle") or 0, "pct": _pct(agg.get("no_huddle"))},
+        "motion": {"plays": agg.get("motion") or 0, "pct": _pct(agg.get("motion"))},
+        "trick_play": {"plays": agg.get("trick_play") or 0, "pct": _pct(agg.get("trick_play"))},
+        "avg_defenders_in_box": _avg(agg.get("avg_defenders_in_box")),
+        "avg_pass_rushers": _avg(agg.get("avg_pass_rushers")),
+        "avg_blitzers": _avg(agg.get("avg_blitzers")),
+    }
 
 
 @_checked
@@ -2356,12 +2406,13 @@ def nfl_td_luck(
     Touchdown luck — actual vs expected TDs per player-season from the
     player_td_luck table. Negative total_td_luck_score = scored fewer TDs than
     expected (positive-regression / "unlucky" candidate); positive = over-performed.
-    Default sort is most unlucky first (total_td_luck_score ASC). Each row has a
-    season_type (REG or POST); season_type filters to one, and None returns both.
+    Default sort is most unlucky first (total_td_luck_score ASC). season_type (required) is
+    REG, POST or ALL; each row has a season_type, and ALL returns the REG and POST rows
+    separately, never summed.
     """
+    season_type = _season_type_arg(season_type)
     limit, offset = _page_args(limit, offset)
     season = _int_arg("season", season)
-    season_type = _derived_season_type(season_type)
     team_clause = _team_filter("team", team)
     team = _team_codes(team)  # codes for the player resolver
     conditions, params = [], []
@@ -2381,30 +2432,24 @@ def nfl_td_luck(
     if season is not None:
         conditions.append("season = ?")
         params.append(season)
-    if season_type:
+    if season_type != "ALL":
         conditions.append("season_type = ?")
         params.append(season_type)
 
     where = " AND ".join(conditions) if conditions else "1=1"
-
-    def sql(typed: bool) -> str:
-        return f"""
-        SELECT player_id, full_name, position, team, season{", season_type" if typed else ""},
+    sql = f"""
+        SELECT player_id, full_name, position, team, season, season_type,
                rec_td, rec_td_exp, rec_td_luck,
                rush_td, rush_td_exp, rush_td_luck,
                total_td_luck_score
         FROM player_td_luck
         WHERE {where}
-        ORDER BY total_td_luck_score ASC NULLS LAST, player_id, season,
-                 {"season_type DESC, " if typed else ""}rowid
+        ORDER BY total_td_luck_score ASC NULLS LAST, player_id, season, season_type DESC, rowid
     """
     try:
-        rows, page, stale = _season_typed_page(sql, params, limit, offset, season_type)
-        result = _with_reason(_with_player({"td_luck": rows, **page}, resolved),
-                              rows, "player_td_luck", season=season)
-        if stale:
-            result["warning"] = _STALE_PLAYER_TABLES
-        return result
+        rows, page = _season_typed_page(sql, params, limit, offset)
+        return _with_reason(_with_player({"td_luck": rows, **page}, resolved),
+                            rows, "player_td_luck", season=season)
     except _StaleDerivedTables:
         return dict(_STALE_PLAYER_ERROR)
     except (duckdb.Error, ValueError, TimeoutError) as e:
@@ -2423,13 +2468,18 @@ def nfl_role_trend(
     limit: int = _DEFAULT_LIMIT,
     player_id: str | None = None,
     offset: int = 0,
+    season_type: str | None = None,
 ) -> Dict[str, Any]:
     """
     Rolling 3-week role trend — weekly snap %, target/carry/air-yards share with a
     trailing 3-week average and the current-week delta vs that average (from
     player_role_trend). Surfaces players whose usage is rising or fading. Default
-    sort is biggest snap-share gain first (snap_pct_delta DESC).
+    sort is biggest snap-share gain first (snap_pct_delta DESC). season_type (required) is
+    REG, POST, ALL or one round (WC, DIV, CON, SB). The 3-week window never mixes REG and
+    POST weeks; each row has a season_type (REG or POST). Snap and share values are
+    percents from 0 to 100.
     """
+    season_type = _season_type_arg(season_type, _GAME_SEASON_TYPES)
     limit, offset = _page_args(limit, offset)
     season, week = _int_arg("season", season), _int_arg("week", week)
     min_snap_pct = _num_arg("min_snap_pct", min_snap_pct)
@@ -2458,10 +2508,21 @@ def nfl_role_trend(
     if min_snap_pct is not None:
         conditions.append("snap_pct >= ?")
         params.append(min_snap_pct)
+    if season_type in _PLAYOFF_ROUNDS:
+        # The derived table keeps REG and POST only; a round is the schedules game_type of the week.
+        conditions.append(
+            "EXISTS (SELECT 1 FROM ff_opportunity o JOIN schedules g ON g.game_id = o.game_id "
+            "WHERE o.player_id = player_role_trend.player_id "
+            "AND CAST(o.season AS INTEGER) = player_role_trend.season "
+            "AND CAST(o.week AS INTEGER) = player_role_trend.week AND g.game_type = ?)")
+        params.append(season_type)
+    elif season_type != "ALL":
+        conditions.append("season_type = ?")
+        params.append(season_type)
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
-        SELECT player_id, full_name, position, team, season, week,
+        SELECT player_id, full_name, position, team, season, season_type, week,
                snap_pct, target_share_pct, carry_share_pct, air_yards_share_pct,
                snap_pct_3wk, target_share_pct_3wk, carry_share_pct_3wk, air_yards_share_pct_3wk,
                snap_pct_delta, target_share_pct_delta, carry_share_pct_delta, air_yards_share_pct_delta
@@ -2470,9 +2531,11 @@ def nfl_role_trend(
         ORDER BY snap_pct_delta DESC NULLS LAST, player_id, season, week, rowid
     """
     try:
-        rows, page = _execute_limited(sql, params, limit, offset)
+        rows, page = _season_typed_page(sql, params, limit, offset)
         return _with_reason(_with_player({"role_trend": rows, **page}, resolved),
                             rows, "player_role_trend", season=season, week=week)
+    except _StaleDerivedTables:
+        return dict(_STALE_PLAYER_ERROR)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -2488,6 +2551,7 @@ def nfl_separation_opportunity(
     limit: int = _DEFAULT_LIMIT,
     player_id: str | None = None,
     offset: int = 0,
+    season_type: str | None = None,
 ) -> Dict[str, Any]:
     """
     Separation-adjusted opportunity — joins Next Gen Stats receiving separation/YAC
@@ -2495,8 +2559,10 @@ def nfl_separation_opportunity(
     Flags receivers getting open (avg_separation > 2.5) who under-produced
     (fp_diff_per_game < -1.5 and td_luck < -1.0) as regression_candidate. Next Gen
     Stats only goes back to 2016. Default sort is most under-producing first
-    (fp_diff_per_game ASC).
+    (fp_diff_per_game ASC). season_type (required) is REG, POST or ALL; each row has a
+    season_type, and ALL returns the REG and POST rows separately, never summed.
     """
+    season_type = _season_type_arg(season_type)
     limit, offset = _page_args(limit, offset)
     season = _int_arg("season", season)
     if season is not None and season < 2016:
@@ -2525,22 +2591,27 @@ def nfl_separation_opportunity(
     if regression_candidate is not None:
         conditions.append("regression_candidate = ?")
         params.append(regression_candidate)
+    if season_type != "ALL":
+        conditions.append("season_type = ?")
+        params.append(season_type)
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
-        SELECT player_id, full_name, position, team, season, games,
+        SELECT player_id, full_name, position, team, season, season_type, games,
                fp_diff, fp_diff_per_game, td_luck, catch_luck,
                target_share_pct, air_yards_share_pct,
                avg_separation, avg_yac_above_expectation, catch_percentage,
                regression_candidate
         FROM player_separation_opportunity
         WHERE {where}
-        ORDER BY fp_diff_per_game ASC NULLS LAST, player_id, season, rowid
+        ORDER BY fp_diff_per_game ASC NULLS LAST, player_id, season, season_type DESC, rowid
     """
     try:
-        rows, page = _execute_limited(sql, params, limit, offset)
+        rows, page = _season_typed_page(sql, params, limit, offset)
         return _with_reason(_with_player({"separation_opportunity": rows, **page}, resolved),
                             rows, "player_separation_opportunity", season=season)
+    except _StaleDerivedTables:
+        return dict(_STALE_PLAYER_ERROR)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
@@ -2562,12 +2633,13 @@ def nfl_drop_rate(
     charting (2022+) joined to plays (player_drop_rate). Also reports contested
     targets and created receptions. The player column holds nflverse short names
     ('J.Jefferson'); a full name in `player` resolves through players and filters by id.
-    Default sort is highest drop rate first (drop_rate_pct DESC). Each row has a
-    season_type (REG or POST); season_type filters to one, and None returns both.
+    Default sort is highest drop rate first (drop_rate_pct DESC). season_type (required) is
+    REG, POST or ALL; each row has a season_type, and ALL returns the REG and POST rows
+    separately, never summed.
     """
+    season_type = _season_type_arg(season_type)
     limit, offset = _page_args(limit, offset)
     season = _int_arg("season", season)
-    season_type = _derived_season_type(season_type)
     if season is not None and season < 2022:
         return {"error": "FTN charting (drop) data is only available from 2022 onward"}
 
@@ -2588,7 +2660,7 @@ def nfl_drop_rate(
     if season is not None:
         conditions.append("season = ?")
         params.append(season)
-    if season_type:
+    if season_type != "ALL":
         conditions.append("season_type = ?")
         params.append(season_type)
     if min_targets is not None:
@@ -2596,24 +2668,18 @@ def nfl_drop_rate(
         params.append(min_targets)
 
     where = " AND ".join(conditions) if conditions else "1=1"
-
-    def sql(typed: bool) -> str:
-        return f"""
-        SELECT player_id, player, team, season{", season_type" if typed else ""},
+    sql = f"""
+        SELECT player_id, player, team, season, season_type,
                catchable_targets, drops, drop_rate_pct,
                contested_targets, created_receptions
         FROM player_drop_rate
         WHERE {where}
-        ORDER BY drop_rate_pct DESC NULLS LAST, player_id, season,
-                 {"season_type DESC, " if typed else ""}rowid
+        ORDER BY drop_rate_pct DESC NULLS LAST, player_id, season, season_type DESC, rowid
     """
     try:
-        rows, page, stale = _season_typed_page(sql, params, limit, offset, season_type)
-        result = _with_reason(_with_player({"drop_rate": rows, **page}, resolved),
-                              rows, "player_drop_rate", season=season)
-        if stale:
-            result["warning"] = _STALE_PLAYER_TABLES
-        return result
+        rows, page = _season_typed_page(sql, params, limit, offset)
+        return _with_reason(_with_player({"drop_rate": rows, **page}, resolved),
+                            rows, "player_drop_rate", season=season)
     except _StaleDerivedTables:
         return dict(_STALE_PLAYER_ERROR)
     except (duckdb.Error, ValueError, TimeoutError) as e:
@@ -2632,13 +2698,17 @@ def nfl_contract_value(
     limit: int = _DEFAULT_LIMIT,
     player_id: str | None = None,
     offset: int = 0,
+    season_type: str | None = None,
 ) -> Dict[str, Any]:
     """
     Contract value efficiency — fantasy points per $M of average per year (APY),
     using each player's active contract joined to seasonal fantasy production
-    (player_contract_value). apy and cap_pct reflect the current active contract.
-    Default sort is best value first (fp_per_million DESC).
+    (player_contract_value). apy and cap_pct reflect the contract in force that season.
+    Default sort is best value first (fp_per_million DESC). season_type (required) is REG, POST
+    or ALL; each row has a season_type, and ALL returns the REG and POST rows separately, never
+    summed.
     """
+    season_type = _season_type_arg(season_type)
     limit, offset = _page_args(limit, offset)
     season = _int_arg("season", season)
     min_apy, max_apy = _num_arg("min_apy", min_apy), _num_arg("max_apy", max_apy)
@@ -2667,19 +2737,24 @@ def nfl_contract_value(
     if max_apy is not None:
         conditions.append("apy <= ?")
         params.append(max_apy)
+    if season_type != "ALL":
+        conditions.append("season_type = ?")
+        params.append(season_type)
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
-        SELECT player_id, full_name, position, team, season,
+        SELECT player_id, full_name, position, team, season, season_type,
                apy, cap_pct, total_fp, total_fp_exp, fp_per_million
         FROM player_contract_value
         WHERE {where}
-        ORDER BY fp_per_million DESC NULLS LAST, player_id, season, rowid
+        ORDER BY fp_per_million DESC NULLS LAST, player_id, season, season_type DESC, rowid
     """
     try:
-        rows, page = _execute_limited(sql, params, limit, offset)
+        rows, page = _season_typed_page(sql, params, limit, offset)
         return _with_reason(_with_player({"contract_value": rows, **page}, resolved),
                             rows, "player_contract_value", season=season)
+    except _StaleDerivedTables:
+        return dict(_STALE_PLAYER_ERROR)
     except (duckdb.Error, ValueError, TimeoutError) as e:
         logger.error("Tool error: %s", e, exc_info=True)
         return {"error": str(e)}
