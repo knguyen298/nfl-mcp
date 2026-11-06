@@ -20,14 +20,20 @@ Interface contract tested here
   season to date; NULL on ESPN rows). nfl_team_records returns them. migrate.SCHEMA_VERSION is
   3 and a schema-2 database is upgraded without the network to the same table a fresh build
   makes. On a database whose team_records lacks the columns, nfl_team_records still returns
-  the records, without points, with a `warning` that names `nfl-mcp upgrade`.
+  the records, without points, with a `warning` that says the points appear after the next
+  database update (it does not tell the user to run `nfl-mcp upgrade`).
 - Each nfl_player_stats season entry has `games`: distinct games of that season and season
   type in which the player has a snap_counts row with at least one snap, or a player_stats
-  row. definitions["games"] names both sources.
-- nfl_query: a truncated result has a `hint` that names the row limit, max_rows and its
-  maximum (500), information_schema.columns and nfl_schema. DESCRIBE, SHOW and SUMMARIZE
-  return up to 500 rows when max_rows is not given; other statements keep 100. The
-  inputSchema has no default for max_rows (mcpo sends a schema default on every call).
+  row. definitions["games"] names both sources. A database without a source table or a
+  column the games query reads (players.pfr_id, snap_counts.game_id) gives games null, not
+  an error.
+- nfl_query: max_rows not given (None) means 100 for every statement, DESCRIBE, SHOW and
+  SUMMARIZE included (DESCRIBE plays at 500 rows was 46 KB). A truncated result has a `hint`
+  that names the row limit, max_rows and its maximum (500). For DESCRIBE, SHOW, SUMMARIZE or
+  a statement that reads information_schema, the hint gives the information_schema.columns
+  filter and nfl_schema; for other statements it says to filter with WHERE, page with LIMIT
+  and OFFSET, or aggregate. The inputSchema has no default for max_rows (mcpo sends a schema
+  default on every call).
 - A missing player gives MISSING_PLAYER with the exact form {"player": "..."} and says that
   other names such as player_name are not accepted. The same in nfl_player_lookup,
   nfl_search_plays (player_role) and nfl_compare (the pair form).
@@ -230,13 +236,14 @@ def test_stale_team_records_still_returns_records_with_a_warning(stale_records):
     (row,) = res["records"]
     assert (row["wins"], row["losses"], row["ties"]) == (1, 1, 1)
     assert not {"points_for", "points_against", "point_diff"} & set(row), row
-    assert "nfl-mcp upgrade" in res["warning"] and "points" in res["warning"]
+    assert "points" in res["warning"] and "next database update" in res["warning"]
+    assert "nfl-mcp upgrade" not in res["warning"]
 
 
 def test_stale_team_records_over_mcp_is_not_an_error(stale_records):
     is_error, payload = _raw("nfl_team_records", {"team": "KC", "season": 2024})
     assert not is_error, payload
-    assert "nfl-mcp upgrade" in payload["warning"]
+    assert "next database update" in payload["warning"]
 
 
 def test_team_records_other_missing_column_is_an_error_not_a_points_fallback(tmp_path, monkeypatch):
@@ -462,6 +469,20 @@ def test_player_games_is_empty_without_the_source_tables(tmp_path, monkeypatch):
     assert tools._player_games("00-0000001") == {}
 
 
+@pytest.mark.parametrize("table, column", [("players", "pfr_id"), ("snap_counts", "game_id")])
+def test_player_games_is_empty_without_a_column_it_reads(tmp_path, monkeypatch, table, column):
+    # A missing column is a DuckDB BinderException, not a CatalogException.
+    path = tmp_path / "g.duckdb"
+    _games_db(path)
+    con = duckdb.connect(str(path))
+    con.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    with pytest.raises(duckdb.BinderException):
+        con.execute(tools._PLAYER_GAMES_SQL, ["00-0000001", "00-0000001"])
+    con.close()
+    monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))
+    assert tools._player_games("00-0000001") == {}
+
+
 @pytest.fixture
 def one_player(monkeypatch):
     monkeypatch.setattr(tools, "_resolve_player",
@@ -499,6 +520,23 @@ def test_player_stats_games_is_none_when_no_source_has_the_season(monkeypatch, o
     assert entry["games"] is None
 
 
+def test_games_is_null_not_an_error_when_the_games_query_misses_a_column(monkeypatch, one_player):
+    stats = _fake_execute([], [_stats_row(2024, "REG")])
+
+    def fake(sql, params=None):
+        if "snap_counts" in sql:
+            raise duckdb.BinderException('Referenced column "pfr_id" not found')
+        return stats(sql, params)
+    monkeypatch.setattr(tools, "_execute", fake)
+    res = tools.nfl_player_stats(player="Player One", season=2024, season_type="REG")
+    assert "error" not in res, res
+    assert [s["games"] for s in res["seasons"]] == [None]
+    res = tools.nfl_compare(player1="Player One", player2="Player One", season=2024,
+                            season_type="REG")
+    assert "error" not in res, res
+    assert [s["games"] for p in res["players"] for s in p["seasons"]] == [None, None]
+
+
 def test_player_stats_keeps_games_with_stat_type(monkeypatch, one_player):
     monkeypatch.setattr(tools, "_execute", _fake_execute(
         [{"season": 2024, "season_type": "REG", "games": 15}], [_stats_row(2024, "REG")]))
@@ -518,7 +556,7 @@ def test_player_stats_description_mentions_games():
     assert "games" in _desc("nfl_player_stats")
 
 
-# ═══ 3. nfl_query: truncation hint and the DESCRIBE default ════════════════════
+# ═══ 3. nfl_query: truncation hint and the default of 100 rows ═════════════════
 
 @pytest.fixture
 def wide_db(tmp_path, monkeypatch):
@@ -533,12 +571,24 @@ def wide_db(tmp_path, monkeypatch):
     return path
 
 
-@pytest.mark.parametrize("sql", ["DESCRIBE wide", "SHOW wide", "  describe wide;", "SUMMARIZE wide",
-                                 "-- columns\nDESCRIBE wide"])
-def test_describe_show_summarize_return_up_to_500_rows_by_default(wide_db, sql):
+_CATALOG_SQL = ["DESCRIBE wide", "SHOW wide", "  describe wide;", "SUMMARIZE wide",
+                "-- columns\nDESCRIBE wide",
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'wide'"]
+
+
+@pytest.mark.parametrize("sql", _CATALOG_SQL)
+def test_describe_show_summarize_keep_the_default_of_100_rows(wide_db, sql):
+    # DESCRIBE plays at 500 rows was 46 KB and SUMMARIZE plays 97 KB, so every statement
+    # defaults to 100 rows.
     res = tools.nfl_query(sql)
-    assert res["row_count"] == 150 and res["truncated"] is False, res.get("row_count")
-    assert "hint" not in res
+    assert res["row_count"] == 100 and res["truncated"] is True, res.get("row_count")
+
+
+@pytest.mark.parametrize("sql", _CATALOG_SQL)
+def test_catalog_truncation_hint_gives_the_column_filter(wide_db, sql):
+    hint = tools.nfl_query(sql)["hint"]
+    assert "100" in hint and "max_rows" in hint and "500" in hint
+    assert "information_schema.columns" in hint and "nfl_schema" in hint
 
 
 def test_select_keeps_the_default_of_100_rows(wide_db):
@@ -546,12 +596,23 @@ def test_select_keeps_the_default_of_100_rows(wide_db):
     assert res["row_count"] == 100 and res["truncated"] is True
 
 
-def test_truncated_result_has_a_hint_naming_the_limit_and_the_ways_out(wide_db):
-    res = tools.nfl_query("DESCRIBE wide", max_rows=100)
-    assert res["row_count"] == 100 and res["truncated"] is True
+def test_select_truncation_hint_is_generic(wide_db):
+    res = tools.nfl_query("SELECT * FROM range(300)", max_rows=50)
+    assert res["row_count"] == 50 and res["truncated"] is True
     hint = res["hint"]
-    assert "100" in hint and "max_rows" in hint and "500" in hint
-    assert "information_schema.columns" in hint and "nfl_schema" in hint
+    assert "50" in hint and "raise max_rows" in hint and "500" in hint
+    assert "WHERE" in hint and "LIMIT" in hint and "OFFSET" in hint and "aggregate" in hint
+    assert "information_schema" not in hint and "nfl_schema" not in hint
+
+
+def test_catalog_truncation_hint_at_the_maximum(wide_db):
+    # 152 columns (wide and plays) times 4 is more than 500 rows.
+    res = tools.nfl_query("SELECT c.column_name FROM information_schema.columns c, range(4)",
+                          max_rows=500)
+    assert res["row_count"] == 500 and res["truncated"] is True
+    hint = res["hint"]
+    assert "raise max_rows" not in hint.lower()
+    assert "information_schema.columns" in hint
 
 
 def test_truncated_at_the_maximum_does_not_suggest_raising_max_rows(wide_db):
@@ -561,6 +622,7 @@ def test_truncated_at_the_maximum_does_not_suggest_raising_max_rows(wide_db):
     assert "500" in hint
     assert "raise max_rows" not in hint.lower()
     assert "WHERE" in hint
+    assert "information_schema" not in hint
 
 
 def test_untruncated_result_has_no_hint(wide_db):
@@ -573,18 +635,19 @@ def test_query_max_rows_has_no_schema_default():
     # "max_rows not given" from the tool.
     prop = TOOLS_BY_NAME["nfl_query"].inputSchema["properties"]["max_rows"]
     assert "default" not in prop
-    assert "DESCRIBE" in prop["description"] and "500" in prop["description"]
+    assert "100" in prop["description"] and "500" in prop["description"]
+    assert "DESCRIBE" not in prop["description"]
 
 
 @pytest.mark.integration
-def test_describe_plays_returns_every_column(real):
+def test_describe_plays_returns_100_rows_and_the_column_hint(real):
     # SELECT count(*) FROM information_schema.columns WHERE table_name = 'plays'  -> 373 here
     n = real.execute("SELECT count(*) FROM information_schema.columns "
                      "WHERE table_name = 'plays'").fetchone()[0]
     assert n > 100
     res = tools.nfl_query("DESCRIBE plays")
-    assert res["row_count"] == min(n, 500)
-    assert res["truncated"] is (n > 500)
+    assert res["row_count"] == 100 and res["truncated"] is True
+    assert "information_schema.columns" in res["hint"]
 
 
 # ═══ 4. missing player: the exact form ═════════════════════════════════════════
@@ -650,7 +713,7 @@ def test_parser_error_has_code_and_duckdb_forms(sql):
     assert "nfl_schema" in hint
 
 
-def test_parser_error_over_mcp_is_not_tool_error(tmp_path, monkeypatch):
+def test_parser_error_over_mcp_is_tool_error_with_syntax_code(tmp_path, monkeypatch):
     path = tmp_path / "empty.duckdb"
     duckdb.connect(str(path)).close()
     monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))

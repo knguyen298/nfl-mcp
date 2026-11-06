@@ -338,7 +338,7 @@ def test_invalid_max_rows_returns_error(db, bad):
 
 
 def test_max_rows_none_means_the_default(db):
-    # v0.7.1: max_rows defaults to None (100 rows; 500 for DESCRIBE/SHOW/SUMMARIZE).
+    # v0.7.1: max_rows defaults to None, which means 100 rows for every statement.
     result = nfl_query("SELECT range AS i FROM range(150)", max_rows=None)
     assert (result["row_count"], result["truncated"]) == (100, True)
 

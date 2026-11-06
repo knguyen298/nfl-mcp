@@ -958,25 +958,27 @@ _EXPLAIN_PREFIX = re.compile(
     rf"{_EXPLAIN_OPTION}(?:\s*,\s*{_EXPLAIN_OPTION})*\s*\))?",
     re.IGNORECASE | re.DOTALL,
 )
-# Statements that list a table's columns or describe it. Their row count is the column
-# count (plays has about 370), so they default to the row cap instead of 100.
+# Statements that list a table's columns or describe it. A truncated one gets a hint on
+# listing only the columns needed, through information_schema.columns.
 _CATALOG_STATEMENT = re.compile(rf"\A{_GAP}(?:DESCRIBE|SHOW|SUMMARIZE)\b", re.IGNORECASE | re.DOTALL)
 _DEFAULT_QUERY_ROWS = 100
 
 
-def _truncated_hint(max_rows: int) -> str:
+def _truncated_hint(max_rows: int, sql: str) -> str:
     """How to see more than the max_rows rows a truncated nfl_query returned."""
-    columns = ("SELECT column_name FROM information_schema.columns WHERE table_name = 'plays' "
-               "AND column_name LIKE '%epa%'")
     if max_rows < _MAX_ROWS:
-        return (f"Only the first {max_rows} rows are shown (max_rows={max_rows}). To see more, "
-                f"raise max_rows (up to {_MAX_ROWS}), page with LIMIT and OFFSET, or narrow the "
-                f"statement with WHERE, for example {columns}. nfl_schema(category='<name>') "
-                "lists play-by-play columns by topic.")
-    return (f"Only the first {_MAX_ROWS} rows are shown; {_MAX_ROWS} is the most max_rows "
-            f"allows. Page with LIMIT and OFFSET, aggregate, or narrow the statement with WHERE, "
-            f"for example {columns}. nfl_schema(category='<name>') lists play-by-play columns "
-            "by topic.")
+        head = (f"Only the first {max_rows} rows are shown (max_rows={max_rows}). To see more, "
+                f"raise max_rows (up to {_MAX_ROWS}), ")
+    else:
+        head = (f"Only the first {_MAX_ROWS} rows are shown; {_MAX_ROWS} is the most max_rows "
+                "allows. ")
+    if _CATALOG_STATEMENT.match(sql) or "information_schema" in sql.lower():
+        columns = ("SELECT column_name FROM information_schema.columns WHERE table_name = 'plays' "
+                   "AND column_name LIKE '%epa%'")
+        return (f"{head}page with LIMIT and OFFSET, or list only the columns you need with WHERE, "
+                f"for example {columns}. nfl_schema(category='<name>') lists play-by-play "
+                "columns by topic.")
+    return f"{head}add a WHERE filter, page with LIMIT and OFFSET, or aggregate with GROUP BY."
 
 
 def _statement_gate(sql: str) -> dict[str, Any] | None:
@@ -1017,8 +1019,8 @@ def nfl_query(sql: str, max_rows: int | None = None) -> Dict[str, Any]:
       - Exactly one statement, parsed by DuckDB (a trailing ';' is fine)
       - Only SELECT, or EXPLAIN [ANALYZE] of a SELECT; anything else is
         rejected with its statement_type
-      - max_rows is an int from 1 to 500; larger values are clamped to 500. Not given:
-        500 for DESCRIBE, SHOW and SUMMARIZE (one row per column), 100 otherwise
+      - max_rows is an int from 1 to 500; larger values are clamped to 500. Not given
+        (None): 100
       - Query runs as written; max_rows + 1 rows are fetched to set `truncated`
       - 10-second timeout (NFL_MCP_QUERY_TIMEOUT_SECONDS overrides)
 
@@ -1036,9 +1038,7 @@ def nfl_query(sql: str, max_rows: int | None = None) -> Dict[str, Any]:
     rejected = _statement_gate(sql)
     if rejected:
         return rejected
-    if max_rows is None:
-        max_rows = _MAX_ROWS if _CATALOG_STATEMENT.match(sql) else _DEFAULT_QUERY_ROWS
-    max_rows = min(max_rows, _MAX_ROWS)
+    max_rows = _DEFAULT_QUERY_ROWS if max_rows is None else min(max_rows, _MAX_ROWS)
 
     try:
         columns, rows = _fetch_capped(sql, max_rows + 1)
@@ -1055,7 +1055,7 @@ def nfl_query(sql: str, max_rows: int | None = None) -> Dict[str, Any]:
         "truncated": truncated,
     }
     if truncated:
-        result["hint"] = _truncated_hint(max_rows)
+        result["hint"] = _truncated_hint(max_rows, sql)
     return result
 
 
@@ -1616,7 +1616,9 @@ def _player_games(gsis_id: str) -> dict[tuple[Any, Any], int]:
     """Games played per (season, season_type) for one gsis_id; {} without the source tables."""
     try:
         rows = _execute(_PLAYER_GAMES_SQL, [gsis_id, gsis_id])
-    except duckdb.CatalogException:  # a trimmed database without player_stats or snap_counts
+    except (duckdb.CatalogException, duckdb.BinderException):
+        # A trimmed database without player_stats or snap_counts (CatalogException), or
+        # without a column the query reads, such as players.pfr_id (BinderException).
         return {}
     return {(r["season"], r["season_type"]): r["games"] for r in rows}
 
@@ -2179,7 +2181,7 @@ _RECORD_POINTS = " points_for, points_against, point_diff,"
 # A database whose team_records predates schema version 3 still answers win-loss questions.
 _STALE_RECORDS_WARNING = (
     "team_records was built by an older nfl-mcp and has no points_for, points_against or "
-    "point_diff, so points are left out. Run `nfl-mcp upgrade` to add them."
+    "point_diff, so points are left out. Points appear after the next database update."
 )
 
 @_checked
@@ -3127,9 +3129,10 @@ _TOOL_TABLES: dict[str, Sequence[str] | None] = {
     "nfl_schema": None, "nfl_status": None, "nfl_catalog": None, "nfl_query": None,
     "nfl_search_plays": ("plays", *_PLAYER_TABLES),
     "nfl_team_stats": ("team_offense_stats", "team_defense_stats", "situational_stats"),
-    "nfl_player_stats": ("plays", *_PLAYER_TABLES),
+    "nfl_player_stats": ("plays", "player_stats", "snap_counts", *_PLAYER_TABLES),
     "nfl_player_lookup": _PLAYER_TABLES,
-    "nfl_compare": ("team_offense_stats", "team_defense_stats", "plays", *_PLAYER_TABLES),
+    "nfl_compare": ("team_offense_stats", "team_defense_stats", "plays", "player_stats",
+                    "snap_counts", *_PLAYER_TABLES),
     "nfl_roster": ("rosters",),
     "nfl_injuries": ("injuries",),
     "nfl_schedule": ("schedules",),

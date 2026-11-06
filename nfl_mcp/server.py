@@ -288,8 +288,8 @@ TOOLS = [
             "The plays column desc (the play description) is an SQL keyword: quote it as "
             "\"desc\". An unknown column returns did_you_mean, taken from the tables the "
             "statement reads. Returns the rows of the statement as written; a truncated "
-            "result has a hint. max_rows 1-500 (default 100, or 500 for DESCRIBE, SHOW and "
-            "SUMMARIZE; larger values are clamped to 500). 10s timeout."
+            "result has a hint. max_rows 1-500 (default 100; larger values are clamped to "
+            "500). 10s timeout."
         ),
         inputSchema={
             "type": "object",
@@ -302,14 +302,11 @@ TOOLS = [
                         "Quote the plays column as \"desc\"."
                     ),
                 },
-                # No schema default: mcpo sends a schema default on every call, and the
-                # default depends on the statement.
+                # No schema default: mcpo sends a schema default on every call. The tool
+                # applies the default of 100 when max_rows is omitted.
                 "max_rows": {
                     "type": "integer",
-                    "description": (
-                        "Max rows to return, 1-500. Omit for the default: 100, or 500 for "
-                        "DESCRIBE, SHOW and SUMMARIZE."
-                    ),
+                    "description": "Max rows to return, 1-500. Omit for the default of 100.",
                     "minimum": 1,
                     "maximum": 500,
                 },

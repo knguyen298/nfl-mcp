@@ -417,7 +417,7 @@ their `gsis_id` and no rows. Call the tool again with `player_id` set to one `gs
 |------|-----------|-------------|
 | `nfl_schema` | `category`, `table` | Database schema reference. The default call gives a summary, the verified table relationships, data notes, and the derived tables. Pass `category` for column detail or `table` for one table's columns, grain, and join keys. |
 | `nfl_status` | none | Database health: total plays, loaded seasons, and per dataset the row count, newest season, newest week, and last refresh time |
-| `nfl_query` | `sql` (required), `max_rows` | Raw SQL SELECT for custom queries (default 100 rows, 500 for `DESCRIBE`/`SHOW`/`SUMMARIZE`; 500 row cap, 10s timeout) |
+| `nfl_query` | `sql` (required), `max_rows` | Raw SQL SELECT for custom queries (default 100 rows, 500 row cap, 10s timeout) |
 | `nfl_search_plays` | `season_type` (required), `team`, `opponent`, `player`, `player_id`, `player_role`, `season`, `season_from`, `season_to`, `week`, `play_type`, `situation`, play filters such as `down`, `qtr` and `is_touchdown`, `sort_by`, `columns`, `max_rows` | Find plays by player, team, season, season type, situation, touchdowns, etc. |
 | `nfl_team_stats` | `team` (required), `season_type` (required), `season`, `season_from`, `season_to`, `side` | Pre-aggregated team offense, defense, and situational stats, one row per team, season and season type |
 | `nfl_player_lookup` | `player` or `player_id`, `team`, `season`, `position` | Find players by name and return each candidate's `gsis_id` for the other player tools |
