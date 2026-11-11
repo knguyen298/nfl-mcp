@@ -8,6 +8,29 @@ Usage:
 
 from dataclasses import dataclass, field
 
+# ── Names the ingest routes on ────────────────────────────────────────────────
+#
+# Written out once, here, so the registry and the router in nfl_mcp/ingest.py cannot
+# disagree about what a source or a dataset is called. `source` picks the ingest helper;
+# the router raises for anything outside KNOWN_SOURCES rather than sending it to nflreadpy.
+
+SOURCE_NFLREADPY = "nflreadpy"
+SOURCE_ESPN = "espn"
+KNOWN_SOURCES: tuple[str, ...] = (SOURCE_NFLREADPY, SOURCE_ESPN)
+
+# Play-by-play is the one dataset on its own ingest path (schema discovery,
+# enhanced_description, null filtering). These spell its id, its target table and its
+# loader for that path.
+PBP_DATASET_ID = "pbp"
+PBP_TABLE_NAME = "plays"
+PBP_LOADER_FN = "load_pbp"
+
+# How a dataset's rows land in its table. See DatasetDef.storage: the value is derived from
+# `seasonal`, so it is spelled here but never declared per dataset.
+STORAGE_APPEND_BY_SEASON = "append_by_season"
+STORAGE_REPLACE = "replace"
+STORAGE_STRATEGIES: tuple[str, ...] = (STORAGE_APPEND_BY_SEASON, STORAGE_REPLACE)
+
 
 @dataclass(frozen=True)
 class DatasetDef:
@@ -18,7 +41,6 @@ class DatasetDef:
     default: bool           # included in default init (no --dataset flag needed)
     description: str = ""
     extra_params: dict = field(default_factory=dict, compare=False, hash=False)
-    storage: str = "append_by_season"   # "replace" | "append_by_season"
     # Known coverage window — seasons outside this range are skipped without
     # making a network request.  None means no known bound.  min_season is the
     # authoritative "how far back does this stat go" answer: it is set to the first
@@ -26,10 +48,22 @@ class DatasetDef:
     # DynastyProcess / ffverse, and always matches nflreadpy's own season validator.
     min_season: int | None = None
     max_season: int | None = None
-    # Where the rows come from. "nflreadpy" is every nflverse/DynastyProcess/ffverse
-    # dataset; "espn" is the external records fetch, which is not an nflreadpy loader and
-    # is opt-in because it is rate-limited and belongs to another publisher.
-    source: str = "nflreadpy"
+    # Where the rows come from. SOURCE_NFLREADPY is every nflverse/DynastyProcess/ffverse
+    # dataset; SOURCE_ESPN is the external records fetch, which is not an nflreadpy loader
+    # and is opt-in because it is rate-limited and belongs to another publisher.
+    source: str = SOURCE_NFLREADPY
+
+    @property
+    def storage(self) -> str:
+        """Write strategy: "replace" for a static dataset, "append_by_season" for a seasonal one.
+
+        Derived from `seasonal` instead of declared next to it. `_ingest_generic_dataset`
+        picks its write strategy from `seasonal` alone, so a declared storage could say one
+        thing while the ingest did another. The two strategies are exactly the two branches
+        that function already has: a static dataset is rebuilt whole, a seasonal one is
+        deleted and re-inserted one season at a time.
+        """
+        return STORAGE_APPEND_BY_SEASON if self.seasonal else STORAGE_REPLACE
 
 
 # ── Registry ───────────────────────────────────────────────────────────────────
@@ -41,42 +75,42 @@ _DEFS: list[DatasetDef] = [
         dataset_id="teams",
         loader_fn="load_teams",
         table_name="teams",
-        seasonal=False, default=True, storage="replace",
+        seasonal=False, default=True,
         description="Team metadata — colors, logos, abbreviations",
     ),
     DatasetDef(
         dataset_id="players",
         loader_fn="load_players",
         table_name="players",
-        seasonal=False, default=True, storage="replace",
+        seasonal=False, default=True,
         description="Player directory — names, draft info, cross-source ID mappings",
     ),
     DatasetDef(
         dataset_id="contracts",
         loader_fn="load_contracts",
         table_name="contracts",
-        seasonal=False, default=True, storage="replace",
+        seasonal=False, default=True,
         description="Historical player contract data",
     ),
     DatasetDef(
         dataset_id="trades",
         loader_fn="load_trades",
         table_name="trades",
-        seasonal=False, default=True, storage="replace",
+        seasonal=False, default=True,
         description="NFL trade history",
     ),
     DatasetDef(
         dataset_id="ff_playerids",
         loader_fn="load_ff_playerids",
         table_name="ff_playerids",
-        seasonal=False, default=True, storage="replace",
+        seasonal=False, default=True,
         description="Fantasy football player ID crosswalk (DynastyProcess.com)",
     ),
     DatasetDef(
         dataset_id="ff_rankings_draft",
         loader_fn="load_ff_rankings",
         table_name="ff_rankings_draft",
-        seasonal=False, default=True, storage="replace",
+        seasonal=False, default=True,
         description="Fantasy football draft rankings/projections",
         extra_params={"type": "draft"},
     ),
@@ -84,7 +118,7 @@ _DEFS: list[DatasetDef] = [
         dataset_id="ff_rankings_week",
         loader_fn="load_ff_rankings",
         table_name="ff_rankings_week",
-        seasonal=False, default=True, storage="replace",
+        seasonal=False, default=True,
         description="Fantasy football weekly rankings/projections",
         extra_params={"type": "week"},
     ),
@@ -92,22 +126,22 @@ _DEFS: list[DatasetDef] = [
         dataset_id="combine",
         loader_fn="load_combine",
         table_name="combine",
-        seasonal=False, default=True, storage="replace",
+        seasonal=False, default=True,
         description="NFL Combine measurables — all years",
     ),
     DatasetDef(
         dataset_id="draft_picks",
         loader_fn="load_draft_picks",
         table_name="draft_picks",
-        seasonal=False, default=True, storage="replace",
+        seasonal=False, default=True,
         description="NFL draft pick data (1980–current)",
     ),
 
     # ── Core seasonal ───────────────────────────────────────────────
     DatasetDef(
-        dataset_id="pbp",
-        loader_fn="load_pbp",
-        table_name="plays",
+        dataset_id=PBP_DATASET_ID,
+        loader_fn=PBP_LOADER_FN,
+        table_name=PBP_TABLE_NAME,
         seasonal=True, default=True,
         description="Play-by-play data — the primary fact table",
         min_season=1999,
@@ -289,7 +323,7 @@ _DEFS: list[DatasetDef] = [
         description="Final season win-loss records 1970-1998, from ESPN (nflverse has no games before 1999)",
         min_season=1970,
         max_season=1998,
-        source="espn",
+        source=SOURCE_ESPN,
     ),
 ]
 

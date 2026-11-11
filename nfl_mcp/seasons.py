@@ -21,6 +21,22 @@ import datetime
 EARLIEST_SEASON = 1920
 FIRST_SEASON = 1966
 
+# The league year rolls over on the 1st of this month: schedules, rosters and the season
+# label all change then. Both helpers below are written from this one constant, so the day
+# a season stops being "current" and the day it is called finished cannot drift apart.
+SEASON_ROLLOVER_MONTH = 3
+
+
+def season_settled_on(season: int) -> datetime.date:
+    """Return the first date on which `season`'s record can no longer change.
+
+    A season plays out into February of the year after it kicks off (the last regular-season
+    week, the playoffs, the Super Bowl). From the league-year rollover on — March 1 of
+    `season + 1` — every game it will ever have is finished, so data loaded on or after that
+    date is complete. Data loaded before it may be missing those last games.
+    """
+    return datetime.date(season + 1, SEASON_ROLLOVER_MONTH, 1)
+
 
 def current_season(today: datetime.date | None = None) -> int:
     """Return the NFL season that is in progress or most recently completed.
@@ -32,7 +48,9 @@ def current_season(today: datetime.date | None = None) -> int:
     Week 1) fail to load gracefully and are retried on the next ingest.
     """
     today = today or datetime.date.today()
-    return today.year if today.month >= 3 else today.year - 1
+    # This year's season is current once last year's has settled — the same March 1 boundary
+    # season_settled_on() gives callers who ask whether a season is finished.
+    return today.year if today >= season_settled_on(today.year - 1) else today.year - 1
 
 
 def all_seasons(today: datetime.date | None = None) -> list[int]:

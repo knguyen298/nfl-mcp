@@ -160,11 +160,27 @@ def fetch_season_records(
 
     Raises EspnUnavailable if either calendar-year pull fails after `attempts` tries, so
     the caller can leave the season unrecorded and retry on the next run.
+
+    Also raises EspnUnavailable when ESPN answered but not with the shape this module reads.
+    A malformed payload makes the two readers below raise AttributeError, KeyError, TypeError
+    or ValueError, and those say nothing a caller can act on. One exception type for "this
+    season gave us no usable records" is what lets the caller keep going to the next season
+    instead of losing the whole run.
     """
     send = transport or _default_transport
-    payloads = [_pull(send, scoreboard_url(year), attempts, backoff, sleep) for year in (season, season + 1)]
+    try:
+        payloads = [
+            _pull(send, scoreboard_url(year), attempts, backoff, sleep)
+            for year in (season, season + 1)
+        ]
+        events = _events_for_season(payloads, season)
+        records = extract_records(events, season)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise EspnUnavailable(
+            f"ESPN response for {season} had an unexpected shape: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    records = extract_records(_events_for_season(payloads, season), season)
     return [
         dataclasses.replace(record, fetched_at=now)
         for _, record in sorted(records.items(), key=lambda item: item[1].team)

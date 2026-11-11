@@ -224,3 +224,46 @@ class TestDefaultTransport:
         assert espn._default_transport("https://example.invalid/x") == {"events": []}
         assert captured["agent"] == espn.USER_AGENT
         assert captured["timeout"] == espn.DEFAULT_TIMEOUT
+
+
+class TestUnexpectedResponseShape:
+    """ESPN answering with something that is not the shape this module reads.
+
+    The scoreboard is read with .get() calls, so a payload of the wrong shape raises
+    AttributeError or TypeError out of the middle of the parse. Left alone, that exception
+    escaped the ingest and aborted every dataset after this one. It is turned into the same
+    EspnUnavailable a dead endpoint raises, so it costs one season and counts toward the
+    breaker like any other failure.
+    """
+
+    @pytest.mark.parametrize("payload", [
+        [],                                          # the JSON top level is a list
+        {"events": {"1": {}}},                       # events is an object, not a list
+        {"events": 7},                               # events is a number
+        {"events": [{"id": "1", "date": "1996-12-22", "season": {"year": 1996},
+                     "competitions": ["nope"]}],     # a competition row is a string
+         },
+    ], ids=["top-level-list", "events-object", "events-number", "competition-string"])
+    def test_becomes_espn_unavailable(self, payload):
+        with pytest.raises(EspnUnavailable, match="unexpected shape"):
+            fetch_season_records(1996, transport=lambda url: payload)
+
+    def test_the_reason_names_the_season_and_keeps_the_real_error(self):
+        with pytest.raises(EspnUnavailable) as excinfo:
+            fetch_season_records(1996, transport=lambda url: [])
+        assert "ESPN response for 1996 had an unexpected shape" in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, AttributeError)
+
+    def test_a_usable_payload_still_produces_records(self):
+        payload = {"events": [_event("1", "1996-12-22", 1996, [(9, "GB", "13-3")])]}
+        records = fetch_season_records(1996, transport=lambda url: payload)
+        assert [r.team for r in records] == ["GB"]
+
+    def test_a_transport_failure_keeps_its_own_reason(self):
+        """Wrapping the parse must not relabel 'could not reach ESPN' as a shape problem."""
+        def transport(url):
+            raise OSError("no route to host")
+
+        with pytest.raises(EspnUnavailable, match="ESPN request failed") as excinfo:
+            fetch_season_records(1996, transport=transport, sleep=lambda s: None)
+        assert "unexpected shape" not in str(excinfo.value)

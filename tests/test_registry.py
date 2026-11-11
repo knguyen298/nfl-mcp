@@ -1,12 +1,23 @@
 """Tests for the dataset registry — structure, completeness, and loader validity."""
 
+import dataclasses
+
 import nflreadpy
 import pytest
 
 from nfl_mcp.registry import (
     ALL_DATASETS,
     DEFAULT_DATASETS,
+    KNOWN_SOURCES,
+    PBP_DATASET_ID,
+    PBP_LOADER_FN,
+    PBP_TABLE_NAME,
     REGISTRY,
+    SOURCE_ESPN,
+    SOURCE_NFLREADPY,
+    STORAGE_APPEND_BY_SEASON,
+    STORAGE_REPLACE,
+    STORAGE_STRATEGIES,
     DatasetDef,
     earliest_season,
 )
@@ -40,10 +51,60 @@ class TestRegistryStructure:
             assert isinstance(d, DatasetDef)
 
     def test_storage_values_are_valid(self):
-        valid = {"replace", "append_by_season"}
         for d in REGISTRY.values():
-            assert d.storage in valid, \
+            assert d.storage in STORAGE_STRATEGIES, \
                 f"{d.dataset_id} has invalid storage={d.storage!r}"
+
+    def test_storage_agrees_with_seasonal(self):
+        """The strategy the registry names is the one the ingest performs.
+
+        _ingest_generic_dataset branches on `seasonal` alone: a seasonal dataset is deleted
+        and re-inserted one season at a time, a static one is rebuilt whole. storage reads
+        off the same flag, so the two cannot disagree.
+        """
+        for d in REGISTRY.values():
+            expected = STORAGE_APPEND_BY_SEASON if d.seasonal else STORAGE_REPLACE
+            assert d.storage == expected, (
+                f"{d.dataset_id} is seasonal={d.seasonal} but reports storage={d.storage!r}"
+            )
+
+    def test_storage_cannot_be_declared_and_thus_cannot_disagree(self):
+        # storage is derived, so there is no keyword left that would state a strategy the
+        # ingest does not perform. Passing one is a mistake caught at import time.
+        assert "storage" not in {f.name for f in dataclasses.fields(DatasetDef)}
+        with pytest.raises(TypeError):
+            DatasetDef(dataset_id="x", loader_fn="load_x", table_name="x",
+                       seasonal=False, default=False, storage="append_by_season")
+
+    def test_derived_storage_matches_the_two_branches(self):
+        static = DatasetDef(dataset_id="x", loader_fn="load_x", table_name="x",
+                            seasonal=False, default=False)
+        seasonal = DatasetDef(dataset_id="y", loader_fn="load_y", table_name="y",
+                              seasonal=True, default=False)
+        assert static.storage == STORAGE_REPLACE
+        assert seasonal.storage == STORAGE_APPEND_BY_SEASON
+
+    def test_every_dataset_declares_a_source_the_router_knows(self):
+        """The router in nfl_mcp/ingest.py raises for a source outside KNOWN_SOURCES.
+
+        A registered dataset with such a source would stop a whole run, so the registry must
+        only ever name one that has an ingest helper.
+        """
+        unknown = [f"{d.dataset_id}: {d.source!r}" for d in REGISTRY.values()
+                   if d.source not in KNOWN_SOURCES]
+        assert unknown == []
+
+    def test_every_known_source_is_used(self):
+        # A source nobody uses is a constant the router still branches on for nothing.
+        assert {d.source for d in REGISTRY.values()} == set(KNOWN_SOURCES)
+
+    def test_the_pbp_path_names_the_same_dataset_the_registry_declares(self):
+        # nfl_mcp/ingest.py picks its special path by PBP_DATASET_ID. Rename the entry and
+        # that path stops matching, so play-by-play goes down the generic loader path
+        # instead and lands with no enhanced_description column.
+        assert REGISTRY[PBP_DATASET_ID].dataset_id == PBP_DATASET_ID
+        assert REGISTRY[PBP_DATASET_ID].loader_fn == PBP_LOADER_FN
+        assert REGISTRY[PBP_DATASET_ID].table_name == PBP_TABLE_NAME
 
     def test_descriptions_are_non_empty(self):
         for d in REGISTRY.values():
@@ -140,7 +201,7 @@ class TestLoaderFunctions:
         missing = [
             d.dataset_id
             for d in REGISTRY.values()
-            if d.source == "nflreadpy" and not hasattr(nflreadpy, d.loader_fn)
+            if d.source == SOURCE_NFLREADPY and not hasattr(nflreadpy, d.loader_fn)
         ]
         assert not missing, f"loader_fn not found in nflreadpy: {missing}"
 
@@ -167,7 +228,7 @@ class TestDefaultDatasets:
         """Full nflverse import is baked in; only the external pull is opt-in."""
         non_default = [
             d.dataset_id for d in REGISTRY.values()
-            if not d.default and d.source == "nflreadpy"
+            if not d.default and d.source == SOURCE_NFLREADPY
         ]
         assert non_default == [], \
             f"these nflreadpy datasets are not default but should be: {non_default}"
@@ -176,7 +237,7 @@ class TestDefaultDatasets:
         # A dataset that reaches another publisher at ingest time must never ride along on
         # the container's scheduled refresh, so it stays out of 'default'.
         for d in REGISTRY.values():
-            if d.source != "nflreadpy":
+            if d.source != SOURCE_NFLREADPY:
                 assert d.default is False, f"{d.dataset_id} is external but default"
 
     def test_only_the_espn_records_pull_is_opt_in(self):
@@ -193,7 +254,7 @@ class TestExternalRecordsSource:
         self.defn = REGISTRY["espn_records"]
 
     def test_declared_as_external(self):
-        assert self.defn.source == "espn"
+        assert self.defn.source == SOURCE_ESPN
         assert self.defn.table_name == "espn_team_records"
         assert self.defn.loader_fn not in dir(nflreadpy), "records loader is not an nflreadpy function"
 
