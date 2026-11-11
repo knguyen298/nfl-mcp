@@ -20,6 +20,9 @@ def _point_at_tmp(monkeypatch, tmp_path):
     config_file = config_dir / "config.json"
     monkeypatch.setattr(config, "CONFIG_DIR", config_dir)
     monkeypatch.setattr(config, "CONFIG_FILE", config_file)
+    # The environment variable outranks the config file. A test run pointed at a database
+    # copy sets it, and these tests expect the default path.
+    monkeypatch.delenv("NFL_MCP_DB_PATH", raising=False)
     return config_dir, config_file
 
 
@@ -98,7 +101,11 @@ def test_a_malformed_config_warns_on_stderr_and_leaves_stdout_free(tmp_path):
     malformed = "{ this is not valid json"
     (config_dir / "config.json").write_text(malformed)
 
-    env = dict(os.environ, HOME=str(tmp_path / "home"), NFL_MCP_DB_PATH="")
+    # The child runs from tmp_path, so it imports nfl_mcp from the checkout explicitly. A
+    # virtual environment without the package installed then works too.
+    repo = str(Path(__file__).resolve().parents[1])
+    env = dict(os.environ, HOME=str(tmp_path / "home"), NFL_MCP_DB_PATH="",
+               PYTHONPATH=os.pathsep.join(filter(None, [repo, os.environ.get("PYTHONPATH")])))
     script = (
         "import warnings; warnings.simplefilter('always'); "
         "from nfl_mcp.config import load_config, get_duckdb_path; "

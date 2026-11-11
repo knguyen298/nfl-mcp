@@ -13,14 +13,27 @@ mkdir -p "$DB_DIR"
 # must not abort startup over a log directory.
 mkdir -p /var/log/nflmcp 2>/dev/null || true
 
+# Started as root (the image's default): a mounted /data or log directory can be owned by
+# root or another uid (bind mounts, volumes from older images), and the updater runs as
+# nflmcp. Hand them over only when some file inside has another owner, then re-run as nflmcp
+# so everything below, including supercronic and the server, is unprivileged. When started
+# with `--user`, this block is skipped and the script continues as that user.
+if [ "$(id -u)" = 0 ]; then
+    for dir in "$DB_DIR" /var/log/nflmcp; do
+        if [ -d "$dir" ] && [ -n "$(find "$dir" ! -user nflmcp -print -quit)" ]; then
+            echo "[init] $dir has files not owned by nflmcp; changing owner (recursive)"
+            chown -R nflmcp:nflmcp "$dir" || echo "[init] WARNING: could not chown $dir; updates may fail"
+        fi
+    done
+    exec env HOME=/home/nflmcp setpriv --reuid=nflmcp --regid=nflmcp --init-groups "$0" "$@"
+fi
+
 # A symlink that resolves is the answer to "which slot is active?" — update_db.sh
 # alternates it between slot A and slot B, so re-pointing it at slot A on every start
 # would serve an older database after an update and let the next update delete the
 # newer one. It can also point at a slot another run was mid-way through rewriting.
 # Leave such a link alone; only a missing or dangling link needs first-start repair.
-if [ -L "$SYMLINK" ] && [ -e "$SYMLINK" ]; then
-    echo "[init] Active DB: $(readlink "$SYMLINK") (keeping existing link)"
-else
+if [ ! -L "$SYMLINK" ] || [ ! -e "$SYMLINK" ]; then
     # Seed slot A rather than ingesting on first start. The published image bakes a
     # database at /seed, so a cold container becomes queryable in seconds. A full ingest
     # here would take 10+ minutes, which blocks readiness on any platform with a startup
@@ -43,7 +56,11 @@ else
         else
             # No seed (e.g. the dev image): fall back to a cold ingest.
             echo "[init] No seed found; ingesting into slot A (slow startup)..."
-            NFL_MCP_DB_PATH="$SLOT_A_TMP" nfl-mcp ingest
+            # --allow-failures: one flaky season must not crash-loop a first boot. The ingest
+            # prints "Ingest failed for: ..." naming each failure; the weekly update fills gaps.
+            # A run that loads nothing at all still exits 3, so set -e stops here and nothing
+            # is renamed into place.
+            NFL_MCP_DB_PATH="$SLOT_A_TMP" nfl-mcp ingest --allow-failures
             mv "$SLOT_A_TMP" "$SLOT_A"
         fi
     fi
@@ -51,6 +68,8 @@ else
     # Relative link: the symlink lives in $DB_DIR, so the target name resolves there.
     ln -sfn "$(basename "$SLOT_A")" "$SYMLINK"
     echo "[init] Active DB: $(readlink "$SYMLINK")"
+else
+    echo "[init] Active DB: $(readlink "$SYMLINK") (keeping existing link)"
 fi
 
 cat > /tmp/crontab << 'EOF'
@@ -76,6 +95,21 @@ if kill -0 "$SCHEDULER_PID" 2>/dev/null; then
     echo "[cron] Scheduler started (pid $SCHEDULER_PID)."
 else
     echo "[cron] WARNING: supercronic is not running. The database will not refresh on schedule."
+fi
+
+# A database made by an older release still serves, but may lack columns the tools use.
+# The active slot is read-only, so the check only reads; on exit 3 one update_db.sh run
+# upgrades a copy and swaps it in. Opt out with NFL_MCP_UPGRADE_ON_START=0. Nothing here
+# may block or fail the start.
+if [ "${NFL_MCP_UPGRADE_ON_START:-1}" != "0" ]; then
+    UPGRADE_RC=0
+    nfl-mcp upgrade --check --db "$SYMLINK" || UPGRADE_RC=$?
+    if [ "$UPGRADE_RC" -eq 3 ]; then
+        echo "[upgrade] Active DB needs a schema upgrade; starting update_db.sh in the background."
+        /update_db.sh >> /var/log/nflmcp/nfl_update.log 2>&1 &
+    elif [ "$UPGRADE_RC" -ne 0 ]; then
+        echo "[upgrade] Schema check exited $UPGRADE_RC; starting without an upgrade."
+    fi
 fi
 
 echo "[server] Starting NFL MCP server..."

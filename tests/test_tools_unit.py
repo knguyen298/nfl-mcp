@@ -5,6 +5,7 @@ import json
 import re
 import threading
 import time
+from collections import defaultdict
 from contextlib import contextmanager
 
 import inspect
@@ -19,31 +20,47 @@ from nfl_mcp.registry import REGISTRY
 from nfl_mcp.status import Availability, ErrorCode
 
 
-def test_normalize_player_name_handles_full_short_and_last_name_inputs():
-    assert tools._normalize_player_name("Mahomes") == "Mahomes"
-    assert tools._normalize_player_name("J.Jefferson") == "J.Jefferson"
-    assert tools._normalize_player_name("Justin Jefferson") == "J.Jefferson"
-    assert tools._normalize_player_name("J. Jefferson") == "J. Jefferson"
+@pytest.fixture
+def no_player_match(monkeypatch):
+    """Names resolve to nobody, so a tool returns no rows and a reason."""
+    monkeypatch.setattr(tools, "_find_players", lambda *a, **k: ([], False))
 
 
-def test_search_plays_uses_parameterized_filters(monkeypatch):
+MAHOMES = {"gsis_id": "00-0033873", "display_name": "Patrick Mahomes"}
+
+
+@pytest.fixture
+def resolves_to_mahomes(monkeypatch):
+    """Record the names handed to the resolver and resolve every one of them to Mahomes."""
+    seen = []
+
+    def fake_resolve(player_name, player_id, **kwargs):
+        seen.append((player_name, player_id, kwargs))
+        return dict(MAHOMES), None
+
+    monkeypatch.setattr(tools, "_resolve_player", fake_resolve)
+    return seen
+
+
+def test_search_plays_uses_parameterized_filters(monkeypatch, resolves_to_mahomes):
     captured = {}
 
     def fake_execute(sql, params=None):
+        if sql.startswith("SELECT MIN("):  # empty-result range lookup, not the tool's query
+            return []
         captured["sql"] = sql
         captured["params"] = params
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
-    result = tools.nfl_search_plays(team="KC", player="Mahomes", season=2024, max_rows=5)
+    result = tools.nfl_search_plays(team="KC", player="Mahomes", season=2024, max_rows=5, season_type="REG")
 
-    assert result["row_count"] == 0
+    assert result["row_count"] == result["count"] == 0
     assert "posteam = ?" in captured["sql"]
-    assert "ILIKE ?" in captured["sql"]
-    # The tool fetches max_rows + 1 rows to detect truncation and returns max_rows.
-    assert "LIMIT 6" in captured["sql"]
+    assert "passer_player_id = ?" in captured["sql"]
+    assert "LIMIT 6 OFFSET 0" in captured["sql"]  # one extra row shows whether another page exists
     assert captured["params"][0] == "KC"
-    assert "%Mahomes%" in captured["params"]
+    assert MAHOMES["gsis_id"] in captured["params"]
     assert 2024 in captured["params"]
 
 
@@ -51,11 +68,13 @@ def test_team_stats_uses_parameterized_team_and_season(monkeypatch):
     calls = []
 
     def fake_execute(sql, params=None):
+        if sql.startswith("SELECT MIN("):  # empty-result range lookup, not the tool's query
+            return []
         calls.append((sql, params))
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
-    tools.nfl_team_stats(team="kc", season=2024, side="both")
+    tools.nfl_team_stats(team="kc", season=2024, side="both", season_type="REG")
 
     assert len(calls) == 3
     assert all("team = ?" in sql for sql, _ in calls)
@@ -63,7 +82,7 @@ def test_team_stats_uses_parameterized_team_and_season(monkeypatch):
     assert all(2024 in params for _, params in calls)
 
 
-def test_player_stats_uses_parameterized_player_name(monkeypatch):
+def test_player_stats_uses_parameterized_player_id(monkeypatch, resolves_to_mahomes):
     captured = {}
 
     def fake_execute(sql, params=None):
@@ -72,26 +91,82 @@ def test_player_stats_uses_parameterized_player_name(monkeypatch):
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
-    tools.nfl_player_stats(player_name="P.Mahomes", stat_type="passing", season_type="REG")
+    result = tools.nfl_player_stats(player="P.Mahomes", season_type="REG")
 
-    assert "ILIKE ?" in captured["sql"]
-    assert captured["params"][0] == "%P.Mahomes%"
-    assert captured["params"][1] == "pass"
-    assert captured["params"][-1] == "REG"
+    assert "me.id" in captured["sql"]
+    assert captured["params"] == [MAHOMES["gsis_id"], "REG"]
+    assert result["player_id"] == MAHOMES["gsis_id"]
+    assert result["seasons"] == []
 
 
-def test_player_stats_normalizes_full_player_name(monkeypatch):
+def test_player_stats_passes_full_name_to_resolver_unchanged(monkeypatch, resolves_to_mahomes):
+    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [])
+    tools.nfl_player_stats(player="Justin Jefferson", season_type="REG")
+
+    assert resolves_to_mahomes[0][0] == "Justin Jefferson"
+
+
+@pytest.mark.parametrize("stat_type", ["passing", "rushing", "receiving"])
+def test_player_stats_stat_type_keeps_one_block(monkeypatch, resolves_to_mahomes, stat_type):
     captured = {}
+    row = defaultdict(lambda: None, season=2024, season_type="REG")  # every other stat is NULL
 
     def fake_execute(sql, params=None):
+        if "snap_counts" in sql:  # the games query (v0.7.1), not the stats query
+            return []
         captured["sql"] = sql
         captured["params"] = params
-        return []
+        return [row]
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
-    tools.nfl_player_stats(player_name="Justin Jefferson", stat_type="passing")
+    result = tools.nfl_player_stats(
+        player="P.Mahomes",
+        stat_type=stat_type,
+        season_from=2020,
+        season_to=2024,
+        season_type="REG",
+    )
+    (season,) = result["seasons"]
+    assert set(season) == {"season", "season_type", "games", stat_type}
+    assert "season >=" in captured["sql"]
+    assert "season <=" in captured["sql"]
+    assert captured["params"] == [MAHOMES["gsis_id"], 2020, 2024, "REG"]
 
-    assert captured["params"][0] == "%J.Jefferson%"
+
+def test_player_stats_rejects_unknown_stat_type():
+    result = tools.nfl_player_stats(player="P.Mahomes", stat_type="kicking", season_type="REG")
+    assert "Unknown stat_type" in result["error"]
+
+
+def test_player_stats_returns_error_on_timeout(monkeypatch):
+    monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("timeout")))
+    result = tools.nfl_player_stats(player="P.Mahomes", stat_type="passing", season_type="REG")
+    assert "error" in result
+
+
+def test_compare_player_path_resolves_both_entities_to_ids(monkeypatch):
+    seen = []
+    ids = {"P.Mahomes": "00-0033873", "00-0034857": "00-0034857"}
+
+    def fake_resolve(player_name, player_id, **kwargs):
+        seen.append((player_name, kwargs))
+        return {"gsis_id": ids[player_name], "display_name": player_name}, None
+
+    calls = []
+    monkeypatch.setattr(tools, "_resolve_player", fake_resolve)
+    monkeypatch.setattr(
+        tools, "_execute",
+        lambda sql, params=None: [] if sql.startswith("SELECT MIN(") else calls.append(params) or [])
+    result = tools.nfl_compare(
+        player1="P.Mahomes",
+        player2="00-0034857",
+        season_from=2020,
+        season_to=2024,
+        season_type="REG",
+    )
+    assert [p["player_id"] for p in result["players"]] == ["00-0033873", "00-0034857"]
+    assert [s[0] for s in seen] == ["P.Mahomes", "00-0034857"]
+    assert calls == [["00-0033873", 2020, 2024, "REG"], ["00-0034857", 2020, 2024, "REG"]]
 
 
 def test_compare_team_refuses_injected_text_as_an_unknown_team_without_interpolating(monkeypatch):
@@ -104,14 +179,11 @@ def test_compare_team_refuses_injected_text_as_an_unknown_team_without_interpola
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
     result = tools.nfl_compare(
-        entity1="KC'; DROP TABLE plays; --", entity2="BAL", compare_type="team", season=2024,
-    )
+        team1="KC'; DROP TABLE plays; --", team2="BAL", season=2024, season_type="REG")
 
-    assert result["code"] is ErrorCode.UNKNOWN_TEAM
-    assert result["parameter"] == "entity1"
-    assert len(calls) == 1
-    assert all("DROP TABLE" not in sql for sql, _ in calls)
-    assert calls[0][1] == ["KC'; DROP TABLE PLAYS; --"]
+    # Group H: an unknown team code is rejected before any SQL runs, so nothing is interpolated.
+    assert result["code"] == "UNKNOWN_TEAM"
+    assert calls == []
 
 
 def test_schema_table_returns_columns(monkeypatch):
@@ -173,9 +245,11 @@ def test_nfl_status_happy_path(monkeypatch):
             return [{"season": 2024, "season_type": "REG", "plays": 123}]
         if "first_season" in sql:
             return [{"first_season": 2024, "last_season": 2024, "num_seasons": 1}]
+        if "GROUP BY dataset_id" in sql:  # the per-dataset query also selects last_refreshed
+            return [{"dataset_id": "pbp", "table_name": "plays", "total_rows": 123}]
         if "last_refreshed" in sql:
             return [{"last_refreshed": "2026-03-01"}]
-        return [{"dataset_id": "pbp", "table_name": "plays", "total_rows": 123}]
+        return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
 
@@ -197,8 +271,8 @@ def test_nfl_status_returns_error_on_timeout(monkeypatch):
 def test_nfl_query_reports_truncation(monkeypatch):
     monkeypatch.setattr(
         tools,
-        "_execute",
-        lambda sql, params=None: [{"x": 1}, {"x": 2}, {"x": 3}],
+        "_fetch_capped",
+        lambda sql, limit: ([{"name": "x", "type": "INTEGER"}], [{"x": 1}, {"x": 2}, {"x": 3}]),
     )
     result = tools.nfl_query("SELECT 1 AS x", max_rows=2)
     assert result["row_count"] == 2
@@ -206,7 +280,7 @@ def test_nfl_query_reports_truncation(monkeypatch):
 
 
 def test_nfl_query_returns_error_when_execute_fails(monkeypatch):
-    monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad sql")))
+    monkeypatch.setattr(tools, "_fetch_capped", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad sql")))
     result = tools.nfl_query("SELECT 1")
     assert result["error"] == "bad sql"
     assert result["code"] == "SQL_ERROR"
@@ -232,10 +306,15 @@ PLAY_COLUMNS = [
 ]
 
 
-def _failing_query(exc, schema_rows):
-    """Fake _execute: answers schema lookups, raises `exc` for the caller's SQL."""
+def _failing_query(exc, schema_rows, table_rows=None):
+    """Fake _execute: answers schema lookups, raises `exc` for the caller's SQL.
+
+    table_rows, when given, answers the table-name lookup; schema_rows answers the rest.
+    """
 
     def fake_execute(sql, params=None):
+        if table_rows is not None and "information_schema.tables" in sql:
+            return table_rows
         if "information_schema" in sql:
             return schema_rows
         raise exc
@@ -243,11 +322,22 @@ def _failing_query(exc, schema_rows):
     return fake_execute
 
 
+def _raise_from_fetch(monkeypatch, exc):
+    """Make nfl_query's own statement fail with `exc` (schema lookups still use _execute)."""
+
+    def fake_fetch(sql, limit):
+        raise exc
+
+    monkeypatch.setattr(tools, "_fetch_capped", fake_fetch)
+
+
 def test_nfl_query_suggests_real_columns_for_an_invented_column(monkeypatch):
     monkeypatch.setattr(
         tools, "_execute", _failing_query(duckdb.BinderException(COLUMN_ERROR),
-                                          [{"column_name": c} for c in PLAY_COLUMNS]),
+                                          [{"column_name": c} for c in PLAY_COLUMNS],
+                                          [{"table_name": "plays"}]),
     )
+    _raise_from_fetch(monkeypatch, duckdb.BinderException(COLUMN_ERROR))
     result = tools.nfl_query("SELECT defteam, ROUND(AVG(play_epa),4) FROM plays GROUP BY 1")
 
     assert result["code"] == "COLUMN_NOT_FOUND"
@@ -262,6 +352,7 @@ def test_nfl_query_suggests_real_tables_for_an_invented_table(monkeypatch):
         tools, "_execute", _failing_query(duckdb.CatalogException(TABLE_ERROR),
                                           [{"table_name": t} for t in ("plays", "schedules")]),
     )
+    _raise_from_fetch(monkeypatch, duckdb.CatalogException(TABLE_ERROR))
     result = tools.nfl_query("SELECT * FROM playz")
 
     assert result["code"] == "TABLE_NOT_FOUND"
@@ -277,6 +368,7 @@ def test_nfl_query_falls_back_to_duckdb_candidates_when_schema_lookup_fails(monk
         raise duckdb.BinderException(COLUMN_ERROR)
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
+    _raise_from_fetch(monkeypatch, duckdb.BinderException(COLUMN_ERROR))
     result = tools.nfl_query("SELECT AVG(play_epa) FROM plays")
 
     assert result["code"] == "COLUMN_NOT_FOUND"
@@ -306,7 +398,7 @@ def test_nearest_drops_the_guess_and_ranks_by_similarity():
         ("red_zone", "yardline_100 <= 20"),
         ("third_down", "down = 3"),
         ("fourth_down", "down = 4"),
-        ("two_minute", "qtr = 4 AND half_seconds_remaining <= 120"),
+        ("two_minute", "half_seconds_remaining <= 120 AND (qtr = 2 OR qtr >= 4)"),
     ],
 )
 def test_search_plays_situations(monkeypatch, situation, expected_sql):
@@ -318,7 +410,7 @@ def test_search_plays_situations(monkeypatch, situation, expected_sql):
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
-    tools.nfl_search_plays(situation=situation, max_rows=10)
+    tools.nfl_search_plays(situation=situation, max_rows=10, season_type="REG")
     assert expected_sql in captured["sql"]
 
 
@@ -326,6 +418,8 @@ def test_search_plays_applies_all_numeric_and_boolean_filters(monkeypatch):
     captured = {}
 
     def fake_execute(sql, params=None):
+        if sql.startswith("SELECT MIN("):  # empty-result range lookup, not the tool's query
+            return []
         captured["sql"] = sql
         captured["params"] = params
         return []
@@ -341,7 +435,7 @@ def test_search_plays_applies_all_numeric_and_boolean_filters(monkeypatch):
         is_touchdown=True,
         is_turnover=True,
         min_yards=7,
-        max_rows=999,
+        max_rows=500,
     )
 
     assert result["row_count"] == 0
@@ -354,14 +448,13 @@ def test_search_plays_applies_all_numeric_and_boolean_filters(monkeypatch):
     assert "touchdown = 1" in captured["sql"]
     assert "(interception = 1 OR fumble_lost = 1)" in captured["sql"]
     assert "yards_gained >= ?" in captured["sql"]
-    # max_rows=999 clamps to 500; the probe row makes the SQL ask for 501.
-    assert "LIMIT 501" in captured["sql"]
+    assert "LIMIT 501 OFFSET 0" in captured["sql"]
     assert captured["params"] == ["BAL", 2020, 2021, 1, "REG", "pass", 7]
 
 
 def test_search_plays_returns_error_on_timeout(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("boom")))
-    result = tools.nfl_search_plays(team="KC")
+    result = tools.nfl_search_plays(team="KC", season_type="REG")
     assert "error" in result
 
 
@@ -373,118 +466,54 @@ def test_team_stats_offense_only_without_season_clause(monkeypatch):
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
-    result = tools.nfl_team_stats(team="kc", side="offense")
+    result = tools.nfl_team_stats(team="kc", side="offense", season_type="REG")
     assert "offense" in result
     assert "defense" not in result
     assert "season_year = ?" not in calls[0][0]
-    assert calls[0][1] == ["KC"]
+    assert calls[0][1] == ["KC", "REG"]  # season_type defaults to REG
 
 
 def test_team_stats_returns_error_on_timeout(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("timeout")))
-    result = tools.nfl_team_stats(team="KC")
+    result = tools.nfl_team_stats(team="KC", season_type="REG")
     assert "error" in result
 
 
-@pytest.mark.parametrize(
-    "stat_type,expected_play_type",
-    [("rushing", "run"), ("receiving", "pass")],
-)
-def test_player_stats_other_stat_types(monkeypatch, stat_type, expected_play_type):
-    captured = {}
-
-    def fake_execute(sql, params=None):
-        captured["sql"] = sql
-        captured["params"] = params
-        return [{"season": 2024, "season_type": "REG"}]
-
-    monkeypatch.setattr(tools, "_execute", fake_execute)
-    result = tools.nfl_player_stats(
-        player_name="P.Mahomes",
-        stat_type=stat_type,
-        season_from=2020,
-        season_to=2024,
-    )
-    assert result["stat_type"] == stat_type
-    assert captured["params"][1] == expected_play_type
-    assert "season >=" in captured["sql"]
-    assert "season <=" in captured["sql"]
-
-
-def test_player_stats_rejects_unknown_stat_type():
-    result = tools.nfl_player_stats(player_name="P.Mahomes", stat_type="kicking")
-    assert "Unknown stat_type" in result["error"]
-
-
-def test_player_stats_returns_error_on_timeout(monkeypatch):
-    monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("timeout")))
-    result = tools.nfl_player_stats(player_name="P.Mahomes", stat_type="passing")
-    assert "error" in result
-
-
-def test_compare_player_path_only_includes_stats_with_attempts(monkeypatch):
-    calls = []
-
-    def fake_execute(sql, params=None):
-        calls.append((sql, params))
-        if "COUNT(*) AS n" in sql and "passer_player_name" in sql:
-            return [{"n": 1}]
-        if "COUNT(*) AS n" in sql and "receiver_player_name" in sql:
-            return [{"n": 1}]
-        if "COUNT(*) AS n" in sql and "rusher_player_name" in sql:
-            return [{"n": 0}]
-        return []
-
-    monkeypatch.setattr(tools, "_execute", fake_execute)
-    monkeypatch.setattr(
-        tools,
-        "nfl_player_stats",
-        lambda player_name, **kwargs: {"seasons": [{"player": player_name, **kwargs}]},
-    )
-    result = tools.nfl_compare(
-        entity1="P.Mahomes",
-        entity2="J.Allen",
-        compare_type="player",
-        season_from=2020,
-        season_to=2024,
-        season_type="REG",
-    )
-    assert "passing" in result["P.Mahomes"]
-    assert "receiving" in result["P.Mahomes"]
-    assert "rushing" not in result["P.Mahomes"]
-    assert "season_type = ?" in calls[0][0]
-
-
-def test_compare_rejects_unknown_type():
-    result = tools.nfl_compare(entity1="KC", entity2="BAL", compare_type="invalid")
-    assert result["error"] == "Unknown compare_type: invalid. Use 'team' or 'player'."
+def test_compare_rejects_a_mixed_or_incomplete_pair():
+    for args in ({"player1": "P.Mahomes", "team2": "BAL"}, {"team1": "KC"}, {}):
+        result = tools.nfl_compare(**args, season_type="REG")
+        assert result["code"] == "INVALID_ARGUMENT"
+        for name in ("player1", "player2", "team1", "team2"):
+            assert name in result["error"]
 
 
 def test_compare_team_applies_season_range_filters(monkeypatch):
     calls = []
 
     def fake_execute(sql, params=None):
+        if sql.startswith("SELECT MIN("):  # empty-result range lookup, not the tool's query
+            return []
         calls.append((sql, params))
         return []
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
     result = tools.nfl_compare(
-        entity1="KC",
-        entity2="BAL",
-        compare_type="team",
+        team1="KC",
+        team2="BAL",
         season_from=2020,
         season_to=2021,
+        season_type="REG",
     )
     assert "error" not in result
     assert len(calls) == 4
     assert "season_year >= ?" in calls[0][0]
     assert "season_year <= ?" in calls[0][0]
-    assert calls[0][1] == ["KC", 2020, 2021]
+    assert calls[0][1] == ["KC", 2020, 2021, "REG"]  # team mode defaults to REG
 
 
 def test_compare_returns_error_on_timeout(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("timeout")))
-    result = tools.nfl_compare(entity1="KC", entity2="BAL", compare_type="team", season=2024)
+    result = tools.nfl_compare(team1="KC", team2="BAL", season=2024, season_type="REG")
     assert "error" in result
 
 
@@ -535,8 +564,8 @@ def test_roster_builds_filters_and_uppercases_inputs(monkeypatch):
     assert result["count"] == 1
     assert "team = ?" in captured["sql"]
     assert "season = ?" in captured["sql"]
-    assert "position ILIKE ?" in captured["sql"]
-    assert captured["params"] == ["KC", 2024, "WR"]
+    assert "(upper(position) = ? OR upper(depth_chart_position) = ?)" in captured["sql"]
+    assert captured["params"] == ["KC", 2024, "WR", "WR"]
 
 
 def test_roster_uses_none_params_when_no_filters(monkeypatch):
@@ -556,7 +585,7 @@ def test_roster_returns_error_on_timeout(monkeypatch):
     assert result["error"] == "roster timeout"
 
 
-def test_injuries_builds_filters_and_wildcards(monkeypatch):
+def test_injuries_builds_filters_and_wildcards(monkeypatch, resolves_to_mahomes):
     captured = {}
 
     def fake_execute(sql, params=None):
@@ -571,39 +600,59 @@ def test_injuries_builds_filters_and_wildcards(monkeypatch):
         week=1,
         player="Mahomes",
         report_status="Out",
+        practice_status="Did Not",
+        season_type="REG",
     )
     assert result["count"] == 1
     assert "team = ?" in captured["sql"]
-    assert "report_status ILIKE ?" in captured["sql"]
-    assert captured["params"] == ["KC", 2024, 1, "%Mahomes%", "%Out%"]
+    assert "gsis_id = ?" in captured["sql"]
+    assert "report_status ILIKE ? ESCAPE" in captured["sql"]
+    assert "practice_status ILIKE ? ESCAPE" in captured["sql"]
+    assert "game_type = ?" in captured["sql"]
+    assert captured["params"] == ["KC", MAHOMES["gsis_id"], 2024, 1, "REG", "%Out%", "%Did Not%"]
+    assert result["player_id"] == MAHOMES["gsis_id"]
 
 
 def test_injuries_returns_error_on_timeout(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("injuries timeout")))
-    result = tools.nfl_injuries(team="KC")
+    result = tools.nfl_injuries(team="KC", season_type="REG")
     assert result["error"] == "injuries timeout"
 
 
-def test_schedule_builds_team_pair_filter_and_uppercases_season_type(monkeypatch):
+def test_schedule_builds_team_pair_filter_and_game_type(monkeypatch):
     captured = {}
 
     def fake_execute(sql, params=None):
         captured["sql"] = sql
         captured["params"] = params
-        return [{"game_id": "2024_01_KC_BAL"}]
+        return [{"game_id": "2024_01_KC_BAL", "away_team": "BAL", "home_team": "KC",
+                 "away_score": 20, "home_score": 27, "_site": "Home"}]
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
-    result = tools.nfl_schedule(team="kc", season=2024, week=1, season_type="reg")
+    result = tools.nfl_schedule(team="kc", season=2024, week=1, season_type="REG")
     assert result["count"] == 1
     assert "(home_team = ? OR away_team = ?)" in captured["sql"]
+    assert "location AS _site" in captured["sql"]
+    assert result["games"][0]["outcome"] == "W" and "_site" not in result["games"][0]
     assert "game_type = ?" in captured["sql"]
     assert captured["params"] == ["KC", "KC", 2024, 1, "REG"]
 
 
+def test_schedule_season_type_is_exact_and_upper_case(monkeypatch):
+    captured = _capture_execute(monkeypatch, [])
+    result = tools.nfl_schedule(team="kc", season_type="reg")
+    assert result["code"] == "INVALID_ARGUMENT"
+    assert "REG, POST, ALL, WC, DIV, CON, SB" in result["error"]
+    assert "sql" not in captured  # rejected before any query
+
+
 def test_schedule_returns_error_on_timeout(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("schedule timeout")))
-    result = tools.nfl_schedule(team="KC")
+    result = tools.nfl_schedule(team="KC", season_type="REG")
     assert result["error"] == "schedule timeout"
+
+
+KELCE = {"gsis_id": "00-0030506", "display_name": "Travis Kelce", "pfr_id": "KelcTr00"}
 
 
 def test_snap_counts_builds_filters(monkeypatch):
@@ -614,6 +663,7 @@ def test_snap_counts_builds_filters(monkeypatch):
         captured["params"] = params
         return [{"player": "T.Kelce"}]
 
+    monkeypatch.setattr(tools, "_resolve_player", lambda *a, **k: (dict(KELCE), None))
     monkeypatch.setattr(tools, "_execute", fake_execute)
     result = tools.nfl_snap_counts(
         player="Kelce",
@@ -621,17 +671,46 @@ def test_snap_counts_builds_filters(monkeypatch):
         season=2024,
         week=1,
         position="te",
+        season_type="REG",
     )
     assert result["count"] == 1
-    assert "player ILIKE ?" in captured["sql"]
+    assert "pfr_player_id = ?" in captured["sql"] and "LIKE" not in captured["sql"]
     assert "team = ?" in captured["sql"]
-    assert "position ILIKE ?" in captured["sql"]
-    assert captured["params"] == ["%Kelce%", "KC", 2024, 1, "TE"]
+    assert "upper(position) = ?" in captured["sql"]
+    # The name resolves to one player; rows are then matched on that player's pfr_id.
+    assert captured["params"] == ["KelcTr00", "KC", 2024, 1, "REG", "TE"]
+
+
+def test_snap_counts_name_with_no_match_runs_no_query(monkeypatch, no_player_match):
+    monkeypatch.setattr(tools, "_execute", lambda *a, **k: pytest.fail("snap query must not run"))
+    result = tools.nfl_snap_counts(player="Kelc", season_type="REG")
+    assert result["snap_counts"] == [] and result["count"] == 0
+    assert "No player matches 'Kelc'" in result["reason"]
+
+
+def test_snap_counts_player_id_maps_through_pfr_id(monkeypatch):
+    calls = []
+
+    def fake_execute(sql, params=None):
+        if sql.startswith("SELECT MIN("):  # empty-result range lookup, not the tool's query
+            return []
+        calls.append((sql, params))
+        if "FROM players" in sql:
+            return [{"gsis_id": "00-0030506", "display_name": "Travis Kelce", "short_name": "T.Kelce",
+                     "position": "TE", "teams": ["KC"], "latest_team": "KC", "first_season": 2013,
+                     "last_season": 2026, "pfr_id": "KelcTr00"}]
+        return []
+
+    monkeypatch.setattr(tools, "_execute", fake_execute)
+    tools.nfl_snap_counts(player_id="00-0030506", season=2024, season_type="REG")
+    sql, params = calls[-1]
+    assert "pfr_player_id = ?" in sql
+    assert params == ["KelcTr00", 2024, "REG"]
 
 
 def test_snap_counts_returns_error_on_timeout(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("snap timeout")))
-    result = tools.nfl_snap_counts(team="KC")
+    result = tools.nfl_snap_counts(team="KC", season_type="REG")
     assert result["error"] == "snap timeout"
 
 
@@ -846,17 +925,18 @@ def test_ftn_charting_builds_all_filters(monkeypatch):
         }]
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
+    monkeypatch.setattr(tools, "_resolve_player", lambda *a, **k: (dict(MAHOMES), None))
     result = tools.nfl_ftn_charting(
         team="kc", opponent="phi", player="Mahomes",
-        season_from=2022, season_to=2024, week=3, season_type="reg",
+        season_from=2022, season_to=2024, week=3, season_type="REG",
     )
     sql, params = captured["sql"], captured["params"]
     assert "p.posteam = ?" in sql and "p.defteam = ?" in sql
-    assert "p.passer_player_name ILIKE ?" in sql
+    assert "p.passer_player_id = ?" in sql
     assert "p.season >= ?" in sql and "p.season <= ?" in sql
     assert "p.week = ?" in sql and "p.season_type = ?" in sql
     assert params[:2] == ["KC", "PHI"]
-    assert params[2:5] == ["%Mahomes%"] * 3
+    assert params[2:5] == [MAHOMES["gsis_id"]] * 3
     assert params[5:7] == [2022, 2024]
     assert params[-2:] == [3, "REG"]
     assert result["charting"]["play_action"]["pct"] == 40.0
@@ -867,11 +947,13 @@ def test_ftn_charting_exact_season_filter(monkeypatch):
     captured = {}
     monkeypatch.setattr(
         tools, "_execute",
-        lambda sql, params=None: captured.update(sql=sql, params=params) or [{"total_plays": 0}],
+        lambda sql, params=None: ([] if sql.startswith("SELECT MIN(")
+                                  else captured.update(sql=sql, params=params) or [{"total_plays": 0}]),
     )
-    result = tools.nfl_ftn_charting(season=2024)
+    result = tools.nfl_ftn_charting(season=2024, season_type="REG")
     assert "p.season = ?" in captured["sql"]
-    assert captured["params"] == [2024]
+    assert captured["params"] == [2024, "REG"]
+    result.pop("data_as_of", None)  # present whenever a database file exists (group J)
     assert result == {"charting": {}, "total_plays": 0}
 
 
@@ -884,7 +966,7 @@ def test_ftn_charting_handles_null_averages(monkeypatch):
             "avg_defenders_in_box": None, "avg_pass_rushers": None, "avg_blitzers": None,
         }],
     )
-    result = tools.nfl_ftn_charting(team="KC")
+    result = tools.nfl_ftn_charting(team="KC", season_type="REG")
     c = result["charting"]
     assert c["play_action"]["pct"] == 0.0
     assert c["play_action"]["plays"] == 0
@@ -893,13 +975,14 @@ def test_ftn_charting_handles_null_averages(monkeypatch):
 
 def test_ftn_charting_empty_rows(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [])
-    result = tools.nfl_ftn_charting(team="KC")
+    result = tools.nfl_ftn_charting(team="KC", season_type="REG")
+    result.pop("data_as_of", None)  # present whenever a database file exists (group J)
     assert result == {"charting": {}, "total_plays": 0}
 
 
 def test_ftn_charting_returns_error_on_db_error(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(duckdb.Error("ftn boom")))
-    result = tools.nfl_ftn_charting(team="KC")
+    result = tools.nfl_ftn_charting(team="KC", season_type="REG")
     assert result["error"] == "ftn boom"
 
 
@@ -917,116 +1000,122 @@ def _capture_execute(monkeypatch, rows):
     return captured
 
 
-def test_td_luck_builds_filters(monkeypatch):
+def test_td_luck_builds_filters(monkeypatch, resolves_to_mahomes):
     captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
-    result = tools.nfl_td_luck(player="Jefferson", position="wr", team="min", season=2024, limit=10)
+    result = tools.nfl_td_luck(player="Jefferson", position="wr", team="min", season=2024, limit=10, season_type="REG")
     assert result["count"] == 1
-    assert "full_name ILIKE ?" in captured["sql"]
-    assert "position ILIKE ?" in captured["sql"]
+    assert "player_id = ?" in captured["sql"] and "ILIKE" not in captured["sql"]
+    assert "upper(position) = ?" in captured["sql"]
     assert "team = ?" in captured["sql"]
     assert "total_td_luck_score ASC" in captured["sql"]
-    assert captured["params"] == ["%Jefferson%", "WR", "MIN", 2024]
+    assert captured["params"] == [MAHOMES["gsis_id"], "WR", "MIN", 2024, "REG"]
 
 
-def test_td_luck_invalid_limit_falls_back(monkeypatch):
+def test_td_luck_invalid_limit_returns_error(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
-    tools.nfl_td_luck(limit="oops")
-    assert "LIMIT 51" in captured["sql"]
-    assert captured["params"] is None
+    result = tools.nfl_td_luck(limit="oops", season_type="REG")
+    assert result["code"] == "INVALID_ARGUMENT"
+    assert "sql" not in captured
 
 
 def test_td_luck_returns_error_on_timeout(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("td timeout")))
-    assert tools.nfl_td_luck()["error"] == "td timeout"
+    assert tools.nfl_td_luck(season_type="REG")["error"] == "td timeout"
 
 
-def test_role_trend_builds_filters(monkeypatch):
+def test_role_trend_builds_filters(monkeypatch, resolves_to_mahomes):
     captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
-    tools.nfl_role_trend(player="Kelce", position="te", team="kc", season=2024, week=8, min_snap_pct=50)
-    assert "full_name ILIKE ?" in captured["sql"]
+    tools.nfl_role_trend(player="Kelce", position="te", team="kc", season=2024, week=8, min_snap_pct=50, season_type="REG")
+    assert "player_id = ?" in captured["sql"] and "ILIKE" not in captured["sql"]
     assert "snap_pct >= ?" in captured["sql"]
     assert "snap_pct_delta DESC" in captured["sql"]
-    assert captured["params"] == ["%Kelce%", "TE", "KC", 2024, 8, 50.0]
+    assert captured["params"] == [MAHOMES["gsis_id"], "TE", "KC", 2024, 8, 50.0, "REG"]
 
 
-def test_role_trend_invalid_limit_falls_back(monkeypatch):
+def test_role_trend_invalid_limit_returns_error(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
-    tools.nfl_role_trend(limit="oops")
-    assert "LIMIT 51" in captured["sql"]
+    result = tools.nfl_role_trend(limit="oops", season_type="REG")
+    assert result["code"] == "INVALID_ARGUMENT"
+    assert "sql" not in captured
 
 
 def test_role_trend_returns_error_on_timeout(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("role timeout")))
-    assert tools.nfl_role_trend()["error"] == "role timeout"
+    assert tools.nfl_role_trend(season_type="REG")["error"] == "role timeout"
 
 
-def test_separation_opportunity_builds_filters(monkeypatch):
+def test_separation_opportunity_builds_filters(monkeypatch, resolves_to_mahomes):
     captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
-    tools.nfl_separation_opportunity(player="Aiyuk", position="wr", team="sf", season=2024, regression_candidate=True)
+    tools.nfl_separation_opportunity(player="Aiyuk", position="wr", team="sf", season=2024, regression_candidate=True, season_type="REG")
     assert "regression_candidate = ?" in captured["sql"]
     assert "fp_diff_per_game ASC" in captured["sql"]
-    assert captured["params"] == ["%Aiyuk%", "WR", "SF", 2024, True]
+    assert "player_id = ?" in captured["sql"]
+    assert captured["params"] == [MAHOMES["gsis_id"], "WR", "SF", 2024, True, "REG"]
 
 
 def test_separation_opportunity_guards_pre_2016():
-    result = tools.nfl_separation_opportunity(season=2015)
+    result = tools.nfl_separation_opportunity(season=2015, season_type="REG")
     assert "2016" in result["error"]
 
 
-def test_separation_opportunity_invalid_limit_falls_back(monkeypatch):
+def test_separation_opportunity_invalid_limit_returns_error(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
-    tools.nfl_separation_opportunity(limit="oops")
-    assert "LIMIT 51" in captured["sql"]
+    result = tools.nfl_separation_opportunity(limit="oops", season_type="REG")
+    assert result["code"] == "INVALID_ARGUMENT"
+    assert "sql" not in captured
 
 
 def test_separation_opportunity_returns_error_on_timeout(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("sep timeout")))
-    assert tools.nfl_separation_opportunity()["error"] == "sep timeout"
+    assert tools.nfl_separation_opportunity(season_type="REG")["error"] == "sep timeout"
 
 
-def test_drop_rate_builds_filters(monkeypatch):
+def test_drop_rate_builds_filters(monkeypatch, resolves_to_mahomes):
     captured = _capture_execute(monkeypatch, [{"player": "T.Pollard"}])
-    tools.nfl_drop_rate(player="Pollard", team="ten", season=2024, min_targets=30)
-    assert "player ILIKE ?" in captured["sql"]
+    tools.nfl_drop_rate(player="Pollard", team="ten", season=2024, min_targets=30, season_type="REG")
+    assert "player_id = ?" in captured["sql"] and "ILIKE" not in captured["sql"]
     assert "catchable_targets >= ?" in captured["sql"]
     assert "drop_rate_pct DESC" in captured["sql"]
-    assert captured["params"] == ["%Pollard%", "TEN", 2024, 30]
+    assert captured["params"] == [MAHOMES["gsis_id"], "TEN", 2024, "REG", 30]
 
 
 def test_drop_rate_guards_pre_2022():
-    result = tools.nfl_drop_rate(season=2021)
+    result = tools.nfl_drop_rate(season=2021, season_type="REG")
     assert "2022" in result["error"]
 
 
-def test_drop_rate_invalid_limit_falls_back(monkeypatch):
+def test_drop_rate_invalid_limit_returns_error(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
-    tools.nfl_drop_rate(limit="oops")
-    assert "LIMIT 51" in captured["sql"]
+    result = tools.nfl_drop_rate(limit="oops", season_type="REG")
+    assert result["code"] == "INVALID_ARGUMENT"
+    assert "sql" not in captured
 
 
 def test_drop_rate_returns_error_on_timeout(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("drop timeout")))
-    assert tools.nfl_drop_rate()["error"] == "drop timeout"
+    assert tools.nfl_drop_rate(season_type="REG")["error"] == "drop timeout"
 
 
-def test_contract_value_builds_filters(monkeypatch):
+def test_contract_value_builds_filters(monkeypatch, resolves_to_mahomes):
     captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
-    tools.nfl_contract_value(player="Gibbs", position="rb", team="det", season=2024, min_apy=2, max_apy=10)
+    tools.nfl_contract_value(player="Gibbs", position="rb", team="det", season=2024, min_apy=2, max_apy=10, season_type="REG")
     assert "apy >= ?" in captured["sql"]
     assert "apy <= ?" in captured["sql"]
     assert "fp_per_million DESC" in captured["sql"]
-    assert captured["params"] == ["%Gibbs%", "RB", "DET", 2024, 2.0, 10.0]
+    assert "player_id = ?" in captured["sql"]
+    assert captured["params"] == [MAHOMES["gsis_id"], "RB", "DET", 2024, 2.0, 10.0, "REG"]
 
 
-def test_contract_value_invalid_limit_falls_back(monkeypatch):
+def test_contract_value_invalid_limit_returns_error(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
-    tools.nfl_contract_value(limit="oops")
-    assert "LIMIT 51" in captured["sql"]
+    result = tools.nfl_contract_value(limit="oops", season_type="REG")
+    assert result["code"] == "INVALID_ARGUMENT"
+    assert "sql" not in captured
 
 
 def test_contract_value_returns_error_on_timeout(monkeypatch):
     monkeypatch.setattr(tools, "_execute", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("contract timeout")))
-    assert tools.nfl_contract_value()["error"] == "contract timeout"
+    assert tools.nfl_contract_value(season_type="REG")["error"] == "contract timeout"
 
 
 def test_injury_return_builds_filters(monkeypatch):
@@ -1039,11 +1128,11 @@ def test_injury_return_builds_filters(monkeypatch):
     assert captured["params"] == ["%hamstring%", "WR", 2]
 
 
-def test_injury_return_invalid_limit_falls_back(monkeypatch):
+def test_injury_return_invalid_limit_returns_error(monkeypatch):
     captured = _capture_execute(monkeypatch, [])
-    tools.nfl_injury_return(limit="oops")
-    assert "LIMIT 51" in captured["sql"]
-    assert captured["params"] is None
+    result = tools.nfl_injury_return(limit="oops")
+    assert result["code"] == "INVALID_ARGUMENT"
+    assert "sql" not in captured
 
 
 def test_injury_return_returns_error_on_timeout(monkeypatch):
@@ -1075,10 +1164,10 @@ def _raise(exc):
 
 
 def test_err_helper_keeps_the_text_and_adds_code_and_extra_fields():
-    result = tools._err(ErrorCode.INVALID_INPUT, "bad input", available=["plays"])
+    result = tools._err(ErrorCode.INVALID_ARGUMENT, "bad input", available=["plays"])
     assert result == {
         "error": "bad input",
-        "code": ErrorCode.INVALID_INPUT,
+        "code": ErrorCode.INVALID_ARGUMENT,
         "available": ["plays"],
     }
 
@@ -1144,10 +1233,12 @@ def test_classifier_code_serializes_as_the_plain_string():
 # ── Early validation errors ────────────────────────────────────────────────────
 
 VALIDATION_CASES = [
+    # Merge: the texts are main's. DuckDB's parser decides the statement checks, and the
+    # fixed-value checks use main's one message form ("Unknown <param> '<value>'. Use one of: ...").
     (
         lambda: tools.nfl_query("INSERT INTO plays VALUES (1)"),
         ErrorCode.NOT_SELECT,
-        "Only SELECT queries are allowed.",
+        "Only SELECT and EXPLAIN of a SELECT are allowed; got INSERT.",
     ),
     (
         lambda: tools.nfl_query("SELECT pg_sleep(100)"),
@@ -1157,37 +1248,32 @@ VALIDATION_CASES = [
     (
         lambda: tools.nfl_query("SELECT 1; SELECT 2"),
         ErrorCode.MULTIPLE_STATEMENTS,
-        "Multiple statements are not allowed.",
+        "Send exactly one statement per call.",
     ),
     (
         lambda: tools.nfl_schema(category="not-real"),
-        ErrorCode.INVALID_INPUT,
+        ErrorCode.INVALID_ARGUMENT,
         "Unknown category 'not-real'",
     ),
     (
-        lambda: tools.nfl_player_stats(player_name="P.Mahomes", stat_type="kicking"),
-        ErrorCode.INVALID_INPUT,
-        "Unknown stat_type: kicking. Use 'passing', 'rushing', or 'receiving'.",
-    ),
-    (
-        lambda: tools.nfl_compare(entity1="KC", entity2="BAL", compare_type="invalid"),
-        ErrorCode.INVALID_INPUT,
-        "Unknown compare_type: invalid. Use 'team' or 'player'.",
+        lambda: tools.nfl_player_stats(player="P.Mahomes", stat_type="kicking", season_type="REG"),
+        ErrorCode.INVALID_ARGUMENT,
+        "Unknown stat_type 'kicking'. Use one of: passing, rushing, receiving.",
     ),
     (
         lambda: tools.nfl_fantasy_rankings(scope="month"),
-        ErrorCode.INVALID_INPUT,
-        "Unknown scope: month. Use 'draft' or 'week'.",
+        ErrorCode.INVALID_ARGUMENT,
+        "Unknown scope 'month'. Use one of: draft, week.",
     ),
     (
         lambda: tools.nfl_team_records(),
-        ErrorCode.INVALID_INPUT,
-        "Provide team, season, or a from_season/to_season range.",
+        ErrorCode.INVALID_ARGUMENT,
+        "Provide team, season, or a season_from/season_to range.",
     ),
     (
         lambda: tools.nfl_team_records(team="ZZZ"),
         ErrorCode.UNKNOWN_TEAM,
-        "Unknown team 'ZZZ'.",
+        "Unknown team 'ZZZ'",
     ),
     (
         lambda: tools.nfl_separation_opportunity(season=2015),
@@ -1241,7 +1327,7 @@ def test_schema_summary_warning_uses_the_classifier(monkeypatch):
 def test_structured_tool_gets_the_column_help_nfl_query_already_had(monkeypatch):
     monkeypatch.setattr(tools, "_live_names", lambda sql: ["epa", "play_type"])
     monkeypatch.setattr(tools, "_execute", _raise(duckdb.BinderException(COLUMN_ERROR)))
-    result = tools.nfl_search_plays(team="KC")
+    result = tools.nfl_search_plays(team="KC", season_type="REG")
     assert result["code"] is ErrorCode.COLUMN_NOT_FOUND
     assert result["unknown_column"] == "play_epa"
     assert result["did_you_mean"][0] == "epa"
@@ -1250,7 +1336,7 @@ def test_structured_tool_gets_the_column_help_nfl_query_already_had(monkeypatch)
 def test_structured_tool_reports_a_derived_table_that_was_never_built(monkeypatch):
     monkeypatch.setattr(tools, "_live_names", lambda sql: ["plays"])
     monkeypatch.setattr(tools, "_execute", _raise(DERIVED_TABLE_MISSING))
-    result = tools.nfl_td_luck()
+    result = tools.nfl_td_luck(season_type="REG")
     assert result["code"] is ErrorCode.TABLE_NOT_FOUND
     assert result["unknown_table"] == "player_td_luck"
     assert "nfl_catalog" in result["hint"]
@@ -1264,24 +1350,25 @@ TOOL_ERROR_CASES = {
     "nfl_schema": {"table": "plays"},
     "nfl_status": {},
     "nfl_query": {"sql": "SELECT 1"},
-    "nfl_search_plays": {"team": "KC"},
-    "nfl_team_stats": {"team": "KC"},
-    "nfl_player_stats": {"player_name": "P.Mahomes"},
-    "nfl_compare": {"entity1": "KC", "entity2": "BAL"},
+    "nfl_search_plays": {"team": "KC", "season_type": "REG"},
+    "nfl_team_stats": {"team": "KC", "season_type": "REG"},
+    "nfl_player_stats": {"player": "P.Mahomes", "season_type": "REG"},
+    "nfl_player_lookup": {"player": "P.Mahomes"},
+    "nfl_compare": {"team1": "KC", "team2": "BAL", "season_type": "REG"},
     "nfl_catalog": {},
     "nfl_roster": {"team": "KC"},
-    "nfl_injuries": {"team": "KC"},
-    "nfl_schedule": {"team": "KC"},
+    "nfl_injuries": {"team": "KC", "season_type": "REG"},
+    "nfl_schedule": {"team": "KC", "season_type": "REG"},
     "nfl_team_records": {"team": "KC"},
-    "nfl_snap_counts": {"team": "KC"},
-    "nfl_fantasy_opportunity": {"team": "KC"},
+    "nfl_snap_counts": {"team": "KC", "season_type": "REG"},
+    "nfl_fantasy_opportunity": {"team": "KC", "season_type": "REG"},
     "nfl_fantasy_rankings": {},
-    "nfl_ftn_charting": {"team": "KC"},
-    "nfl_td_luck": {},
-    "nfl_role_trend": {},
-    "nfl_separation_opportunity": {},
-    "nfl_drop_rate": {},
-    "nfl_contract_value": {},
+    "nfl_ftn_charting": {"team": "KC", "season_type": "REG"},
+    "nfl_td_luck": {"season_type": "REG"},
+    "nfl_role_trend": {"season_type": "REG"},
+    "nfl_separation_opportunity": {"season_type": "REG"},
+    "nfl_drop_rate": {"season_type": "REG"},
+    "nfl_contract_value": {"season_type": "REG"},
     "nfl_injury_return": {},
 }
 
@@ -1293,6 +1380,8 @@ def test_every_public_tool_is_walked_by_the_error_test():
 @pytest.mark.parametrize("name", sorted(TOOL_ERROR_CASES))
 def test_every_tool_failure_returns_a_string_error_and_an_error_code(monkeypatch, name):
     monkeypatch.setattr(tools, "_execute", _raise(TimeoutError("query timeout")))
+    # nfl_query runs its SQL as written through _fetch_capped, not _execute.
+    monkeypatch.setattr(tools, "_fetch_capped", _raise(TimeoutError("query timeout")))
 
     result = getattr(tools, name)(**TOOL_ERROR_CASES[name])
 
@@ -1320,26 +1409,37 @@ def test_cap_helper_drops_the_probe_row_and_flags_truncation(n_rows, expected_tr
 # A new capped tool belongs here; a tool with no cap belongs in NO_ROW_CAP below.
 ROW_CAP_CASES = [
     ("nfl_query", {"sql": "SELECT 1 AS x", "max_rows": 3}, "rows", "row_count", 3),
-    ("nfl_search_plays", {"max_rows": 3}, "rows", "row_count", 3),
-    ("nfl_team_records", {"season": 2024}, "records", "count", 500),
-    ("nfl_roster", {}, "players", "count", 500),
-    ("nfl_injuries", {}, "injuries", "count", 500),
-    ("nfl_schedule", {}, "games", "count", 500),
-    ("nfl_snap_counts", {}, "snap_counts", "count", 500),
-    ("nfl_fantasy_opportunity", {}, "fantasy_opportunity", "count", 500),
+    ("nfl_search_plays", {"limit": 3, "season_type": "REG"}, "rows", "row_count", 3),
+    ("nfl_player_lookup", {"player": "Smith"}, "candidates", "count", 50),
+    ("nfl_team_records", {"season": 2024, "limit": 3}, "records", "count", 3),
+    ("nfl_roster", {"limit": 3}, "players", "count", 3),
+    ("nfl_injuries", {"limit": 3, "season_type": "REG"}, "injuries", "count", 3),
+    ("nfl_schedule", {"limit": 3, "season_type": "REG"}, "games", "count", 3),
+    ("nfl_snap_counts", {"limit": 3, "season_type": "REG"}, "snap_counts", "count", 3),
+    ("nfl_fantasy_opportunity", {"limit": 3, "season_type": "REG"}, "fantasy_opportunity", "count", 3),
     ("nfl_fantasy_rankings", {"limit": 3}, "fantasy_rankings", "count", 3),
-    ("nfl_td_luck", {"limit": 3}, "td_luck", "count", 3),
-    ("nfl_role_trend", {"limit": 3}, "role_trend", "count", 3),
-    ("nfl_separation_opportunity", {"limit": 3}, "separation_opportunity", "count", 3),
-    ("nfl_drop_rate", {"limit": 3}, "drop_rate", "count", 3),
-    ("nfl_contract_value", {"limit": 3}, "contract_value", "count", 3),
+    ("nfl_td_luck", {"limit": 3, "season_type": "REG"}, "td_luck", "count", 3),
+    ("nfl_role_trend", {"limit": 3, "season_type": "REG"}, "role_trend", "count", 3),
+    ("nfl_separation_opportunity", {"limit": 3, "season_type": "REG"}, "separation_opportunity", "count", 3),
+    ("nfl_drop_rate", {"limit": 3, "season_type": "REG"}, "drop_rate", "count", 3),
+    ("nfl_contract_value", {"limit": 3, "season_type": "REG"}, "contract_value", "count", 3),
     ("nfl_injury_return", {"limit": 3}, "injury_return", "count", 3),
 ]
 
 
 def _capped_rows(n):
-    """Fake `_execute` results; the extra keys satisfy nfl_team_records' era-name join."""
-    return [{"i": i, "season": 2024, "team": "LV"} for i in range(n)]
+    """Fake `_execute` results. The extra keys satisfy nfl_team_records' era-name join and the
+    player rows nfl_player_lookup shapes (latest_team, teams)."""
+    return [{"i": i, "season": 2024, "team": "LV", "latest_team": "LV", "teams": ["LV"]}
+            for i in range(n)]
+
+
+def _fake_fetch_capped(captured, n):
+    """Stand-in for nfl_query's _fetch_capped: records the SQL with the row limit it was given."""
+    def fetch(sql, limit):
+        captured["sql"] = f"{sql}\nLIMIT {limit}"
+        return [{"name": "i", "type": "INTEGER"}], _capped_rows(min(n, limit))
+    return fetch
 
 
 @pytest.mark.parametrize("name,kwargs,list_key,count_key,cap", ROW_CAP_CASES)
@@ -1351,6 +1451,7 @@ def test_capped_tool_fetches_cap_plus_one_and_flags_truncation(monkeypatch, name
         return _capped_rows(cap + 1)
 
     monkeypatch.setattr(tools, "_execute", fake_execute)
+    monkeypatch.setattr(tools, "_fetch_capped", _fake_fetch_capped(captured, cap + 1))
     result = getattr(tools, name)(**kwargs)
 
     assert "error" not in result
@@ -1364,6 +1465,7 @@ def test_capped_tool_fetches_cap_plus_one_and_flags_truncation(monkeypatch, name
 @pytest.mark.parametrize("name,kwargs,list_key,count_key,cap", ROW_CAP_CASES)
 def test_capped_tool_reports_no_truncation_under_the_cap(monkeypatch, name, kwargs, list_key, count_key, cap):
     monkeypatch.setattr(tools, "_execute", lambda sql, params=None: _capped_rows(cap - 1))
+    monkeypatch.setattr(tools, "_fetch_capped", _fake_fetch_capped({}, cap - 1))
     result = getattr(tools, name)(**kwargs)
 
     assert "error" not in result
@@ -1558,7 +1660,8 @@ def test_status_on_an_old_database_reports_the_same_health_and_no_issues(old_log
     assert result["datasets"]["total_loaded"] == 2
     assert [d["dataset_id"] for d in result["datasets"]["loaded"]] == ["pbp", "rosters"]
     assert result["datasets"]["loaded"][0]["total_rows"] == 650
-    assert result["datasets"]["last_refreshed"] == datetime.datetime(2026, 1, 1)
+    # main reports timestamps as ISO 8601 UTC text (_iso_utc).
+    assert result["datasets"]["last_refreshed"] == "2026-01-01T00:00:00.000000Z"
     assert result["datasets"]["issues"] == []
 
 
@@ -1571,7 +1674,8 @@ def test_status_on_a_new_database_lists_attempts_that_landed_nothing(new_log_db)
     assert loaded[0]["total_rows"] == 650
     assert result["datasets"]["total_loaded"] == 2
     # The failed and empty attempts were written later than any loaded row.
-    assert result["datasets"]["last_refreshed"] == datetime.datetime(2026, 1, 1)
+    # main reports timestamps as ISO 8601 UTC text (_iso_utc).
+    assert result["datasets"]["last_refreshed"] == "2026-01-01T00:00:00.000000Z"
     assert result["datasets"]["issues"] == [
         {"dataset_id": "espn_records", "season": 1972, "status": "empty",
          "detail": "ESPN listed no games"},
@@ -1621,10 +1725,13 @@ ESPN_LOG = [
     ("espn_records", "espn_team_records", 1997, 0, "2026-01-01", "failed", "HTTP 500"),
 ]
 
+# Merge: main's v0.7.3 wording, which names the optional ESPN pull and no command the
+# container user cannot run.
 _PULL_ADVICE = (
     "No stored record for that franchise and season. Records before "
-    f"{RECORDS_FIRST_NFLVERSE_SEASON} come from the opt-in ESPN pull: "
-    "run 'nfl-mcp ingest --pre1999'."
+    f"{RECORDS_FIRST_NFLVERSE_SEASON} come from an optional ESPN data pull. "
+    "This database was built without that pull, or ESPN's archive has no "
+    "record for this franchise and season."
 )
 
 
@@ -1646,7 +1753,7 @@ def test_record_absent_after_a_loaded_espn_season_says_the_source_has_none(tmp_p
 
 def test_record_absent_over_a_pre1999_range_the_pull_covered_says_the_same(tmp_path, monkeypatch):
     _records_db(tmp_path, monkeypatch, ESPN_LOG)
-    result = tools.nfl_team_records(team="CIN", from_season=1990, to_season=1995)
+    result = tools.nfl_team_records(team="CIN", season_from=1990, season_to=1995)
     assert result["source_checked"] == "espn"
     assert "--pre1999" not in result["reason"]
 
@@ -1681,7 +1788,7 @@ def test_record_absent_when_the_log_cannot_be_read_still_points_at_the_pull(tmp_
 
 def test_record_absent_on_an_open_ended_range_makes_no_espn_claim(tmp_path, monkeypatch):
     _records_db(tmp_path, monkeypatch, ESPN_LOG)
-    result = tools.nfl_team_records(team="GB", from_season=1970)
+    result = tools.nfl_team_records(team="GB", season_from=1970)
     assert "source_checked" not in result
     assert result["reason"] == "No stored record for that franchise and season."
 
@@ -1716,11 +1823,20 @@ def _parameters(name):
     return set(inspect.signature(getattr(tools, name)).parameters)
 
 
+def _call(name, *args, **kwargs):
+    """Call a public tool. main requires season_type on every tool that takes it, so the
+    tests below send REG unless they pass their own value."""
+    if "season_type" in _parameters(name):
+        kwargs.setdefault("season_type", "REG")
+    return getattr(tools, name)(*args, **kwargs)
+
+
 # Arguments the tools need before they reach any check.
 _REQUIRED = {
+    "nfl_player_lookup": {"player": "P.Mahomes"},
     "nfl_team_stats": {"team": "KC"},
-    "nfl_player_stats": {"player_name": "P.Mahomes"},
-    "nfl_compare": {"entity1": "KC", "entity2": "BAL"},
+    "nfl_player_stats": {"player": "P.Mahomes"},
+    "nfl_compare": {"team1": "KC", "team2": "BAL"},
 }
 
 _WHOLE_RAIDERS = {"LV", "OAK"}
@@ -1732,8 +1848,9 @@ TEAM_ARGUMENT_CASES = [
     ("nfl_search_plays", "team", {}, _WHOLE_RAIDERS),
     ("nfl_search_plays", "opponent", {}, _WHOLE_RAIDERS),
     ("nfl_team_stats", "team", {}, _WHOLE_RAIDERS),
-    ("nfl_compare", "entity1", {"entity2": "KC"}, _WHOLE_RAIDERS),
-    ("nfl_compare", "entity2", {"entity1": "KC"}, _WHOLE_RAIDERS),
+    ("nfl_player_lookup", "team", {"player": "Smith"}, _WHOLE_RAIDERS),
+    ("nfl_compare", "team1", {"team2": "KC"}, _WHOLE_RAIDERS),
+    ("nfl_compare", "team2", {"team1": "KC"}, _WHOLE_RAIDERS),
     ("nfl_roster", "team", {}, _WHOLE_RAIDERS),
     ("nfl_injuries", "team", {}, _WHOLE_RAIDERS),
     ("nfl_schedule", "team", {}, _WHOLE_RAIDERS),
@@ -1758,15 +1875,15 @@ def test_every_team_argument_is_walked_by_the_team_tests():
     }
     walked = {(name, param) for name, param, _, _ in TEAM_ARGUMENT_CASES}
     assert declared <= walked
-    assert walked - declared == {("nfl_compare", "entity1"), ("nfl_compare", "entity2")}
+    assert walked - declared == {("nfl_compare", "team1"), ("nfl_compare", "team2")}
 
 
 @pytest.mark.parametrize("name,param,kwargs,codes", TEAM_ARGUMENT_CASES)
 def test_every_team_argument_refuses_an_unknown_team(monkeypatch, name, param, kwargs, codes):
     _record_calls(monkeypatch)
-    result = getattr(tools, name)(**{**kwargs, param: "ZZZ"})
+    result = _call(name, **{**kwargs, param: "ZZZ"})
     assert result["code"] is ErrorCode.UNKNOWN_TEAM
-    assert result["error"] == "Unknown team 'ZZZ'."
+    assert result["error"] == "Unknown team 'ZZZ'"
     assert result["parameter"] == param
     assert result["did_you_mean"] == []
 
@@ -1776,7 +1893,7 @@ def test_every_team_argument_sends_every_code_of_a_relocated_franchise(
     monkeypatch, name, param, kwargs, codes,
 ):
     calls = _record_calls(monkeypatch)
-    result = getattr(tools, name)(**{**kwargs, param: "oak"})
+    result = _call(name, **{**kwargs, param: "oak"})
     assert "error" not in result
     raiders = [(sql, params) for sql, params in calls if "LV" in params]
     assert raiders, "no query carried the Raiders"
@@ -1801,45 +1918,55 @@ def test_the_jaguars_reach_the_fantasypros_code(monkeypatch):
 
 def test_a_code_only_the_table_stores_is_accepted(monkeypatch):
     # FantasyPros lists free agents as FA, which is no franchise.
-    calls = []
-
-    def fake_execute(sql, params=None):
-        calls.append((sql, params))
-        return [{"1": 1}] if sql.startswith("SELECT 1 FROM ff_rankings_week") else []
-
-    monkeypatch.setattr(tools, "_execute", fake_execute)
+    # Merge: main spells FA in nfl_fantasy_rankings instead of probing the table first, so
+    # the one query is the rankings query, and it filters on the rankings' own code.
+    calls = _record_calls(monkeypatch)
     result = tools.nfl_fantasy_rankings(team="fa", scope="week")
     assert "error" not in result
-    assert calls[0] == ("SELECT 1 FROM ff_rankings_week WHERE team = ? LIMIT 1", ["FA"])
-    assert calls[-1][1][0] == "FA"
+    assert len(calls) == 1
+    assert "team = 'FA'" in calls[0][0]
 
 
-def test_a_failed_stored_code_lookup_returns_the_classified_error(monkeypatch):
+def test_an_unknown_team_is_refused_without_a_table_lookup(monkeypatch):
+    # Merge: the branch probed the table for a code only it stores, so a failed probe was a
+    # TIMEOUT. main names those codes instead (JAC is a Jaguars alias in franchises.py, FA is
+    # spelled in nfl_fantasy_rankings), so an unknown code never reaches the database.
     monkeypatch.setattr(tools, "_execute", _raise(TimeoutError("probe timeout")))
     result = tools.nfl_roster(team="ZZZ")
-    assert result["code"] is ErrorCode.TIMEOUT
-    assert result["error"] == "probe timeout"
+    assert result["code"] is ErrorCode.UNKNOWN_TEAM
 
 
 def test_a_team_check_runs_only_when_a_team_is_given(monkeypatch):
     calls = _record_calls(monkeypatch)
-    tools.nfl_roster(team="")
-    assert calls[0][1] == []
+    tools.nfl_roster(team=None)
+    assert not calls[0][1]
+    # Merge: main refuses an empty team value by name instead of reading it as "no team".
+    assert tools.nfl_roster(team="")["code"] is ErrorCode.UNKNOWN_TEAM
 
 
 # Every parameter with a fixed set of values: (tool, other kwargs, parameter, allowed).
 CHOICE_CASES = [
-    ("nfl_search_plays", {}, "season_type", tools.SEASON_TYPES),
+    ("nfl_search_plays", {"player": "P.Mahomes"}, "player_role", tools.PLAYER_ROLES),
+    ("nfl_search_plays", {}, "season_type", tools.GAME_SEASON_TYPES),
     ("nfl_search_plays", {}, "play_type", tools.PLAY_TYPES),
     ("nfl_search_plays", {}, "situation", tools.SITUATIONS),
+    ("nfl_search_plays", {}, "sort_by", tools.PLAY_SORTS),
     ("nfl_team_stats", {"team": "KC"}, "side", tools.TEAM_STAT_SIDES),
-    ("nfl_player_stats", {"player_name": "P.Mahomes"}, "season_type", tools.SEASON_TYPES),
-    ("nfl_player_stats", {"player_name": "P.Mahomes"}, "stat_type", tools.STAT_TYPES),
-    ("nfl_compare", {"entity1": "KC", "entity2": "BAL"}, "compare_type", tools.COMPARE_TYPES),
-    ("nfl_compare", {"entity1": "KC", "entity2": "BAL"}, "season_type", tools.SEASON_TYPES),
-    ("nfl_schedule", {}, "season_type", tools.SCHEDULE_SEASON_TYPES),
+    ("nfl_team_stats", {"team": "KC"}, "season_type", tools.SEASON_TYPES),
+    ("nfl_player_stats", {"player": "P.Mahomes"}, "season_type", tools.SEASON_TYPES),
+    ("nfl_player_stats", {"player": "P.Mahomes"}, "stat_type", tools.STAT_TYPES),
+    ("nfl_compare", {"team1": "KC", "team2": "BAL"}, "season_type", tools.SEASON_TYPES),
+    ("nfl_injuries", {}, "season_type", tools.GAME_SEASON_TYPES),
+    ("nfl_schedule", {}, "season_type", tools.GAME_SEASON_TYPES),
+    ("nfl_snap_counts", {}, "season_type", tools.GAME_SEASON_TYPES),
+    ("nfl_fantasy_opportunity", {}, "season_type", tools.GAME_SEASON_TYPES),
     ("nfl_fantasy_rankings", {}, "scope", tools.RANKING_SCOPES),
-    ("nfl_ftn_charting", {}, "season_type", tools.SEASON_TYPES),
+    ("nfl_ftn_charting", {}, "season_type", tools.GAME_SEASON_TYPES),
+    ("nfl_td_luck", {}, "season_type", tools.SEASON_TYPES),
+    ("nfl_role_trend", {}, "season_type", tools.GAME_SEASON_TYPES),
+    ("nfl_separation_opportunity", {}, "season_type", tools.SEASON_TYPES),
+    ("nfl_drop_rate", {}, "season_type", tools.SEASON_TYPES),
+    ("nfl_contract_value", {}, "season_type", tools.SEASON_TYPES),
 ]
 
 
@@ -1859,49 +1986,66 @@ def test_every_schema_enum_is_a_checked_choice_with_the_same_values():
 @pytest.mark.parametrize("name,kwargs,param,allowed", CHOICE_CASES)
 def test_an_unrecognized_fixed_value_is_invalid_input(monkeypatch, name, kwargs, param, allowed):
     calls = _record_calls(monkeypatch)
-    result = getattr(tools, name)(**{**kwargs, param: "bogus"})
-    assert result["code"] is ErrorCode.INVALID_INPUT
+    result = _call(name, **{**kwargs, param: "bogus"})
+    assert result["code"] is ErrorCode.INVALID_ARGUMENT
     assert result["parameter"] == param
     assert result["allowed"] == list(allowed)
-    assert result["error"].startswith(f"Unknown {param}: bogus. Use ")
+    assert result["error"].startswith(f"Unknown {param} 'bogus'. Use one of: ")
     assert calls == []
 
 
 @pytest.mark.parametrize("name,kwargs,param,allowed", CHOICE_CASES)
 def test_every_fixed_value_is_accepted_in_any_case(monkeypatch, name, kwargs, param, allowed):
+    # Merge: season_type is matched exactly (main's rule, _season_type_arg); every other
+    # fixed-value argument is matched without regard to case (_choice).
     _record_calls(monkeypatch)
     for value in allowed:
-        result = getattr(tools, name)(**{**kwargs, param: value.lower()})
+        spelled = value if param == "season_type" else value.lower()
+        result = _call(name, **{**kwargs, param: spelled})
         assert "error" not in result, (name, param, value)
+
+
+@pytest.mark.parametrize("name,kwargs,param,allowed",
+                         [case for case in CHOICE_CASES if case[2] == "season_type"])
+def test_season_type_is_matched_exactly(monkeypatch, name, kwargs, param, allowed):
+    calls = _record_calls(monkeypatch)
+    result = _call(name, **{**kwargs, param: "reg"})
+    assert result["code"] is ErrorCode.INVALID_ARGUMENT
+    assert result["parameter"] == "season_type"
+    assert calls == []
 
 
 def test_search_plays_sends_the_canonical_spelling_of_a_choice(monkeypatch):
     calls = _record_calls(monkeypatch)
-    tools.nfl_search_plays(season_type="post", play_type="PASS")
+    # Merge: season_type is matched exactly (main); play_type still ignores case.
+    tools.nfl_search_plays(season_type="POST", play_type="PASS")
     assert calls[0][1] == ["POST", "pass"]
 
 
 def test_schedule_post_matches_every_playoff_round(monkeypatch):
     calls = _record_calls(monkeypatch)
-    tools.nfl_schedule(season_type="post")
+    tools.nfl_schedule(season_type="POST")
     assert "game_type IN (?, ?, ?, ?)" in calls[0][0]
     assert calls[0][1] == ["WC", "DIV", "CON", "SB"]
 
 
 def test_schedule_one_playoff_round_matches_that_round(monkeypatch):
     calls = _record_calls(monkeypatch)
-    tools.nfl_schedule(season_type="sb")
+    tools.nfl_schedule(season_type="SB")
     assert calls[0][1] == ["SB"]
 
 
 def test_spelled_options_read_as_a_list():
-    assert tools._spell_options(("a", "b")) == "'a' or 'b'"
-    assert tools._spell_options(("a", "b", "c")) == "'a', 'b', or 'c'"
+    # Merge: the branch's _spell_options ("'a', 'b', or 'c'") is replaced by main's one
+    # message form, which lists the options after "Use one of:".
+    with pytest.raises(tools._Refusal) as refused:
+        tools._choice("scope", "month", ("a", "b", "c"))
+    assert refused.value.as_error()["error"] == "Unknown scope 'month'. Use one of: a, b, c."
 
 
 def test_week_zero_is_a_filter_not_a_missing_value(monkeypatch):
     calls = _record_calls(monkeypatch)
-    tools.nfl_search_plays(week=0)
+    tools.nfl_search_plays(week=0, season_type="ALL")
     assert "week = ?" in calls[0][0]
     assert calls[0][1] == [0]
 
@@ -1932,36 +2076,37 @@ _FLOORED = sorted(name for name in tools._COVERAGE if tools.first_season(name) i
 def test_a_season_before_the_dataset_is_out_of_coverage(monkeypatch, name):
     calls = _record_calls(monkeypatch)
     floor = tools.first_season(name)
-    result = getattr(tools, name)(**_REQUIRED.get(name, {}), season=floor - 1)
+    result = _call(name, **_REQUIRED.get(name, {}), season=floor - 1)
     assert result["code"] is ErrorCode.OUT_OF_COVERAGE
     assert result["first_season"] == floor
     assert result["error"] == f"{tools._COVERAGE[name][1]} is only available from {floor} onward"
     assert calls == []
-    assert "error" not in getattr(tools, name)(**_REQUIRED.get(name, {}), season=floor)
+    assert "error" not in _call(name, **_REQUIRED.get(name, {}), season=floor)
 
 
 @pytest.mark.parametrize("name", sorted(tools._COVERAGE))
-def test_a_season_after_the_current_one_is_out_of_coverage(monkeypatch, name):
-    calls = _record_calls(monkeypatch)
+def test_a_season_after_the_current_one_is_answered_not_refused(monkeypatch, name):
+    # Merge: the branch refused a season after the current one with OUT_OF_COVERAGE. main
+    # answers it (no rows, and a `reason` where the tool gives one), and main's behavior
+    # wins. Only a season before the registry floor is refused.
+    _record_calls(monkeypatch)
     monkeypatch.setattr(tools, "current_season", lambda: 2026)
-    result = getattr(tools, name)(**_REQUIRED.get(name, {}), season=2027)
-    assert result["code"] is ErrorCode.OUT_OF_COVERAGE
-    assert result["last_season"] == 2026
-    assert "through the 2026 season" in result["error"]
-    assert calls == []
+    result = _call(name, **_REQUIRED.get(name, {}), season=2027)
+    assert "error" not in result
+    assert result.get("code") is not ErrorCode.OUT_OF_COVERAGE
 
 
 @pytest.mark.parametrize("kwargs,refused", [
     ({"season_from": 1990, "season_to": 1995}, True),   # wholly before
     ({"season_to": 1990}, True),                       # ends before
-    ({"season_from": 2027}, True),                     # starts after
+    ({"season_from": 2027}, False),                    # starts after: answered (main)
     ({"season_from": 1990, "season_to": 2005}, False),  # overlaps the floor
     ({"season_from": 2020, "season_to": 2030}, False),  # overlaps the current season
 ])
 def test_a_range_is_refused_only_when_it_lies_wholly_outside(monkeypatch, kwargs, refused):
     _record_calls(monkeypatch)
     monkeypatch.setattr(tools, "current_season", lambda: 2026)
-    result = tools.nfl_search_plays(**kwargs)
+    result = tools.nfl_search_plays(**kwargs, season_type="REG")
     assert ("code" in result) is refused
 
 
@@ -1979,7 +2124,7 @@ def test_team_range_reports_one_gap_per_missing_season(monkeypatch):
     ]
     _record_calls(monkeypatch, rows)
     monkeypatch.setattr(tools, "current_season", lambda: 2026)
-    result = tools.nfl_team_records(team="KC", from_season=2023, to_season=2026)
+    result = tools.nfl_team_records(team="KC", season_from=2023, season_to=2026)
     assert [gap["season"] for gap in result["gaps"]] == [2023, 2025]
     assert {gap["status"] for gap in result["gaps"]} == {Availability.RECORD_NOT_AVAILABLE}
     assert "status" not in result
@@ -1991,7 +2136,7 @@ def test_team_range_reports_one_gap_per_missing_season(monkeypatch):
 def test_team_range_before_the_franchise_existed_says_so(monkeypatch):
     # HOU is the Texans (2002+); the old answer was "no stored record".
     _record_calls(monkeypatch)
-    result = tools.nfl_team_records(team="HOU", from_season=1990, to_season=1995)
+    result = tools.nfl_team_records(team="HOU", season_from=1990, season_to=1995)
     assert result["status"] is Availability.FRANCHISE_NOT_YET_ACTIVE
     assert result["first_season"] == 2002
     assert len(result["gaps"]) == 6
@@ -2000,34 +2145,34 @@ def test_team_range_before_the_franchise_existed_says_so(monkeypatch):
 
 def test_team_range_with_mixed_reasons_keeps_record_not_available_on_top(monkeypatch):
     _record_calls(monkeypatch)
-    result = tools.nfl_team_records(team="CLE", from_season=1995, to_season=1997)
+    result = tools.nfl_team_records(team="CLE", season_from=1995, season_to=1997)
     assert result["status"] is Availability.RECORD_NOT_AVAILABLE
     assert [gap["status"] for gap in result["gaps"]] == [
         Availability.RECORD_NOT_AVAILABLE,
         Availability.FRANCHISE_INACTIVE,
         Availability.FRANCHISE_INACTIVE,
     ]
-    assert "--pre1999" in result["gaps"][0]["reason"]
+    assert "optional ESPN data pull" in result["gaps"][0]["reason"]
 
 
 def test_team_range_gaps_are_clipped_to_the_records_floor(monkeypatch):
     _record_calls(monkeypatch)
-    result = tools.nfl_team_records(team="GB", from_season=1960, to_season=1972)
+    result = tools.nfl_team_records(team="GB", season_from=1960, season_to=1972)
     assert [gap["season"] for gap in result["gaps"]] == [1970, 1971, 1972]
 
 
 def test_team_range_wholly_before_the_records_floor(monkeypatch):
     _record_calls(monkeypatch)
-    gb = tools.nfl_team_records(team="GB", from_season=1950, to_season=1960)
+    gb = tools.nfl_team_records(team="GB", season_from=1950, season_to=1960)
     assert gb["status"] is Availability.BEFORE_COVERAGE
     assert gb["gaps"] == []
-    sea = tools.nfl_team_records(team="SEA", from_season=1950, to_season=1960)
+    sea = tools.nfl_team_records(team="SEA", season_from=1950, season_to=1960)
     assert sea["status"] is Availability.FRANCHISE_NOT_YET_ACTIVE
 
 
 def test_team_range_gaps_read_espn_coverage_per_season(tmp_path, monkeypatch):
     _records_db(tmp_path, monkeypatch, ESPN_LOG)
-    result = tools.nfl_team_records(team="CIN", from_season=1993, to_season=1995)
+    result = tools.nfl_team_records(team="CIN", season_from=1993, season_to=1995)
     by_season = {gap["season"]: gap for gap in result["gaps"]}
     assert by_season[1994]["source_checked"] == "espn"
     assert by_season[1993]["reason"] == _PULL_ADVICE
@@ -2041,7 +2186,7 @@ def test_season_only_query_with_nothing_stored_says_why(monkeypatch):
     assert before["first_season"] == 1970
     pre1999 = tools.nfl_team_records(season=1985)
     assert pre1999["status"] is Availability.RECORD_NOT_AVAILABLE
-    assert "--pre1999" in pre1999["reason"]
+    assert "optional ESPN data pull" in pre1999["reason"]
     modern = tools.nfl_team_records(season=2020)
     assert modern["reason"] == "No stored records for that season."
     assert "gaps" not in modern
@@ -2065,58 +2210,55 @@ def test_a_season_with_rows_carries_no_status(monkeypatch):
 
 def test_compare_refuses_two_codes_for_the_same_franchise(monkeypatch):
     calls = _record_calls(monkeypatch)
-    result = tools.nfl_compare(entity1="LV", entity2="oak")
-    assert result["code"] is ErrorCode.INVALID_INPUT
-    assert "same team (LV)" in result["error"]
+    result = tools.nfl_compare(team1="LV", team2="oak", season_type="REG")
+    assert result["code"] is ErrorCode.INVALID_ARGUMENT
+    assert "same franchise (LV)" in result["error"]
     assert calls == []
 
 
-def test_compare_refuses_two_spellings_of_the_same_player(monkeypatch):
-    result = tools.nfl_compare("Patrick Mahomes", "P.Mahomes", compare_type="player")
-    assert result["code"] is ErrorCode.INVALID_INPUT
-    assert "same player" in result["error"]
-
-
-def test_compare_team_mode_says_it_did_not_apply_season_type(monkeypatch):
+def test_compare_refuses_two_spellings_of_the_same_player(monkeypatch, resolves_to_mahomes):
+    # Merge: the branch refused two names of one player. main answers that pair with two
+    # entries (tests/fixes/test_v071.py compares a player with itself), and main's behavior
+    # wins, so both names resolve to the one player and the call is answered.
     _record_calls(monkeypatch)
-    with_type = tools.nfl_compare("KC", "BAL", season_type="POST")
-    assert "season_type=POST was not applied" in with_type["notes"][0]["note"]
-    assert tools.nfl_compare("KC", "BAL")["notes"] == []
+    result = tools.nfl_compare(player1="Patrick Mahomes", player2="P.Mahomes", season_type="REG")
+    assert "error" not in result
+    assert [p["player_id"] for p in result["players"]] == [MAHOMES["gsis_id"]] * 2
 
 
-def test_compare_player_mode_notes_a_player_no_play_matched(monkeypatch):
-    def fake_execute(sql, params=None):
-        return [{"n": 3}] if "%P.Mahomes%" in params and "passer" in sql else [{"n": 0}]
-
-    monkeypatch.setattr(tools, "_execute", fake_execute)
-    monkeypatch.setattr(tools, "nfl_player_stats", lambda *a, **k: {"seasons": [{"season": 2024}]})
-    result = tools.nfl_compare("P.Mahomes", "Zz Nobody", compare_type="player")
-    assert result["P.Mahomes"] == {"passing": [{"season": 2024}]}
-    assert result["Zz Nobody"] == {}
-    assert result["notes"] == [{"entity": "Zz Nobody", "note": result["notes"][0]["note"]}]
-    assert "No play matched 'Zz Nobody'" in result["notes"][0]["note"]
+def test_compare_team_mode_applies_season_type(monkeypatch):
+    # Merge: the branch's team mode could not filter on season_type and said so in `notes`.
+    # main's team mode reads the derived team tables for the season_type asked for.
+    calls = _record_calls(monkeypatch)
+    result = tools.nfl_compare(team1="KC", team2="BAL", season_type="POST")
+    assert "error" not in result and "notes" not in result
+    team_queries = [params for sql, params in calls if "team_offense_stats" in sql and params]
+    assert team_queries and all("POST" in params for params in team_queries)
 
 
-def test_compare_player_mode_notes_a_failed_stat_lookup(monkeypatch):
-    monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [{"n": 1}])
-    monkeypatch.setattr(
-        tools, "nfl_player_stats",
-        lambda *a, stat_type, **k: (
-            {"error": "slow", "code": ErrorCode.TIMEOUT} if stat_type == "rushing"
-            else {"seasons": []}
-        ),
-    )
-    result = tools.nfl_compare("P.Mahomes", "J.Allen", compare_type="player")
-    failed = [note for note in result["notes"] if note.get("stat_type") == "rushing"]
-    assert [note["entity"] for note in failed] == ["P.Mahomes", "J.Allen"]
-    assert all(note["code"] is ErrorCode.TIMEOUT for note in failed)
-    assert "rushing" not in result["P.Mahomes"]
-    assert "passing" in result["P.Mahomes"]
+def test_compare_player_mode_notes_a_player_no_play_matched(monkeypatch, no_player_match):
+    # Merge: main reports a name no player matches as that entry's `reason`.
+    _record_calls(monkeypatch)
+    result = tools.nfl_compare(player1="P.Mahomes", player2="Zz Nobody", season_type="REG")
+    nobody = result["players"][1]
+    assert nobody["player_id"] is None and nobody["seasons"] == []
+    assert "No player matches 'Zz Nobody'" in nobody["reason"]
+
+
+def test_compare_player_mode_notes_a_failed_stat_lookup(monkeypatch, resolves_to_mahomes):
+    # Merge: main reads one player's seasons in one query, so a failed read is the call's
+    # error, with its code, rather than a note next to partial results.
+    monkeypatch.setattr(tools, "_resolve_player",
+                        lambda name, pid, **k: ({"gsis_id": name, "display_name": name}, None))
+    monkeypatch.setattr(tools, "_player_seasons", _raise(TimeoutError("slow")))
+    result = tools.nfl_compare(player1="P.Mahomes", player2="J.Allen", season_type="REG")
+    assert result["code"] is ErrorCode.TIMEOUT
+    assert result["error"] == "slow"
 
 
 def test_compare_player_mode_returns_a_query_failure(monkeypatch):
     monkeypatch.setattr(tools, "_execute", _raise(TimeoutError("count timeout")))
-    result = tools.nfl_compare("P.Mahomes", "J.Allen", compare_type="player")
+    result = tools.nfl_compare(player1="P.Mahomes", player2="J.Allen", season_type="REG")
     assert result["code"] is ErrorCode.TIMEOUT
 
 
@@ -2144,3 +2286,114 @@ def test_schema_says_when_it_ignored_the_category(monkeypatch):
     both = tools.nfl_schema(table="rosters", category="epa")
     assert "category='epa' was ignored" in both["note"]
     assert "note" not in tools.nfl_schema(table="rosters")
+
+
+# ── Player identity helpers ────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("name, strip, expected", [
+    ("Ja'Marr Chase", False, "jamarr chase"),
+    ("Amon-Ra St. Brown", False, "amon ra st brown"),
+    ("Audric Estimé", False, "audric estime"),
+    ("Odell Beckham Jr.", True, "odell beckham"),
+    ("Odell Beckham Jr.", False, "odell beckham jr"),
+    ("Patrick Mahomes II", True, "patrick mahomes"),
+    ("V", True, "v"),            # a lone token is a name, not a suffix
+    ("K.Allen", False, "kallen"),
+    ("  ", False, ""),
+])
+def test_fold_player_name(name, strip, expected):
+    assert tools._fold(name, strip_suffix=strip) == expected
+
+
+def test_player_lookup_requires_a_name():
+    result = tools.nfl_player_lookup(player="  ")
+    assert result["code"] == "MISSING_PLAYER"
+    assert result["error"].startswith("player or player_id is required")
+
+
+def test_player_stats_without_player_is_an_error_with_code():
+    result = tools.nfl_player_stats(player=None, season_type="REG")
+    assert result["code"] == "MISSING_PLAYER"
+
+
+def test_player_stats_returns_ambiguous_without_running_stats(monkeypatch):
+    candidates = [{"gsis_id": "a", "display_name": "X"}, {"gsis_id": "b", "display_name": "X"}]
+    monkeypatch.setattr(tools, "_find_players", lambda *a, **k: (candidates, False))
+    monkeypatch.setattr(tools, "_execute", lambda *a, **k: pytest.fail("stats query must not run"))
+    result = tools.nfl_player_stats(player="X", season=2024, season_type="REG")
+    assert result["ambiguous"] is True and result["candidates"] == candidates
+    assert "error" not in result and "seasons" not in result
+
+
+def test_resolver_uses_a_lone_overall_match_when_the_season_has_none(monkeypatch):
+    only = {"gsis_id": "a", "display_name": "X"}
+    monkeypatch.setattr(
+        tools, "_find_players", lambda name=None, **k: ([], False) if k.get("season") else ([only], False))
+    assert tools._resolve_player("X", None, season=2016) == (only, None)
+
+
+def test_player_stats_with_no_matching_player_says_so(monkeypatch):
+    monkeypatch.setattr(tools, "_find_players", lambda *a, **k: ([], False))
+    monkeypatch.setattr(tools, "_execute", lambda *a, **k: pytest.fail("stats query must not run"))
+    result = tools.nfl_player_stats(player="Nobody", season=2024, season_type="REG")
+    assert result["seasons"] == [] and result["player_id"] is None
+    assert "No player matches 'Nobody'" in result["reason"]
+
+
+# ── season_type on nfl_fantasy_opportunity and nfl_role_trend ────────────────
+
+def test_fantasy_opportunity_filters_by_season_type(monkeypatch, resolves_to_mahomes):
+    captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
+    tools.nfl_fantasy_opportunity(player="Kelce", team="kc", season=2024, week=3, position="te",
+                                  season_type="POST")
+    assert "player_id = ?" in captured["sql"] and "upper(position) = ?" in captured["sql"]
+    assert "schedules" in captured["sql"] and "AS season_type" in captured["sql"]
+    assert captured["params"][-4:] == ["2024", 3, "TE", "POST"]
+
+
+def test_fantasy_opportunity_round_code_filters_on_the_schedule_game_type(monkeypatch, no_player_match):
+    captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
+    tools.nfl_fantasy_opportunity(season=2024, season_type="SB")
+    assert "g.game_type = ?" in captured["sql"] and captured["params"] == ["2024", "SB"]
+
+
+def test_fantasy_opportunity_all_adds_no_season_type_filter(monkeypatch, no_player_match):
+    captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
+    tools.nfl_fantasy_opportunity(season=2024, season_type="ALL")
+    assert captured["params"] == ["2024"]
+    assert "g.game_type = ?" not in captured["sql"]
+
+
+def test_role_trend_round_code_filters_through_the_schedule(monkeypatch, no_player_match):
+    captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
+    tools.nfl_role_trend(season=2024, season_type="DIV")
+    assert "EXISTS (SELECT 1 FROM ff_opportunity o JOIN schedules g" in captured["sql"]
+    assert captured["params"] == [2024, "DIV"]
+
+
+def test_role_trend_all_adds_no_season_type_filter(monkeypatch, no_player_match):
+    captured = _capture_execute(monkeypatch, [{"full_name": "X"}])
+    tools.nfl_role_trend(season=2024, season_type="ALL")
+    assert captured["params"] == [2024] and "EXISTS" not in captured["sql"]
+
+
+def test_search_plays_returns_the_resolver_error_for_an_unknown_player_id(monkeypatch):
+    unknown = {"error": "No player with player_id '00-9999999'", "code": "UNKNOWN_PLAYER"}
+    monkeypatch.setattr(tools, "_resolve_player", lambda *a, **k: (None, unknown))
+    monkeypatch.setattr(tools, "_execute", lambda *a, **k: pytest.fail("plays query must not run"))
+    assert tools.nfl_search_plays(player_id="00-9999999", season=2024, season_type="REG") == unknown
+
+
+def test_a_failed_newest_season_read_leaves_the_status_without_it(monkeypatch):
+    def fail(sql, params=None):
+        raise RuntimeError("catalog read failed")
+
+    monkeypatch.setattr(tools, "_execute", fail)
+    assert tools._newest_seasons(["plays"]) == {}
+
+
+def test_an_unknown_argument_skips_the_coverage_check_and_reaches_the_tool():
+    """A call that does not fit the signature is not refused for coverage. The tool raises
+    TypeError itself, and the server reports that as INVALID_ARGUMENTS."""
+    with pytest.raises(TypeError):
+        tools.nfl_team_stats(team="KC", season=2024, season_type="REG", bogus=1)

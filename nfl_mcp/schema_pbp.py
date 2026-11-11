@@ -1,6 +1,6 @@
 _SCHEMA_SUMMARY = """
 Database: nflread (DuckDB)
-Table: plays (1999 through the current season, 372 columns)
+Table: plays (1999 through the current season, 373 columns)
 
 Key columns for common queries:
   season (INT), week (INT), season_type ('REG'|'POST'), game_id, game_date
@@ -22,15 +22,18 @@ The team identifier is named differently in every table: `posteam`/`defteam` in 
 `team` in the aggregate tables below, `team_abbr` in the `teams` table (which has no `team`
 column — `team_name` is 'Minnesota Vikings', `team_nick` is 'Vikings').
 
-Aggregate tables (faster for team-level queries):
-  team_offense_stats  (team, season_year, total_plays, total_yards, avg_epa, ...)
-  team_defense_stats  (team, season_year, yards_allowed, sacks, turnovers_forced, avg_epa_allowed, ...)
-  situational_stats   (team, season_year, situation, plays, avg_epa, conversion_pct)
-  formation_effectiveness (team, season_year, formation, play_type, avg_epa, ...)
-  team_records        (season, team, source_team, games, wins, losses, ties, source) — final
-                      regular-season record per franchise, 1970+ (1970-1998 needs the optional
-                      'nfl-mcp ingest --pre1999'). `team` is the CURRENT abbreviation, so the
-                      Raiders are 'LV' in every season and will not match `posteam`='OAK' in plays.
+Aggregate tables (faster for team-level queries; one row per season_type, REG or POST, so
+filter season_type before you sum):
+  team_offense_stats  (team, season_year, season_type, total_plays, total_yards, avg_epa, ...)
+  team_defense_stats  (team, season_year, season_type, yards_allowed, sacks, turnovers_forced, avg_epa_allowed, ...)
+  situational_stats   (team, season_year, season_type, situation, plays, avg_epa, conversion_pct)
+  formation_effectiveness (team, season_year, season_type, formation, play_type, avg_epa, ...)
+  team_records        (season, team, source_team, games, wins, losses, ties, points_for,
+                      points_against, point_diff, source) — final regular-season record and
+                      points per franchise, 1970+ (1970-1998 comes from an optional
+                      ESPN data pull and has no points). `team` is the CURRENT
+                      abbreviation, so the Raiders are 'LV' in every season and will not match
+                      `posteam`='OAK' in plays.
 
 Categories available (pass category='<name>' for full detail):
   game_context, teams, game_situation, play_details, timeouts, score,
@@ -46,7 +49,7 @@ GAME CONTEXT
   game_id          TEXT              e.g. '2024_01_KC_BAL'
   old_game_id      TEXT              legacy ESPN/NFL game ID
   nfl_api_id       TEXT              NFL API identifier
-  season           INTEGER           2013–current
+  season           INTEGER           1999–current
   week             INTEGER           1–22 (regular + post)
   season_type      TEXT              'REG' | 'POST'
   game_date        TEXT              'YYYY-MM-DD'
@@ -107,7 +110,8 @@ GAME SITUATION
 PLAY DETAILS
   play_type        TEXT    'pass' | 'run' | 'field_goal' | 'punt' | 'kickoff'
                            | 'extra_point' | 'no_play' | 'qb_spike' | 'qb_kneel'
-  desc             TEXT    raw play description — use ILIKE for text search
+  "desc"           TEXT    raw play description — an SQL keyword, so always quote it:
+                           WHERE "desc" ILIKE '%touchdown%'
   yards_gained     DOUBLE PRECISION  net yards gained on play
   end_clock_time   TEXT    clock time at end of play
   end_yard_line    TEXT    yard line at end of play
@@ -413,24 +417,35 @@ VEGAS / BETTING
   total_line    DOUBLE PRECISION  over/under total
 """,
     "aggregate_tables": """
-AGGREGATE TABLES  (pre-aggregated, much faster for team/season queries)
+AGGREGATE TABLES  (pre-aggregated, much faster for team/season queries; season_type is REG or
+POST, one row each, so filter it before you sum)
   team_offense_stats
-    (team, season_year, total_plays, total_yards, yards_per_play,
-     rush_plays, pass_plays, rush_yards, pass_yards, yards_per_rush, yards_per_pass,
-     touchdowns, turnovers, third_down_pct, red_zone_td_pct, explosive_plays,
-     avg_epa, pass_epa, rush_epa)
+    (team, season_year, season_type, total_plays, total_yards, yards_per_play,
+     rush_plays, pass_plays, pass_attempts, completions, interceptions, sacks, dropbacks,
+     scrambles, rush_yards, pass_yards, sack_yards, net_pass_yards, yards_per_rush,
+     yards_per_pass, touchdowns, turnovers, third_down_pct, red_zone_td_pct,
+     explosive_plays, avg_epa, pass_epa, rush_epa)
+    -- pass_yards is gross; net_pass_yards = pass_yards - sack_yards (sack_yards positive).
+    -- total_plays counts runs, kneels, pass attempts, spikes and sacks. total_yards =
+    -- rush_yards + net_pass_yards (the NFL definition of total net yards). yards_per_play and
+    -- yards_per_rush include kneels. avg_epa, pass_epa, rush_epa, third_down_pct,
+    -- red_zone_td_pct and explosive_plays leave kneels and spikes out.
 
   team_defense_stats
-    (team, season_year, plays_against, yards_allowed, yards_per_play_allowed,
-     sacks, interceptions, turnovers_forced, third_down_stop_pct, avg_epa_allowed)
+    (team, season_year, season_type, plays_against, yards_allowed, yards_per_play_allowed,
+     rush_yards_allowed, pass_yards_allowed, sacks, sack_yards, net_pass_yards_allowed,
+     interceptions, turnovers_forced, third_down_stop_pct, avg_epa_allowed)
+    -- pass_yards_allowed is gross; net_pass_yards_allowed = pass_yards_allowed - sack_yards.
+    -- yards_allowed = rush_yards_allowed + net_pass_yards_allowed, kneels in. plays_against
+    -- counts kneels and spikes like total_plays.
 
   situational_stats
-    (team, season_year, situation, plays, avg_yards, touchdowns, conversion_pct, avg_epa)
+    (team, season_year, season_type, situation, plays, avg_yards, touchdowns, conversion_pct, avg_epa)
     -- situation values: '3rd & Long','3rd & Short','Red Zone','4th Down',
     --                   'Two Minute Drill','Standard'
 
   formation_effectiveness
-    (team, season_year, formation, play_type, plays, avg_yards, touchdowns, turnovers, avg_epa)
+    (team, season_year, season_type, formation, play_type, plays, avg_yards, touchdowns, turnovers, avg_epa)
     -- formation values: 'SHOTGUN','UNDER CENTER','NO HUDDLE','SHOTGUN NO HUDDLE'
 """,
     "query_tips": """
@@ -440,11 +455,15 @@ QUERY TIPS
   • Player names are abbreviated: 'P.Mahomes', 'T.Hill', 'D.Henry', 'J.Jefferson'
   • Use aggregate tables for season-level team stats (much faster than raw plays)
   • Use plays table directly for play-level filtering or custom aggregations
-  • Use ILIKE '%keyword%' for text search in the desc column
+  • Use ILIKE '%keyword%' for text search in the "desc" column. The name is an SQL keyword, so
+    the column must be quoted: SELECT "desc" FROM plays (unquoted it is a syntax error)
   • Exclude non-play rows: WHERE play_type NOT IN ('no_play','qb_spike','qb_kneel')
     or WHERE rush_attempt = 1 OR pass_attempt = 1
   • Exclude special teams: WHERE special_teams_play = 0 OR special_teams_play IS NULL
-  • For REG season only: WHERE season_type = 'REG'
+  • For REG season only: WHERE season_type = 'REG' (plays and the aggregate tables)
+  • schedules and snap_counts have game_type (REG, WC, DIV, CON, SB), not season_type:
+    WHERE game_type = 'REG'
+  • players has display_name (the full name), not full_name; rosters and injuries have full_name
   • game_date is TEXT in 'YYYY-MM-DD' format — cast if needed: game_date::date
   • `success` = 1 means play met the success threshold (50%+ of yards on 1st, 70%+ on 2nd, 100% on 3rd/4th)
   • OT is qtr = 5

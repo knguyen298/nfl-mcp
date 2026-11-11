@@ -14,7 +14,7 @@ import pytest
 
 from nfl_mcp import status, tools
 from nfl_mcp.franchises import availability
-from nfl_mcp.server import _error_body, _tool_error_payload
+from nfl_mcp.server import _error_payload, _tool_error_payload
 from nfl_mcp.status import Availability, ErrorCode, IngestStatus
 
 # Every member with the exact string a caller used to see.  Spelled out rather than
@@ -29,16 +29,25 @@ SPELLINGS = [
     (ErrorCode.TIMEOUT, "TIMEOUT"),
     (ErrorCode.INVALID_ARGUMENTS, "INVALID_ARGUMENTS"),
     (ErrorCode.TOOL_EXECUTION_ERROR, "TOOL_EXECUTION_ERROR"),
+    (ErrorCode.TOOL_ERROR, "TOOL_ERROR"),
+    (ErrorCode.UNAUTHORIZED, "UNAUTHORIZED"),
     (ErrorCode.COLUMN_NOT_FOUND, "COLUMN_NOT_FOUND"),
     (ErrorCode.TABLE_NOT_FOUND, "TABLE_NOT_FOUND"),
+    (ErrorCode.SQL_SYNTAX_ERROR, "SQL_SYNTAX_ERROR"),
     (ErrorCode.NOT_SELECT, "NOT_SELECT"),
     (ErrorCode.FORBIDDEN_KEYWORD, "FORBIDDEN_KEYWORD"),
     (ErrorCode.MULTIPLE_STATEMENTS, "MULTIPLE_STATEMENTS"),
     (ErrorCode.SQL_ERROR, "SQL_ERROR"),
     (ErrorCode.DB_NOT_FOUND, "DB_NOT_FOUND"),
     (ErrorCode.DB_LOCKED, "DB_LOCKED"),
-    (ErrorCode.INVALID_INPUT, "INVALID_INPUT"),
+    (ErrorCode.STALE_DERIVED_TABLES, "STALE_DERIVED_TABLES"),
+    (ErrorCode.SCHEMA_UNAVAILABLE, "SCHEMA_UNAVAILABLE"),
+    (ErrorCode.INVALID_ARGUMENT, "INVALID_ARGUMENT"),
+    (ErrorCode.MISSING_ARGUMENT, "MISSING_ARGUMENT"),
     (ErrorCode.UNKNOWN_TEAM, "UNKNOWN_TEAM"),
+    (ErrorCode.UNKNOWN_COLUMN, "UNKNOWN_COLUMN"),
+    (ErrorCode.MISSING_PLAYER, "MISSING_PLAYER"),
+    (ErrorCode.UNKNOWN_PLAYER_ID, "UNKNOWN_PLAYER_ID"),
     (ErrorCode.OUT_OF_COVERAGE, "OUT_OF_COVERAGE"),
     (IngestStatus.LOADED, "loaded"),
     (IngestStatus.EMPTY, "empty"),
@@ -132,12 +141,13 @@ class TestAvailabilityReturnsMembers:
 
 
 class TestErrorPayloadsKeepTheOldStrings:
-    # Only an exception that escaped a tool reaches _tool_error_payload now. UNKNOWN_TOOL
-    # and INVALID_ARGUMENTS are written by call_tool before the tool runs (_error_body),
-    # and a TypeError from inside a tool is a tool bug, not an argument error.
+    # An exception that escaped a tool reaches _tool_error_payload. UNKNOWN_TOOL and an
+    # unknown argument are written by call_tool before the tool runs (_error_payload). The
+    # merged server keeps main's mapping: a TypeError is a call that does not fit the
+    # signature, so it is INVALID_ARGUMENTS.
     @pytest.mark.parametrize("exc,code", [
         (TimeoutError("Query exceeded timeout"), "TIMEOUT"),
-        (TypeError("unsupported operand"), "TOOL_EXECUTION_ERROR"),
+        (TypeError("unsupported operand"), "INVALID_ARGUMENTS"),
         (RuntimeError("boom"), "TOOL_EXECUTION_ERROR"),
     ])
     def test_tool_error_payload_code(self, exc, code):
@@ -149,7 +159,7 @@ class TestErrorPayloadsKeepTheOldStrings:
 
     @pytest.mark.parametrize("code", [ErrorCode.UNKNOWN_TOOL, ErrorCode.INVALID_ARGUMENTS])
     def test_server_error_body_code(self, code):
-        payload = _error_body("nfl_query", code, "message")
+        payload = _error_payload(code, "message", tool="nfl_query")
         assert payload["code"] is code
         assert json.dumps(payload).count(f'"{code.value}"') == 1
 

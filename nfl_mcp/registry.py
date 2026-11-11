@@ -48,10 +48,21 @@ class DatasetDef:
     # DynastyProcess / ffverse, and always matches nflreadpy's own season validator.
     min_season: int | None = None
     max_season: int | None = None
+    # Newest season nflreadpy will load, named by the rule its own season validator uses
+    # (see NEWEST_SEASON_RULES). Seasons past it are skipped before any fetch: they are not
+    # published yet, which is not a failure. None means nflreadpy sets no upper bound.
+    newest_season: str | None = None
     # Where the rows come from. SOURCE_NFLREADPY is every nflverse/DynastyProcess/ffverse
     # dataset; SOURCE_ESPN is the external records fetch, which is not an nflreadpy loader
     # and is opt-in because it is rate-limited and belongs to another publisher.
     source: str = SOURCE_NFLREADPY
+    # How a re-fetch finds the season's old rows. delete_key is the column; delete_match
+    # "equals" means delete_key = season, "id_prefix" means delete_key starts with
+    # "<season>_" (nflverse game ids). stamp_season: the file has no season column in some
+    # years (depth_charts 2025+), so the loader adds one from the season it fetched.
+    delete_key: str = "season"
+    delete_match: str = "equals"
+    stamp_season: bool = False
 
     @property
     def storage(self) -> str:
@@ -64,6 +75,18 @@ class DatasetDef:
         deleted and re-inserted one season at a time.
         """
         return STORAGE_APPEND_BY_SEASON if self.seasonal else STORAGE_REPLACE
+
+
+# newest_season rule -> (roster flag passed to nflreadpy's get_current_season, offset).
+#   "season"    get_current_season(): rolls over the Thursday after Labor Day. From March
+#               until then our current_season() is already the new year and this is not.
+#   "roster"    get_current_season(roster=True): rolls over on March 15.
+#   "roster-1"  one season before "roster": nflverse never publishes the season in progress.
+NEWEST_SEASON_RULES: dict[str, tuple[bool, int]] = {
+    "season": (False, 0),
+    "roster": (True, 0),
+    "roster-1": (True, -1),
+}
 
 
 # ── Registry ───────────────────────────────────────────────────────────────────
@@ -145,6 +168,7 @@ _DEFS: list[DatasetDef] = [
         seasonal=True, default=True,
         description="Play-by-play data — the primary fact table",
         min_season=1999,
+        newest_season="season",
     ),
     DatasetDef(
         dataset_id="schedules",
@@ -153,6 +177,8 @@ _DEFS: list[DatasetDef] = [
         seasonal=True, default=True,
         description="Game-level schedule and results",
         min_season=1999,   # schedules/games published seasons are 1999+ (verified)
+        # No newest_season: load_schedules filters one full file, so a season with no
+        # games yet comes back empty instead of raising, and the new schedule (May) loads.
     ),
     DatasetDef(
         dataset_id="rosters",
@@ -161,6 +187,7 @@ _DEFS: list[DatasetDef] = [
         seasonal=True, default=True,
         description="Season-level roster snapshots",
         min_season=1920,
+        newest_season="roster",
     ),
     DatasetDef(
         dataset_id="player_stats",
@@ -170,6 +197,9 @@ _DEFS: list[DatasetDef] = [
         description="Pre-aggregated player stats by week/season",
         extra_params={"summary_level": "week"},
         min_season=1999,
+        # No validator in nflreadpy, but its seasons=True range ends at get_current_season()
+        # and the new season's file does not exist before Week 1 (the fetch would 404).
+        newest_season="season",
     ),
     DatasetDef(
         dataset_id="team_stats_raw",
@@ -179,6 +209,7 @@ _DEFS: list[DatasetDef] = [
         description="Pre-aggregated team stats by week/season",
         extra_params={"summary_level": "week"},
         min_season=1999,
+        newest_season="season",   # no validator, same as player_stats
     ),
     DatasetDef(
         dataset_id="injuries",
@@ -187,6 +218,7 @@ _DEFS: list[DatasetDef] = [
         seasonal=True, default=True,
         description="Weekly injury reports",
         min_season=2009,
+        newest_season="season",
     ),
     DatasetDef(
         dataset_id="snap_counts",
@@ -195,6 +227,7 @@ _DEFS: list[DatasetDef] = [
         seasonal=True, default=True,
         description="Player snap counts (Pro Football Reference)",
         min_season=2013,  # the 2012 file exists and downloads fine but holds 0 rows
+        newest_season="season",
     ),
 
     # ── Analytics enrichment ───────────────────────────────────────
@@ -205,6 +238,7 @@ _DEFS: list[DatasetDef] = [
         seasonal=True, default=True,
         description="Weekly roster snapshots — large dataset",
         min_season=2002,
+        newest_season="season",
     ),
     DatasetDef(
         dataset_id="depth_charts",
@@ -213,6 +247,9 @@ _DEFS: list[DatasetDef] = [
         seasonal=True, default=True,
         description="Weekly depth charts",
         min_season=2001,
+        # 2025+ files have dt/team/pos_* and no season column; the loader stamps one.
+        stamp_season=True,
+        newest_season="roster",
     ),
     DatasetDef(
         dataset_id="officials",
@@ -221,6 +258,7 @@ _DEFS: list[DatasetDef] = [
         seasonal=True, default=True,
         description="Game officials assignments",
         min_season=2015,
+        newest_season="season",
     ),
     DatasetDef(
         dataset_id="participation",
@@ -229,7 +267,11 @@ _DEFS: list[DatasetDef] = [
         seasonal=True, default=True,
         description="Player participation per play — very large dataset",
         min_season=2016,
-        # No upper bound: upstream publishes every season from 2016 onward.
+        # Published only after a season ends: load_participation rejects anything past
+        # get_current_season(roster=True) - 1, so the season in progress is skipped.
+        newest_season="roster-1",
+        # No season column; nflverse_game_id is '<season>_<week>_<away>_<home>'.
+        delete_key="nflverse_game_id", delete_match="id_prefix",
     ),
     DatasetDef(
         dataset_id="nextgen_stats_passing",
@@ -239,6 +281,7 @@ _DEFS: list[DatasetDef] = [
         description="Next Gen Stats — passing",
         extra_params={"stat_type": "passing"},
         min_season=2016,
+        newest_season="season",
     ),
     DatasetDef(
         dataset_id="nextgen_stats_receiving",
@@ -248,6 +291,7 @@ _DEFS: list[DatasetDef] = [
         description="Next Gen Stats — receiving",
         extra_params={"stat_type": "receiving"},
         min_season=2016,
+        newest_season="season",
     ),
     DatasetDef(
         dataset_id="nextgen_stats_rushing",
@@ -257,6 +301,7 @@ _DEFS: list[DatasetDef] = [
         description="Next Gen Stats — rushing",
         extra_params={"stat_type": "rushing"},
         min_season=2016,
+        newest_season="season",
     ),
     DatasetDef(
         dataset_id="pfr_advstats_pass",
@@ -266,6 +311,7 @@ _DEFS: list[DatasetDef] = [
         description="PFR advanced passing stats",
         extra_params={"stat_type": "pass"},
         min_season=2018,
+        newest_season="season",
     ),
     DatasetDef(
         dataset_id="pfr_advstats_rush",
@@ -275,6 +321,7 @@ _DEFS: list[DatasetDef] = [
         description="PFR advanced rushing stats",
         extra_params={"stat_type": "rush"},
         min_season=2018,
+        newest_season="season",
     ),
     DatasetDef(
         dataset_id="pfr_advstats_rec",
@@ -284,6 +331,7 @@ _DEFS: list[DatasetDef] = [
         description="PFR advanced receiving stats",
         extra_params={"stat_type": "rec"},
         min_season=2018,
+        newest_season="season",
     ),
     DatasetDef(
         dataset_id="pfr_advstats_def",
@@ -293,6 +341,7 @@ _DEFS: list[DatasetDef] = [
         description="PFR advanced defensive stats",
         extra_params={"stat_type": "def"},
         min_season=2018,
+        newest_season="season",
     ),
 
     # ── External / fantasy / commercial ────────────────────────────
@@ -303,6 +352,7 @@ _DEFS: list[DatasetDef] = [
         seasonal=True, default=True,
         description="FTN advanced charting data",
         min_season=2022,
+        newest_season="season",
     ),
     DatasetDef(
         dataset_id="ff_opportunity",
@@ -312,6 +362,7 @@ _DEFS: list[DatasetDef] = [
         description="Fantasy football opportunity model",
         extra_params={"stat_type": "weekly"},
         min_season=2006,
+        newest_season="season",
     ),
 
     # ── External publisher (opt-in) ─────────────────────────────────────────

@@ -4,11 +4,15 @@ NFL MCP — command-line entry point
   nfl-mcp init                Interactive setup wizard
   nfl-mcp serve               Start the MCP server (Streamable HTTP)
   nfl-mcp ingest              Load NFL play-by-play data into the database
+  nfl-mcp rebuild             Rebuild the derived tables from the loaded data
+  nfl-mcp upgrade             Detect and upgrade a database made by an older nfl-mcp
+  nfl-mcp validate            Check a database slot before it replaces the active one
   nfl-mcp setup-client        Configure Claude Desktop / VS Code MCP
   nfl-mcp doctor              Check that everything is working
 """
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -49,11 +53,26 @@ def _run_problems(result) -> tuple[bool, bool]:
         return False, False
     return result.nothing_loaded, result.any_failed
 
+# `nfl-mcp ingest` exit code when the run finished but some datasets or seasons failed.
+# A fatal error exits 1 and a usage error 2 (click).
+INGEST_PARTIAL_EXIT = 3
 
-def _season_window_label(min_season: int | None, max_season: int | None) -> str:
-    """Render a dataset's coverage window for --list, e.g. '1999-present'."""
+
+def _season_window_label(min_season: int | None, max_season: int | None,
+                         newest_season: str | None = None) -> str:
+    """Render a dataset's coverage window for --list, e.g. '1999-present'.
+
+    A newest_season rule that stops before the roster year (participation) never reaches
+    the season in progress, so its window ends at the last completed season.
+    """
+    from .registry import NEWEST_SEASON_RULES
     start = str(min_season) if min_season is not None else "earliest"
-    end = str(max_season) if max_season is not None else "present"
+    if max_season is not None:
+        end = str(max_season)
+    elif newest_season is not None and NEWEST_SEASON_RULES[newest_season][1] < 0:
+        end = "last completed season"
+    else:
+        end = "present"
     return f"{start}–{end}"
 
 
@@ -100,20 +119,71 @@ def main():
     """NFL play-by-play MCP server."""
 
 
+def _check_auth_token_env() -> None:
+    """Exit 1 when NFL_MCP_AUTH_TOKEN is set but empty after strip: the operator meant to require auth."""
+    raw = os.environ.get("NFL_MCP_AUTH_TOKEN")
+    if raw and not raw.strip():
+        raise click.ClickException(
+            "NFL_MCP_AUTH_TOKEN is set but empty. Set a token or unset the variable."
+        )
+
+
 # ── serve ──────────────────────────────────────────────────────────────────────
 
+def _exit_on_config_problem():
+    """Exit non-zero, naming the env var, if NFL_MCP_DUCKDB_* is invalid."""
+    from .database import connection_config_problem
+
+    problem = connection_config_problem()
+    if problem:
+        click.secho(f"✗ {problem}", fg="red", err=True)
+        sys.exit(1)
+
+
+def _warn_if_schema_old() -> None:
+    """Log one warning when the database file needs an upgrade or is newer. Never exits."""
+    from . import database, migrate
+    from .config import get_duckdb_path
+
+    log = logging.getLogger("nfl-mcp")
+    path = get_duckdb_path()
+    if not path.is_file():
+        return
+    try:
+        with database.get_db_connection() as conn:
+            status = migrate.check(conn)
+    except Exception as e:  # noqa: BLE001 - the server starts either way
+        log.warning("Could not check the schema version of %s: %s", path, e)
+        return
+    if status.newer:
+        log.warning("Database %s has schema version %d, newer than this nfl-mcp (%d); "
+                    "update nfl-mcp", path, status.version, status.target)
+    elif status.upgrade_needed:
+        needed = [s.name for s in status.steps if s.needed]
+        log.warning("Database %s is at schema version %d, this nfl-mcp expects %d%s; "
+                    "run: nfl-mcp upgrade", path, status.version, status.target,
+                    f" (needs: {', '.join(needed)})" if needed else "")
+
+
 @main.command()
-@click.option("--host", default=None,
-              help=f"Host to bind the HTTP server to (default {DEFAULT_HOST}). "
-                   "Use 0.0.0.0 for LAN access. Omit to use the 'serve_host' key in "
-                   "config.json, or the default when that key is absent.")
+@click.option("--host", default=DEFAULT_HOST, show_default=True,
+              help="Host to bind the HTTP server to. Use 0.0.0.0 for LAN access. Omit to "
+                   "use the 'serve_host' key in config.json, or the default when that key "
+                   "is absent.")
 @click.option("--port", default=None, type=int,
               help=f"Port to listen on (default {DEFAULT_PORT}). Omit to use the "
                    "'serve_port' key in config.json, or the default when it is absent.")
-def serve(host, port):
+@click.pass_context
+def serve(ctx, host, port):
     """Start the MCP server over Streamable HTTP."""
     from .config import load_config
 
+    # The help shows the default, but an omitted --host still lets the config key decide.
+    if ctx.get_parameter_source("host") is click.core.ParameterSource.DEFAULT:
+        host = None
+    _exit_on_config_problem()
+    _check_auth_token_env()
+    _warn_if_schema_old()
     host, port = _serve_settings(load_config(), host=host, port=port)
     url = _client_url(host, port)
     click.echo(f"🏈 NFL MCP server listening on {url}")
@@ -145,16 +215,26 @@ def serve(host, port):
               help="Print all available dataset names and exit.")
 @click.option("--pre1999", is_flag=True,
               help="Also pull pre-1999 season win-loss records from ESPN (opt-in external source).")
+@click.option("--allow-failures", is_flag=True,
+              help="Exit 0 even if a dataset or season failed to load (the failures are still "
+                   "listed). For image builds and first-start loads that should not stop on "
+                   "one flaky fetch.")
+@click.option("--failures-file", default=None, type=click.Path(dir_okay=False),
+              help="Write each dataset (or dataset and season) that failed to load to this "
+                   "file, one per line. The file is empty when nothing failed. update_db.sh "
+                   "uses it to name the failures in its log.")
 @click.option("--strict", is_flag=True,
-              help="Exit non-zero when any fetch failed, not only when nothing loaded at all.")
-def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, strict):
+              help="Exit 3 when any fetch failed, even with --allow-failures. Without "
+                   "--allow-failures this is already the default.")
+def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, allow_failures,
+           failures_file, strict):
     """Download NFL data via nflreadpy and load into DuckDB.
 
-    Exits 0 unless every fetch this run made failed, which is the one pattern that says the
-    database is no newer than it was before the run. Some failures are ordinary: play-by-play
-    for a new season does not exist before Week 1, so it fails on every run from March to
-    September. Use --strict to make any single failure non-zero.
+    Some failures are ordinary: play-by-play for a new season does not exist before
+    Week 1. A run in which no fetch put rows in the database prints that the database
+    was left as it was, and exits 3 even with --allow-failures.
 
+    \b
     Examples:
       nfl-mcp ingest                          # default datasets, all seasons
       nfl-mcp ingest --dataset all            # every dataset, all seasons
@@ -162,6 +242,18 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, stri
       nfl-mcp ingest --dataset pbp --start 2020 --end 2024
       nfl-mcp ingest --pre1999                # defaults + ESPN 1970-1998 records
       nfl-mcp ingest --list                   # show all dataset names
+
+    Exit codes:
+
+    \b
+      0  Every requested dataset loaded, or --allow-failures was given
+         without --strict. A season the publisher has no rows for is not a
+         failure.
+      3  The run finished, but some datasets or seasons failed to load. Each
+         failed one keeps the rows it had before. The failures are listed.
+      1  The run stopped with an error, for example when no play-by-play
+         season could be fetched or the database could not be opened.
+      2  A usage error, for example an unknown dataset name.
     """
     from .registry import REGISTRY, DEFAULT_DATASETS, ALL_DATASETS
 
@@ -171,7 +263,7 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, stri
             default_tag = "[default]" if defn.default else "[opt-in]"
             click.echo(f"  {ds_id:<35} {default_tag:<10}  {defn.description}")
             if defn.seasonal:
-                label = _season_window_label(defn.min_season, defn.max_season)
+                label = _season_window_label(defn.min_season, defn.max_season, defn.newest_season)
                 if defn.min_season is not None and defn.min_season < FIRST_SEASON:
                     label += f" (from {FIRST_SEASON} by default)"
                 click.echo(f"  {'':<35} {'':<10}  → seasons {label}")
@@ -204,7 +296,7 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, stri
     if pre1999 and "espn_records" not in dataset_ids:
         dataset_ids.append("espn_records")
 
-    from .ingest import run_ingest_datasets
+    from .ingest import IngestRunResult, failure_labels, run_ingest_datasets
     result = run_ingest_datasets(
         dataset_ids=dataset_ids,
         start=start,
@@ -212,13 +304,187 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, stri
         fresh=fresh,
         skip_views=skip_views,
     )
+    if result is None:
+        # A stubbed-out run returns None: nothing ran, so nothing failed.
+        result = IngestRunResult()
+    failures = result.failures
+    if failures_file:
+        labels = failure_labels(failures)
+        Path(failures_file).write_text("".join(f"{label}\n" for label in labels))
+    message = "Ingest failed for: " + "; ".join(failures)
+    if result.nothing_loaded:
+        # The run fetched, and no fetch put rows in the database: a dead network, or a
+        # source that answered nothing. The database is no newer than before, so not even
+        # --allow-failures makes this a success. entrypoint.sh stops on it rather than
+        # renaming an empty first-start database into place.
+        if failures:
+            click.secho(f"Error: {message}", fg="red", err=True)
+        click.secho(NOTHING_LOADED_MESSAGE, fg="red", err=True)
+        sys.exit(INGEST_PARTIAL_EXIT)
+    if failures:
+        if allow_failures and not strict:
+            click.echo(f"{message} (ignored: --allow-failures)")
+            return
+        # A distinct code: the run finished and the rest loaded. update_db.sh goes on to
+        # upgrade and validate on this code and stops on any other non-zero one.
+        click.secho(f"Error: {message}", fg="red", err=True)
+        sys.exit(INGEST_PARTIAL_EXIT)
 
-    nothing_loaded, any_failed = _run_problems(result)
-    if nothing_loaded:
-        click.echo(NOTHING_LOADED_MESSAGE)
+
+# ── rebuild ────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option("--db", "db_path", default=None, type=click.Path(dir_okay=False),
+              help="Database file to rebuild (default: the configured path / NFL_MCP_DB_PATH).")
+def rebuild(db_path):
+    """Rebuild every derived table (team, situational, fantasy, records) in one transaction.
+
+    No data is downloaded. If any table fails the previous tables are kept and the
+    command exits with an error.
+    """
+    import duckdb
+
+    from .config import get_duckdb_path
+    from .ingest import _apply_duckdb_pragmas, _ensure_metadata_table, rebuild_derived_tables
+
+    path = Path(db_path).expanduser() if db_path else get_duckdb_path()
+    if not path.exists():
+        raise click.ClickException(f"Database not found at {path}. Run 'nfl-mcp ingest' first.")
+
+    conn = duckdb.connect(str(path))
+    try:
+        _apply_duckdb_pragmas(conn, str(path))
+        _ensure_metadata_table(conn)  # the builders write the status and detail columns
+        rebuild_derived_tables(conn)
+    except duckdb.Error as e:
+        raise click.ClickException(f"Rebuild failed, previous derived tables kept: {e}")
+    finally:
+        conn.close()
+    click.secho("Derived tables rebuilt.", fg="green")
+
+
+# ── upgrade ────────────────────────────────────────────────────────────────────
+
+def _step_line(step) -> str:
+    state = "ok" if not step.needed else "NEEDED (network)" if step.needs_network else "NEEDED"
+    return f"  {step.name:<22} {state}" + (f"  {step.detail}" if step.needed else "")
+
+
+@main.command()
+@click.option("--db", "db_path", default=None, type=click.Path(dir_okay=False),
+              help="Database file (default: the configured path / NFL_MCP_DB_PATH).")
+@click.option("--check", "check_only", is_flag=True,
+              help="Only report what is needed (read-only). Exit 0 current, 3 upgrade needed, "
+                   "1 error or a database newer than this nfl-mcp.")
+@click.option("--no-fetch", is_flag=True,
+              help="Skip the steps that download data; exit 3 if any are left.")
+def upgrade(db_path, check_only, no_fetch):
+    """Detect and upgrade a database made by an older nfl-mcp, without deleting it.
+
+    Runs only the steps the database needs, then records the schema version once none
+    is left. Running it again is safe. The served container slot is read-only on purpose:
+    update_db.sh upgrades a copy of it before the swap.
+    """
+    import duckdb
+
+    from . import migrate
+    from .config import get_duckdb_path
+    from .database import _connection_config
+    from .ingest import _apply_duckdb_pragmas
+
+    path = Path(db_path).expanduser() if db_path else get_duckdb_path()
+    if not path.is_file():
+        raise click.ClickException(f"Database not found at {path}. Run 'nfl-mcp ingest' first.")
+
+    if check_only:
+        try:
+            conn = duckdb.connect(str(path), read_only=True, config=_connection_config())
+            try:
+                status = migrate.check(conn)
+            finally:
+                conn.close()
+        except (duckdb.Error, ValueError) as e:
+            raise click.ClickException(f"Cannot check {path}: {e}")
+        click.echo(f"Schema version {status.version}, this nfl-mcp expects {status.target}")
+        for step in status.steps:
+            click.echo(_step_line(step))
+        if status.newer:
+            raise click.ClickException(
+                f"{path} is newer than this nfl-mcp (version {status.version} > {status.target}); "
+                "update nfl-mcp")
+        if status.upgrade_needed:
+            click.echo("Upgrade needed: run nfl-mcp upgrade")
+            sys.exit(3)
+        click.secho("Database is current.", fg="green")
+        return
+
+    # os.access is always true for root, so also look at the mode bits of the real file.
+    if not os.access(path, os.W_OK) or path.resolve().stat().st_mode & 0o222 == 0:
+        raise click.ClickException(
+            f"{path} is read-only. The active container slot is read-only on purpose; "
+            "the next update_db.sh run upgrades a copy of it.")
+    try:
+        conn = duckdb.connect(str(path))
+    except duckdb.Error as e:
+        raise click.ClickException(f"Cannot open {path} for writing: {e}")
+    try:
+        _apply_duckdb_pragmas(conn, str(path))
+        result = migrate.upgrade(conn, fetch=not no_fetch)
+    except duckdb.Error as e:
+        raise click.ClickException(f"Upgrade of {path} failed: {e}")
+    finally:
+        conn.close()
+
+    click.echo(f"Schema version {result.before.version} -> {result.after.version}, "
+               f"this nfl-mcp expects {result.after.target}")
+    for step in [] if result.before.newer else result.before.steps:
+        if step.name in result.ran:
+            state = "ran"
+        elif step.name in result.pending:
+            state = "skipped (--no-fetch)"
+        elif step.needed:
+            state = "FAILED"
+        else:
+            state = "ok (not needed)"
+        click.echo(f"  {step.name:<22} {state}")
+    for failure in result.failed:
+        click.secho(f"  FAILED {failure}", fg="red")
+    if result.failed:
         sys.exit(1)
-    if strict and any_failed:
+    if result.stamped:
+        click.secho(f"Stamped schema version {result.after.version}.", fg="green")
+    if result.after.upgrade_needed:
+        click.echo("Not stamped: run nfl-mcp upgrade without --no-fetch to finish.")
+        sys.exit(3)
+
+
+# ── validate ───────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option("--db", "db_path", required=True, type=click.Path(dir_okay=False),
+              help="Database file to check (the freshly ingested slot).")
+@click.option("--current", "current_path", default=None, type=click.Path(dir_okay=False),
+              help="The active slot. The new file must not hold fewer rows or an older "
+                   "newest week than this one.")
+def validate(db_path, current_path):
+    """Check a database file before it is swapped in. Exit 1 if any check fails.
+
+    Both files are opened read-only. Checks: required tables and columns, row counts
+    against the current slot, duplicate plays, newest week, and key columns in the
+    newest week.
+    """
+    from .validate import run_checks
+
+    results = run_checks(Path(db_path).expanduser(),
+                         Path(current_path).expanduser() if current_path else None)
+    for r in results:
+        click.secho(f"{'ok  ' if r.ok else 'FAIL'} {r.name}: {r.detail}",
+                    fg="green" if r.ok else "red")
+    failed = [r for r in results if not r.ok]
+    if failed:
+        click.secho(f"Validation failed: {len(failed)} of {len(results)} checks.", fg="red")
         sys.exit(1)
+    click.secho(f"Validation passed: {len(results)} checks.", fg="green")
 
 
 # ── init ───────────────────────────────────────────────────────────────────────
@@ -302,6 +568,12 @@ def init(start, end, host, port, skip_ingest):
             # exist, or at an empty one. Say so and name the command; keep the user's file.
             load_failed = True
             click.secho(f"  ✗ Data load stopped: {exc}", fg="red")
+        else:
+            # Some seasons landed and some did not: the database works, so warn and go on.
+            failures = [] if result is None else result.failures
+            if failures and not nothing_loaded:
+                click.secho("  Warning: some data failed to load: " + "; ".join(failures)
+                            + ". Run 'nfl-mcp ingest' again to retry.", fg="yellow")
 
     # ── 4. Set up IDE client ───────────────────────────────────────────────
     click.echo()
@@ -324,6 +596,8 @@ def init(start, end, host, port, skip_ingest):
     click.echo("   You can start it any time with:  nfl-mcp serve")
     click.echo()
     if click.confirm("  Start the server now?", default=True):
+        _exit_on_config_problem()
+        _check_auth_token_env()
         click.secho(f"   Starting server on {_client_url(host, port)}  (Ctrl-C to stop)", fg="cyan")
         click.echo()
         uvicorn.run(create_app(), host=host, port=port)
@@ -511,9 +785,31 @@ def _configure_claude_code(config: dict) -> bool:
 
 # ── doctor ─────────────────────────────────────────────────────────────────────
 
+def _doctor_schema_line() -> None:
+    """One line: the database schema version, the target and the steps still needed."""
+    from . import database, migrate
+
+    try:
+        with database.get_db_connection() as conn:
+            status = migrate.check(conn)
+    except Exception:  # noqa: BLE001 - doctor reports, it does not stop
+        click.secho("  – Schema version unknown (could not check)", fg="bright_black")
+        return
+    needed = [s.name for s in status.steps if s.needed]
+    head = f"Schema version {status.version}, this nfl-mcp expects {status.target}"
+    if status.newer:
+        click.secho(f"  ⚠ {head}: the database is newer, update nfl-mcp", fg="yellow")
+    elif status.upgrade_needed:
+        click.secho(f"  ⚠ {head}: needs {', '.join(needed) or 'a version stamp'}; "
+                    "run 'nfl-mcp upgrade'", fg="yellow")
+    else:
+        click.secho(f"  ✓ {head} (current)", fg="green")
+
+
 @main.command()
 def doctor():
     """Check that everything is configured and working."""
+    from . import database
     from .config import config_exists, config_file_is_usable, get_duckdb_path
 
     click.echo()
@@ -548,14 +844,11 @@ def doctor():
         click.secho(f"  ✓ DuckDB file exists ({db_path})", fg="green")
         import duckdb
         try:
-            conn = duckdb.connect(str(db_path), read_only=True)
-            try:
+            with database.get_db_connection() as conn:
                 count = conn.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
                 seasons = conn.execute(
                     "SELECT MIN(season), MAX(season) FROM plays"
                 ).fetchone()
-            finally:
-                conn.close()
         except duckdb.CatalogException:
             # An empty database file: created, never loaded, so it has no plays table.
             click.secho(f"  ✗ Database has no data yet — no plays table in {db_path}", fg="red")
@@ -571,6 +864,7 @@ def doctor():
                 click.secho(f"  ✗ Database has no data yet — 0 plays in {db_path}", fg="red")
                 click.echo(f"    Run '{INGEST_COMMAND}' to load data.")
                 all_ok = False
+        _doctor_schema_line()
     else:
         click.secho(f"  ✗ DuckDB file not found at {db_path}", fg="red")
         click.echo(f"    Run '{INGEST_COMMAND}' to create it.")

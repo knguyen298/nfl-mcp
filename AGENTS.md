@@ -10,11 +10,12 @@ Guidance for AI agents working on this codebase.
 
 ```
 nfl_mcp/
-  cli.py          # Click CLI: serve, ingest, init, setup-client, doctor
+  cli.py          # Click CLI: serve, ingest, rebuild, upgrade, validate, init, setup-client, doctor
   server.py       # MCP server: TOOLS list + _DISPATCH + call_tool handler
   tools.py        # Tool implementations (nfl_schema, nfl_status, nfl_query, ...)
   schema_pbp.py   # PBP schema strings (_SCHEMA_SUMMARY, _SCHEMA_CATEGORIES) — pure data, no logic
   ingest.py       # Data ingestion: run_ingest_datasets, idempotency, schema reconciliation
+  migrate.py      # Schema version (_schema_version), the check, and `nfl-mcp upgrade`
   registry.py     # Declarative dataset definitions (REGISTRY, DatasetDef)
   espn.py         # External fetcher: 1970-1998 final season records from ESPN's scoreboard API
   franchises.py   # Franchise identity: canonical team codes, era names, availability, season shapes
@@ -44,6 +45,8 @@ tests/
   test_status.py     # Enum values, plain-string equality, str()/JSON serialization of states
   test_safety.py     # SQL injection / forbidden keyword guardrails
   test_dockerfile_dev.py # Image wiring: both Dockerfiles, the schedule, and the two updater scripts
+  test_coverage_gaps.py  # Unit tests for lines no other test reaches
+  fixes/             # Release regression tests, one file per review group or version (v0.7.x)
 ```
 
 ## Key Architectural Rules
@@ -149,8 +152,10 @@ nfl-mcp ingest --dataset all                             # all seasons, slow
 - **Unit tests** (no DB, no network, always run in CI): `test_registry`, `test_ingest`, `test_cli`,
   `test_config`, `test_database`, `test_espn`, `test_franchises`, `test_status`,
   `test_tools_unit`, `test_dockerfile_dev`, and `test_safety` except its `TestNflQueryLive` class
-- **Integration tests** (`test_tools.py` classes marked `@pytest.mark.integration`): require a
-  loaded DuckDB. The `require_db` fixture skips them when no database is present
+- **Integration tests** (`test_tools.py` classes and the `tests/fixes/` tests marked
+  `@pytest.mark.integration`): require a loaded DuckDB. The `require_db` fixture skips them when
+  no database is present. Some `tests/fixes/` oracles count rows of the 2024 season only, so they
+  expect the CI database (`--start 2024 --end 2024`)
 - `tests/conftest.py` gives every test that does not carry the `integration` marker the `unit`
   marker, so a test that reads the real database must be marked. An unmarked test runs in
   `-m unit`, passes on a developer machine that happens to hold a database, and skips its own
@@ -186,14 +191,17 @@ class TestMyNewTool:
   (`_lock_external_access`). Extension autoload and auto-install are off, Python replacement
   scans are off, and `enable_external_access` is off, so a query cannot read a file on disk or
   reach the network. `lock_configuration` means a query cannot `SET` any of that back on.
-- **What `nfl_query` accepts**: one statement that starts with `SELECT` or `WITH`, after leading
-  comments. The text checks read only SQL code, because `_mask_sql` blanks string literals,
-  quoted identifiers and comments first, so a blocked word inside a quoted column name or a
-  semicolon inside a literal both pass. A blocked keyword, a blocked file function, or a second
-  statement is refused with `FORBIDDEN_KEYWORD`, `NOT_SELECT`, or `MULTIPLE_STATEMENTS`. DuckDB's
-  own parser then must see exactly one SELECT. `max_rows` is clamped to 1..500, and the extra row
-  is what sets `truncated`. `tests/test_safety.py` covers each of these, including the engine
-  refusing every file-reading form in `_FILE_VECTORS` with the text guard switched off.
+- **What `nfl_query` accepts**: one SELECT, or an EXPLAIN of one SELECT. DuckDB's own parser
+  decides first (`_statement_gate`): text it cannot parse is `SQL_SYNTAX_ERROR`, two statements
+  are `MULTIPLE_STATEMENTS`, and any other statement is `NOT_SELECT` with its `statement_type`.
+  Then `_mask_sql` blanks string literals, quoted identifiers and comments, and checks its spans
+  against DuckDB's tokenizer (`_engine_agrees`). A disagreement is refused with `SQL_ERROR`. The
+  scan of the masked text refuses a call to a blocked function (`_FORBIDDEN_FUNCTIONS`, or such a
+  name in double quotes) with `FORBIDDEN_KEYWORD`. A statement keyword is not scanned for, because
+  the parser already refused it. The SQL runs as written, through `_fetch_capped`, which fetches
+  `max_rows + 1` rows. `max_rows` is an integer: below 1 is `INVALID_ARGUMENT`, above 500 is
+  clamped to 500. `tests/test_safety.py` covers each of these, including the engine refusing every
+  file-reading form in `_FILE_VECTORS` with the text guard switched off.
 
 ## Configuration File
 
@@ -291,37 +299,47 @@ no fetches, and it is not treated as a failure.
 first `_SUMMARY_LINE_CAP` seasons that landed nothing. A dead network fails every season in the
 range, so the list is capped and the counts carry the size of the problem.
 
-`nfl-mcp ingest` exits 1 when `nothing_loaded` is true: the run fetched at least once and no
-fetch put rows in the database. It prints `NOTHING_LOADED_MESSAGE` and leaves the database as it
-was. A run where some fetches failed and others landed exits 0. That is deliberate: play-by-play
-for a new season does not exist before Week 1, so it fails on every run from March to September,
-and an exit code that fires on that would fire all year. `--strict` exits 1 when any single fetch
-failed, for a caller that wants the stricter answer.
+`nfl-mcp ingest` exits 0 when every fetch landed, 3 (`INGEST_PARTIAL_EXIT`) when any fetch
+failed or the run loaded nothing, 1 on a fatal error, and 2 on a usage error. A run that loaded
+nothing also prints `NOTHING_LOADED_MESSAGE`. A season nflreadpy does not publish yet is skipped,
+not failed, so play-by-play for a season before its Week 1 does not set exit 3.
+`--allow-failures` turns a partial run (some fetches landed) into exit 0. `--strict` exits 3 when
+any single fetch failed, even with `--allow-failures`. `--failures-file` writes the failed
+datasets and seasons, one per line.
 
-That exit code decides whether a running container changes its data. `update_db.sh` runs
-`nfl-mcp ingest` under `set -eu`, so a run that loaded nothing ends the script before the symlink
-swap and the server keeps the database it already had.
+That exit code decides whether a running container changes its data. `update_db.sh` treats exit 3
+as a warning: the failed datasets keep their previous rows, and the script goes on to the upgrade
+and the checks. Any other non-zero exit ends the script before the symlink swap, and the server
+keeps the database it already had. `entrypoint.sh` runs the no-seed cold ingest with
+`--allow-failures`, so a run that loaded nothing still exits 3 and stops the first start.
 
 ## Tool Results
 
 - **Every tool failure carries a code.** A failure is a dict with `error` (a string) and `code`
   (an `ErrorCode` member). `tools._err` builds it, and `_error_from_exception` classifies an
   exception into `TIMEOUT`, `DB_NOT_FOUND`, `DB_LOCKED`, `COLUMN_NOT_FOUND`, `TABLE_NOT_FOUND` or
-  `SQL_ERROR`. `server.py` writes the same shape for the failures outside a tool: `UNKNOWN_TOOL`,
-  `INVALID_ARGUMENTS` from the input schema or the signature, and `TOOL_EXECUTION_ERROR` for an
-  exception that escaped. `_is_error_result` recognizes that shape and sets `isError=True` on the
-  MCP result, so a client sees a failure as a failure.
+  `SQL_ERROR`. On the wire, `server.py` sends one shape: `error` and `code` at the top level, and
+  every other field under `details`, with the tool name. It writes the same shape for the
+  failures outside a tool: `UNKNOWN_TOOL`, `INVALID_ARGUMENTS` from the input schema or the
+  signature, and `TOOL_EXECUTION_ERROR` for an exception that escaped. The handler is registered
+  with `validate_input=False`, and `_argument_failure` runs the schema check and the signature
+  bind itself, so a bad argument gets that shape rather than the SDK's plain text.
+  `_is_error_result` recognizes a failure and sets `isError=True` on the MCP result, so a client
+  sees a failure as a failure. Every response, a failure too, carries `data_as_of`.
 - **A cut list says it was cut.** A tool that caps its rows asks the database for one row more
   than it returns and passes the fetch through `_cap`, which returns `truncated: True` when the
   extra row came back. The flag sits next to the tool's count key.
-- **Three checks answer before any query runs.** `_resolve_team` resolves a team through
-  `franchises` and refuses a code no franchise owns with `UNKNOWN_TEAM`, unless the table the tool
-  reads stores that code (FantasyPros files free agents as `FA`). `_choice` matches a fixed-value
-  argument against its tuple, ignoring case, and refuses with `INVALID_INPUT` plus the allowed
-  list. `_check_coverage` refuses a season outside the tool's registry window with
-  `OUT_OF_COVERAGE`, and answers a range that only overlaps the edge. Each raises `_Refusal`, and
-  the `_refusals_as_errors` decorator on the tool returns its payload, so a tool body lists its
-  checks and never repeats the return.
+- **Three checks answer before any query runs.** `_team_codes` resolves a team through
+  `franchises.team_codes`, so the query carries every code the franchise was stored under, and
+  refuses an empty or unknown value with `UNKNOWN_TEAM` and `did_you_mean`. `JAC` is a Jaguars
+  alias in `franchises.py`, and `nfl_fantasy_rankings` spells the rankings' own `FA` code.
+  `_choice` matches a fixed-value argument against its tuple, ignoring case, and refuses with
+  `INVALID_ARGUMENT` plus the allowed list. `season_type` is required on every tool that takes it
+  and is matched exactly (`_season_type_arg`). `_check_coverage` refuses a season before the
+  tool's registry floor with `OUT_OF_COVERAGE`, and answers a range that only overlaps the floor.
+  A season after the loaded data is answered with no rows and a `reason`. Each check raises
+  `_Refusal`, and the `_refusals_as_errors` decorator on the tool returns its payload, so a tool
+  body lists its checks and never repeats the return.
 - **A new tool gets those checks by the same route.** Decorate it with `@_refusals_as_errors`,
   call the helpers, spell a fixed-value argument as one of the module's tuples, and list its
   datasets in `_COVERAGE`. `server.py` builds the schema `enum` and the first-season sentence from
@@ -401,10 +419,10 @@ Two independent paths keep the published image current. Change one without break
 `update_db.sh` publishes a newer database in this order, and every step that fails ends the run
 before the swap, so the live slot keeps serving:
 
-1. Take `flock -n` on `/data/.update.lock`. A second overlapping run prints "Another update is
-   running, skipping this one" and exits 0. The lock sits on an open file descriptor, so a run
-   that dies releases it and a later run is not blocked. A missing `flock` is an error, because
-   running unguarded is what the lock prevents.
+1. Open `/data` itself on descriptor 9 and take `flock -n` on it. A second overlapping run
+   prints "Another update is already running; skipping this run." and exits 0. The lock sits on
+   an open descriptor, so a run that dies releases it, and no lock file is left in `/data`. A
+   missing `flock` is an error, because running unguarded is what the lock prevents.
 2. Read the link, and accept only `nflread_a.duckdb` or `nflread_b.duckdb`. The check runs before
    any `rm`, because the script deletes the other slot and a loose target would delete the live
    one. The active slot must also be a regular file.
@@ -414,12 +432,15 @@ before the swap, so the live slot keeps serving:
    2. The copy of the active slot and the WAL DuckDB keeps beside it both land on that
    filesystem. DuckDB's spill directory is elsewhere in the image, so it is not counted here. Set
    the variable higher when the volume needs more headroom.
-5. Copy the active slot to the idle slot, then run `nfl-mcp ingest` into it.
-6. Refuse the swap when the idle slot has a `.wal` next to it. That file means the load process
+5. Copy the active slot to the idle slot, then run `nfl-mcp ingest` into it. Exit 3 is a
+   warning that names the failed datasets. Any other failure ends the run.
+6. Run `nfl-mcp upgrade` on the idle slot, so it has the current schema version.
+7. Refuse the swap when the idle slot has a `.wal` next to it. That file means the load process
    died before DuckDB closed the database, and a reader would see only the last checkpoint.
-7. Run `validate_db.sh` on the idle slot, and refuse the swap when it fails or when the script is
+8. Run `validate_db.sh` on the idle slot, and refuse the swap when it fails or when the script is
    missing.
-8. Swap the link with `ln -sfn`.
+9. Run `nfl-mcp validate` on the idle slot against the active slot.
+10. Make the idle slot read-only and swap the link with `ln -sfn`.
 
 Rules:
 

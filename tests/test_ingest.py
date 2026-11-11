@@ -202,7 +202,8 @@ class TestEnsureMetadataTable:
         _ensure_metadata_table(conn)
 
         cols = [r[1] for r in conn.execute("PRAGMA table_info('_ingest_metadata')").fetchall()]
-        assert cols[-2:] == ["status", "detail"]
+        # The merge adds main's nflreadpy_version column after the branch's two.
+        assert cols[-3:] == ["status", "detail", "nflreadpy_version"]
         assert _outcome(conn, "pbp", 2020) == ("loaded", None, 12345)
         assert conn.execute("SELECT loaded_at FROM _ingest_metadata").fetchone()[0] == \
             datetime.datetime(2024, 1, 1)          # the row was rewritten, only widened
@@ -210,7 +211,7 @@ class TestEnsureMetadataTable:
 
         _ensure_metadata_table(conn)               # a second run changes nothing
         assert conn.execute("SELECT * FROM _ingest_metadata").fetchall() == [
-            old_row + ("loaded", None)
+            old_row + ("loaded", None, None)      # status, detail, nflreadpy_version
         ]
         conn.close()
 
@@ -861,8 +862,8 @@ class TestPbpIngestionHelpers:
         })
         _install_fake_nflreadpy(monkeypatch, load_pbp=lambda seasons: bad)
 
-        with pytest.raises(duckdb.ConversionException):
-            _ingest_pbp_season(conn, 2024)
+        # Main's rule, kept by the merge: a failed write is logged and the run goes on.
+        assert _ingest_pbp_season(conn, 2024) == 0
 
         assert conn not in _open_transactions
         rows = conn.execute("SELECT season, posteam FROM plays").fetchall()
@@ -1079,8 +1080,8 @@ class TestGenericDatasetIngestion:
 
         # The season's rows were already deleted inside the transaction by this point.
         monkeypatch.setattr("nfl_mcp.ingest._write_df_to_table", failing_write)
-        with pytest.raises(RuntimeError, match="insert failed"):
-            _ingest_generic_dataset(conn, defn, seasons=[2024], fresh=True)
+        # A failed write is a soft failure: logged, 0 rows, and the run goes on.
+        assert _ingest_generic_dataset(conn, defn, seasons=[2024], fresh=True) == 0
 
         rows = conn.execute(
             "SELECT season, value FROM fake_seasonal ORDER BY season, value"
@@ -1112,8 +1113,8 @@ class TestGenericDatasetIngestion:
             raise RuntimeError("insert failed")
 
         monkeypatch.setattr("nfl_mcp.ingest._write_df_to_table", drop_then_fail)
-        with pytest.raises(RuntimeError, match="insert failed"):
-            _ingest_generic_dataset(conn, defn, seasons=[2024], fresh=False)
+        # A failed write is a soft failure: logged, 0 rows, and the run goes on.
+        assert _ingest_generic_dataset(conn, defn, seasons=[2024], fresh=False) == 0
 
         # DuckDB rolls back DDL too, so the dropped table is back with its old rows.
         assert conn.execute("SELECT x FROM fake_static").fetchall() == [(1,)]
@@ -1887,7 +1888,7 @@ class TestRunIngestOrchestration:
         )
 
         assert calls["pbp"] == [2024]
-        assert calls["record"] == [("pbp", "plays", "load_pbp", 11, 2024)]
+        assert calls["record"] == []  # pbp metadata is written inside _ingest_pbp_season (mocked here)
         assert calls["idx"] == 1
         assert calls["agg"] == 1
         assert calls.get("fantasy") == 1
@@ -2068,8 +2069,10 @@ class TestRunIngestOrchestration:
             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("metadata write failed")),
         )
 
-        with pytest.raises(RuntimeError, match="metadata write failed"):
-            run_ingest_datasets(["pbp"], start=2024, end=2024, skip_views=True, db_path=path)
+        # The failed write is reported by the run instead of raised (main's soft failure).
+        result = run_ingest_datasets(["pbp"], start=2024, end=2024, skip_views=True, db_path=path)
+        assert result.failures == ["pbp 2024: metadata write failed"]
+        assert result.nothing_loaded is True
 
         check = duckdb.connect(path)
         assert check.execute("SELECT season, posteam FROM plays").fetchall() == [(2024, "KC")]
@@ -2826,9 +2829,10 @@ class TestRunResultEndToEnd:
         monkeypatch.setattr("nfl_mcp.ingest._ingest_generic_dataset",
                             lambda *a, **k: _throw(RuntimeError("disk full")))
 
-        with pytest.raises(RuntimeError, match="disk full"):
-            run_ingest_datasets(["schedules"], start=2024, end=2024, skip_views=True,
-                                db_path=str(tmp_path / "nflread.duckdb"))
+        # A dataset that raises is reported by the run instead of raised (main's soft failure).
+        result = run_ingest_datasets(["schedules"], start=2024, end=2024, skip_views=True,
+                                     db_path=str(tmp_path / "nflread.duckdb"))
+        assert result.failures == ["schedules: disk full"]
         assert spy.closes == 1
 
 
@@ -2932,6 +2936,7 @@ class TestStaleDerivedTables:
             "position": ["RB", "WR"],
             "posteam": ["KC", "BAL"],
             "season": ["2024", "2024"],
+            "week": [1.0, 1.0],              # main's builder labels REG/POST by week
             "rec_touchdown": [1.0, 2.0],
             "rec_touchdown_exp": [1.5, 1.0],
             "rec_touchdown_diff": [-0.5, 1.0],

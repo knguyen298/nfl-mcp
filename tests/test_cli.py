@@ -1,5 +1,6 @@
 """Unit tests for CLI commands — no database or network required."""
 
+import contextlib
 import json
 import os
 
@@ -63,9 +64,11 @@ UNUSABLE_CONFIG = {
 
 class TestServe:
     @pytest.fixture(autouse=True)
-    def _isolated_config(self, monkeypatch):
+    def _isolated_config(self, monkeypatch, tmp_path):
         """serve reads config.json, so point it at defaults unless a test says otherwise."""
-        monkeypatch.delenv("NFL_MCP_DB_PATH", raising=False)
+        # Merge: serve now checks the schema of the database file first (main). A path with
+        # no file skips that check, so these tests never open a real database.
+        monkeypatch.setenv("NFL_MCP_DB_PATH", str(tmp_path / "absent.duckdb"))
         monkeypatch.setattr("nfl_mcp.config.load_config", lambda: {})
 
     def test_serve_starts_uvicorn(self, runner, monkeypatch):
@@ -996,6 +999,9 @@ class _FakeHealthyDb:
     def execute(self, sql):
         if "COUNT(*) FROM plays" in sql:
             return _FakeCursor((123456,))
+        if "current_setting('enable_external_access')" in sql:
+            # get_db_connection reads the lock back before it hands out the connection.
+            return _FakeCursor((False,))
         return _FakeCursor((2013, 2025))
 
     def close(self):
@@ -1096,11 +1102,31 @@ class TestDoctorCommand:
         vscode_dir.mkdir(parents=True, exist_ok=True)
         (vscode_dir / "mcp.json").write_text(json.dumps({"servers": {"nfl": {"command": "nfl-mcp"}}}))
 
+        class _FakeCursor:
+            def __init__(self, row):
+                self._row = row
+
+            def fetchone(self):
+                return self._row
+
+        class _FakeConn:
+            def execute(self, sql):
+                if "COUNT(*) FROM plays" in sql:
+                    return _FakeCursor((123456,))
+                return _FakeCursor((2013, 2025))
+
+            def close(self):
+                return None
+
+        @contextlib.contextmanager
+        def _fake_get_db_connection():
+            yield _FakeConn()
+
         monkeypatch.setattr("nfl_mcp.config.config_exists", lambda: True)
         monkeypatch.setattr("nfl_mcp.config.get_duckdb_path", lambda: db_path)
         monkeypatch.setattr("nfl_mcp.cli._claude_desktop_config_path", lambda: claude_path)
         monkeypatch.setattr("nfl_mcp.cli.Path.cwd", lambda: tmp_path)
-        monkeypatch.setattr("duckdb.connect", lambda *args, **kwargs: _FakeHealthyDb())
+        monkeypatch.setattr("nfl_mcp.database.get_db_connection", _fake_get_db_connection)
 
         result = runner.invoke(main, ["doctor"])
         assert result.exit_code == 0
@@ -1115,8 +1141,8 @@ class TestDoctorCommand:
         monkeypatch.setattr("nfl_mcp.cli._claude_desktop_config_path", lambda: None)
         monkeypatch.setattr("nfl_mcp.cli.Path.cwd", lambda: tmp_path)
         monkeypatch.setattr(
-            "duckdb.connect",
-            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("cannot open db")),
+            "nfl_mcp.database.get_db_connection",
+            lambda: (_ for _ in ()).throw(RuntimeError("cannot open db")),
         )
 
         result = runner.invoke(main, ["doctor"])
@@ -1275,7 +1301,7 @@ class TestDoctorCommand:
 # exit 0. These tests pin the rule: a run where nothing at all loaded leaves the exit code
 # non-zero, and a run that merely failed on some seasons does not.
 
-from nfl_mcp.cli import NOTHING_LOADED_MESSAGE, _run_problems  # noqa: E402
+from nfl_mcp.cli import INGEST_PARTIAL_EXIT, NOTHING_LOADED_MESSAGE, _run_problems  # noqa: E402
 from nfl_mcp.config import DEFAULT_DUCKDB_PATH  # noqa: E402
 from nfl_mcp.ingest import IngestAttempt, IngestRunResult  # noqa: E402
 from nfl_mcp.status import IngestStatus  # noqa: E402
@@ -1310,22 +1336,32 @@ class TestRunProblems:
 
 
 class TestIngestExitCode:
-    def test_some_seasons_failing_is_still_a_successful_run(self, runner, monkeypatch):
+    # Merge: main's exit codes win. A partial run exits 3 (update_db.sh goes on to upgrade and
+    # validate on 3), --allow-failures turns it into 0, and a run that loaded nothing exits 3
+    # even with --allow-failures. The branch exited 0 on a partial run and 1 on nothing loaded.
+
+    def test_some_seasons_failing_exits_three_unless_failures_are_allowed(self, runner,
+                                                                          monkeypatch):
         """Play-by-play for a new season fails every run from March to September.
 
-        'Any failure is non-zero' would stop the container's scheduled refresh for half the
-        year, so only a run that loaded nothing at all is an error.
+        The run still finished, so the code is 3, not the fatal 1, and update_db.sh goes on.
         """
         _stub_run(monkeypatch, IngestStatus.LOADED, IngestStatus.FAILED)
         result = runner.invoke(main, ["ingest", "--dataset", "schedules", "--skip-views"])
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == INGEST_PARTIAL_EXIT, result.output
         assert NOTHING_LOADED_MESSAGE not in result.output
+        allowed = runner.invoke(main, ["ingest", "--dataset", "schedules", "--skip-views",
+                                       "--allow-failures"])
+        assert allowed.exit_code == 0, allowed.output
 
-    def test_a_run_that_loaded_nothing_exits_one(self, runner, monkeypatch):
+    def test_a_run_that_loaded_nothing_exits_three(self, runner, monkeypatch):
         _stub_run(monkeypatch, IngestStatus.FAILED, IngestStatus.FAILED, IngestStatus.EMPTY)
         result = runner.invoke(main, ["ingest", "--dataset", "schedules", "--skip-views"])
-        assert result.exit_code == 1
+        assert result.exit_code == INGEST_PARTIAL_EXIT
         assert NOTHING_LOADED_MESSAGE in result.output
+        allowed = runner.invoke(main, ["ingest", "--dataset", "schedules", "--skip-views",
+                                       "--allow-failures"])
+        assert allowed.exit_code == INGEST_PARTIAL_EXIT
 
     def test_the_message_says_the_database_was_left_alone(self, runner, monkeypatch):
         _stub_run(monkeypatch, IngestStatus.FAILED)
@@ -1342,13 +1378,17 @@ class TestIngestExitCode:
         _stub_run(monkeypatch, IngestStatus.EMPTY, IngestStatus.EMPTY)
         result = runner.invoke(main, ["ingest", "--dataset", "schedules", "--skip-views"])
         # Nothing landed, so the run did load nothing, and it still says so.
-        assert result.exit_code == 1
+        assert result.exit_code == INGEST_PARTIAL_EXIT
         assert NOTHING_LOADED_MESSAGE in result.output
 
-    def test_strict_exits_one_when_any_attempt_failed(self, runner, monkeypatch):
+    def test_strict_exits_three_when_any_attempt_failed(self, runner, monkeypatch):
         _stub_run(monkeypatch, IngestStatus.LOADED, IngestStatus.FAILED)
         result = runner.invoke(main, ["ingest", "--dataset", "schedules", "--strict"])
-        assert result.exit_code == 1
+        assert result.exit_code == INGEST_PARTIAL_EXIT
+        # --strict wins over --allow-failures.
+        both = runner.invoke(main, ["ingest", "--dataset", "schedules", "--strict",
+                                    "--allow-failures"])
+        assert both.exit_code == INGEST_PARTIAL_EXIT
 
     def test_strict_tolerates_a_season_the_publisher_has_no_rows_for(self, runner, monkeypatch):
         _stub_run(monkeypatch, IngestStatus.LOADED, IngestStatus.EMPTY)
@@ -1389,19 +1429,20 @@ class TestIngestExitCode:
         monkeypatch.setitem(sys.modules, "nflreadpy", fake)
         monkeypatch.setattr("nfl_mcp.config.get_duckdb_path", lambda: tmp_path / name)
 
-    def test_a_real_run_where_everything_fails_exits_one(self, runner, monkeypatch, tmp_path):
-        """The whole chain: the run finds nothing loaded, the command exits 1."""
+    def test_a_real_run_where_everything_fails_exits_three(self, runner, monkeypatch, tmp_path):
+        """The whole chain: the run finds nothing loaded, the command exits 3."""
         def dead(seasons, **kwargs):
             raise OSError("no route to host")
 
         self._real_run(monkeypatch, tmp_path, dead)
         result = runner.invoke(main, ["ingest", "--dataset", "schedules",
                                       "--start", "2021", "--end", "2022", "--skip-views"])
-        assert result.exit_code == 1, result.output
+        assert result.exit_code == INGEST_PARTIAL_EXIT, result.output
         assert "failed: 2" in result.output
         assert NOTHING_LOADED_MESSAGE in result.output
 
-    def test_a_real_run_that_loaded_one_season_exits_zero(self, runner, monkeypatch, tmp_path):
+    def test_a_real_run_that_loaded_one_season_exits_zero_with_allow_failures(
+            self, runner, monkeypatch, tmp_path):
         import polars as pl
 
         def flaky(seasons, **kwargs):
@@ -1410,7 +1451,7 @@ class TestIngestExitCode:
             raise OSError("no route to host")
 
         self._real_run(monkeypatch, tmp_path, flaky)
-        result = runner.invoke(main, ["ingest", "--dataset", "schedules",
+        result = runner.invoke(main, ["ingest", "--dataset", "schedules", "--allow-failures",
                                       "--start", "2021", "--end", "2022", "--skip-views"])
         assert result.exit_code == 0, result.output
         assert "loaded: 1" in result.output
@@ -1434,7 +1475,7 @@ class TestIngestExitCode:
         self._real_run(monkeypatch, tmp_path, dead, name="empty.duckdb")
         strict = runner.invoke(main, ["ingest", "--dataset", "schedules",
                                       "--start", "2021", "--end", "2021", "--skip-views", "--strict"])
-        assert strict.exit_code == 1
+        assert strict.exit_code == INGEST_PARTIAL_EXIT
 
 
 class TestInitReportsWhatItLoaded:

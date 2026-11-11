@@ -54,7 +54,7 @@ class TestNflSchema:
         result = nfl_schema(category="nonexistent")
         assert "error" in result
         assert "available" in result
-        assert result["code"] == "INVALID_INPUT"
+        assert result["code"] == "INVALID_ARGUMENT"
 
 
 @pytest.mark.integration
@@ -107,7 +107,7 @@ class TestNflSchemaIntegration:
 @pytest.mark.usefixtures("require_db")
 class TestNflSearchPlays:
     def test_search_by_team(self):
-        result = nfl_search_plays(team="KC", season=2024, max_rows=5)
+        result = nfl_search_plays(team="KC", season=2024, max_rows=5, season_type="REG")
         assert "error" not in result
         assert result["row_count"] > 0
         assert all(r["posteam"] == "KC" for r in result["rows"])
@@ -115,31 +115,31 @@ class TestNflSearchPlays:
         assert result["truncated"] is True
 
     def test_search_by_player(self):
-        result = nfl_search_plays(player="Mahomes", season=2024, max_rows=5)
+        result = nfl_search_plays(player="Mahomes", season=2024, max_rows=5, season_type="REG")
         assert "error" not in result
         assert result["row_count"] > 0
 
     def test_search_touchdowns(self):
-        result = nfl_search_plays(is_touchdown=True, season=2024, max_rows=5)
+        result = nfl_search_plays(is_touchdown=True, season=2024, max_rows=5, season_type="REG")
         assert "error" not in result
         assert all(r["touchdown"] == 1 for r in result["rows"])
 
     def test_search_turnovers(self):
-        result = nfl_search_plays(is_turnover=True, season=2024, max_rows=5)
+        result = nfl_search_plays(is_turnover=True, season=2024, max_rows=5, season_type="REG")
         assert "error" not in result
         assert result["row_count"] > 0
 
     def test_search_situation_red_zone(self):
-        result = nfl_search_plays(situation="red_zone", team="KC", season=2024, max_rows=5)
+        result = nfl_search_plays(situation="red_zone", team="KC", season=2024, max_rows=5, season_type="REG")
         assert "error" not in result
 
     def test_search_min_yards(self):
-        result = nfl_search_plays(min_yards=30, season=2024, max_rows=5)
+        result = nfl_search_plays(min_yards=30, season=2024, max_rows=5, season_type="REG")
         assert "error" not in result
         assert all(r["yards_gained"] >= 30 for r in result["rows"])
 
     def test_empty_search(self):
-        result = nfl_search_plays(max_rows=10)
+        result = nfl_search_plays(max_rows=10, season_type="REG")
         assert "error" not in result
         assert result["row_count"] > 0
         assert result["truncated"] is True
@@ -149,58 +149,62 @@ class TestNflSearchPlays:
 @pytest.mark.usefixtures("require_db")
 class TestNflTeamStats:
     def test_returns_offense_and_defense(self):
-        result = nfl_team_stats(team="KC", season=2024)
+        result = nfl_team_stats(team="KC", season=2024, season_type="REG")
         assert "error" not in result
         assert "offense" in result
         assert "defense" in result
         assert len(result["offense"]) == 1
 
     def test_offense_only(self):
-        result = nfl_team_stats(team="BAL", season=2024, side="offense")
+        result = nfl_team_stats(team="BAL", season=2024, side="offense", season_type="REG")
         assert "offense" in result
         assert "defense" not in result
 
     def test_defense_only(self):
-        result = nfl_team_stats(team="BAL", season=2024, side="defense")
+        result = nfl_team_stats(team="BAL", season=2024, side="defense", season_type="REG")
         assert "defense" in result
         assert "offense" not in result
 
     def test_includes_situational(self):
-        result = nfl_team_stats(team="KC", season=2024)
+        result = nfl_team_stats(team="KC", season=2024, season_type="REG")
         assert "situational" in result
         assert len(result["situational"]) > 0
 
     def test_unknown_team_is_an_unknown_team_error(self):
         # Was an empty success; a mistyped team now says so instead of "no data".
-        result = nfl_team_stats(team="ZZZ", season=2024)
+        result = nfl_team_stats(team="ZZZ", season=2024, season_type="REG")
         assert result["code"] == "UNKNOWN_TEAM"
-        assert result["error"] == "Unknown team 'ZZZ'."
+        assert result["error"].startswith("Unknown team 'ZZZ'")
+    def test_invalid_team_returns_error(self):
+        result = nfl_team_stats(team="ZZZ", season=2024, season_type="REG")
+        assert result["code"] == "UNKNOWN_TEAM"  # group H: an unknown code is an error
+        assert "offense" not in result
 
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("require_db")
 class TestNflPlayerStats:
     def test_passing_stats(self):
-        result = nfl_player_stats(player_name="P.Mahomes", stat_type="passing")
+        result = nfl_player_stats(player="P.Mahomes", stat_type="passing", season_type="REG")
         assert "error" not in result
         assert len(result["seasons"]) > 0
-        season = result["seasons"][0]
-        assert "attempts" in season
-        assert "completions" in season
-        assert "avg_epa" in season
+        passing = result["seasons"][0]["passing"]
+        assert "attempts" in passing
+        assert "completions" in passing
+        assert "epa_per_attempt" in passing
 
     def test_rushing_stats(self):
-        result = nfl_player_stats(player_name="D.Henry", stat_type="rushing", season=2024)
+        result = nfl_player_stats(player="D.Henry", stat_type="rushing", season=2024, season_type="REG")
         assert "error" not in result
         assert len(result["seasons"]) > 0
-        assert "carries" in result["seasons"][0]
+        assert "carries" in result["seasons"][0]["rushing"]
 
     def test_receiving_stats(self):
-        result = nfl_player_stats(player_name="J.Jefferson", stat_type="receiving")
+        result = nfl_player_stats(player="J.Jefferson", stat_type="receiving", season_type="REG")
         assert "error" not in result
 
     def test_unknown_player_returns_empty(self):
-        result = nfl_player_stats(player_name="ZZZZNOTAPLAYER", stat_type="passing")
+        result = nfl_player_stats(player="ZZZZNOTAPLAYER", stat_type="passing", season_type="REG")
         assert "error" not in result
         assert len(result["seasons"]) == 0
 
@@ -209,7 +213,7 @@ class TestNflPlayerStats:
 @pytest.mark.usefixtures("require_db")
 class TestNflCompare:
     def test_compare_teams(self):
-        result = nfl_compare(entity1="KC", entity2="BAL", compare_type="team", season=2024)
+        result = nfl_compare(team1="KC", team2="BAL", season=2024, season_type="REG")
         assert "error" not in result
         assert "KC" in result
         assert "BAL" in result
@@ -218,12 +222,12 @@ class TestNflCompare:
 
     def test_compare_players(self):
         result = nfl_compare(
-            entity1="P.Mahomes", entity2="L.Jackson",
-            compare_type="player", season=2024
+            player1="Patrick Mahomes", player2="00-0034796",  # Lamar Jackson QB; the name has a CB twin
+            season=2024,
+            season_type="REG",
         )
         assert "error" not in result
-        assert "P.Mahomes" in result
-        assert "L.Jackson" in result
+        assert [p["player_name"] for p in result["players"]] == ["Patrick Mahomes", "Lamar Jackson"]
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("require_db")
@@ -336,27 +340,31 @@ class TestNflRoster:
         former = nfl_roster(team="OAK", season=2024)
         assert current["count"] > 0
         assert former["players"] == current["players"]
+    def test_unknown_team_returns_error(self):
+        result = nfl_roster(team="ZZZ", season=2024)
+        assert result["code"] == "UNKNOWN_TEAM"  # group H: an unknown code is an error
+        assert "players" not in result
 
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("require_db")
 class TestNflInjuries:
     def test_filter_by_team_and_season(self):
-        result = nfl_injuries(team="KC", season=2024)
+        result = nfl_injuries(team="KC", season=2024, season_type="REG")
         assert "error" not in result
         assert result["count"] > 0
 
     def test_filter_by_week(self):
-        result = nfl_injuries(team="KC", season=2024, week=10)
+        result = nfl_injuries(team="KC", season=2024, week=10, season_type="REG")
         assert "error" not in result
         assert all(r["week"] == 10 for r in result["injuries"])
 
     def test_filter_by_player(self):
-        result = nfl_injuries(player="Mahomes", season=2024)
+        result = nfl_injuries(player="Mahomes", season=2024, season_type="REG")
         assert "error" not in result
 
     def test_returns_expected_fields(self):
-        result = nfl_injuries(team="KC", season=2024, week=1)
+        result = nfl_injuries(team="KC", season=2024, week=1, season_type="REG")
         if result["count"] > 0:
             row = result["injuries"][0]
             for field in ("full_name", "position", "team", "season", "week", "report_status"):
@@ -367,7 +375,7 @@ class TestNflInjuries:
 @pytest.mark.usefixtures("require_db")
 class TestNflSchedule:
     def test_filter_by_team(self):
-        result = nfl_schedule(team="KC", season=2024)
+        result = nfl_schedule(team="KC", season=2024, season_type="REG")
         assert "error" not in result
         assert result["count"] > 0
         assert all(
@@ -376,13 +384,13 @@ class TestNflSchedule:
         )
 
     def test_filter_by_week(self):
-        result = nfl_schedule(season=2024, week=1)
+        result = nfl_schedule(season=2024, week=1, season_type="REG")
         assert "error" not in result
         assert result["count"] > 0
         assert all(r["week"] == 1 for r in result["games"])
 
     def test_returns_expected_fields(self):
-        result = nfl_schedule(team="KC", season=2024)
+        result = nfl_schedule(team="KC", season=2024, season_type="REG")
         row = result["games"][0]
         for field in ("game_id", "season", "week", "home_team", "away_team", "home_score", "away_score"):
             assert field in row
@@ -403,22 +411,22 @@ class TestNflSchedule:
 @pytest.mark.usefixtures("require_db")
 class TestNflSnapCounts:
     def test_filter_by_team_and_season(self):
-        result = nfl_snap_counts(team="KC", season=2024)
+        result = nfl_snap_counts(team="KC", season=2024, season_type="REG")
         assert "error" not in result
         assert result["count"] > 0
 
     def test_filter_by_player(self):
-        result = nfl_snap_counts(player="Kelce", season=2024)
+        result = nfl_snap_counts(player="Kelce", season=2024, season_type="REG")
         assert "error" not in result
         assert result["count"] > 0
 
     def test_filter_by_week(self):
-        result = nfl_snap_counts(team="KC", season=2024, week=1)
+        result = nfl_snap_counts(team="KC", season=2024, week=1, season_type="REG")
         assert "error" not in result
         assert all(r["week"] == 1 for r in result["snap_counts"])
 
     def test_returns_expected_fields(self):
-        result = nfl_snap_counts(team="KC", season=2024, week=1)
+        result = nfl_snap_counts(team="KC", season=2024, week=1, season_type="REG")
         if result["count"] > 0:
             row = result["snap_counts"][0]
             for field in ("player", "position", "team", "season", "week", "offense_snaps", "offense_pct"):
@@ -429,28 +437,34 @@ class TestNflSnapCounts:
 @pytest.mark.usefixtures("require_db")
 class TestNflFantasyOpportunity:
     def test_no_filters_returns_results(self):
-        result = nfl_fantasy_opportunity(season=2024)
+        result = nfl_fantasy_opportunity(season=2024, season_type="REG")
         assert "error" not in result
 
     def test_filter_by_player(self):
-        result = nfl_fantasy_opportunity(player="Jefferson", season=2024)
+        result = nfl_fantasy_opportunity(player="Jefferson", season=2024, season_type="REG")
         assert "error" not in result
 
     def test_filter_by_team_and_position(self):
-        result = nfl_fantasy_opportunity(team="KC", position="WR", season=2024)
+        result = nfl_fantasy_opportunity(team="KC", position="WR", season=2024, season_type="REG")
         assert "error" not in result
 
-    def test_future_season_is_out_of_coverage(self):
-        result = nfl_fantasy_opportunity(season=2099)
+    def test_season_before_coverage_is_out_of_coverage(self):
+        # Merge: a season after the loaded data is answered (main's test below); a season
+        # before the registry floor (2006) is refused.
+        result = nfl_fantasy_opportunity(season=2005, season_type="REG")
         assert result["code"] == "OUT_OF_COVERAGE"
+        assert result["first_season"] == 2006
+    def test_future_season_returns_dict(self):
+        result = nfl_fantasy_opportunity(season=2099, season_type="REG")
+        assert isinstance(result, dict)
 
     def test_filter_by_week(self):
-        result = nfl_fantasy_opportunity(team="KC", season=2024, week=1)
+        result = nfl_fantasy_opportunity(team="KC", season=2024, week=1, season_type="REG")
         assert "error" not in result
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):
-            result = nfl_fantasy_opportunity(season=2024)
+            result = nfl_fantasy_opportunity(season=2024, season_type="REG")
         assert "error" in result
         assert "boom" in result["error"]
 
@@ -496,14 +510,13 @@ class TestNflFantasyRankings:
         result = nfl_fantasy_rankings(scope="bogus")
         assert "error" in result
 
-    def test_invalid_limit_falls_back(self):
+    def test_invalid_limit_returns_error(self):
         result = nfl_fantasy_rankings(scope="draft", limit="oops")
-        assert "error" not in result
+        assert result["code"] == "INVALID_ARGUMENT"
 
-    def test_limit_is_capped(self):
+    def test_limit_above_cap_returns_error(self):
         result = nfl_fantasy_rankings(scope="draft", limit=99999)
-        assert result["count"] <= 500
-        assert isinstance(result["truncated"], bool)
+        assert result["code"] == "INVALID_ARGUMENT"
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):
@@ -516,7 +529,7 @@ class TestNflFantasyRankings:
 @pytest.mark.usefixtures("require_db")
 class TestNflFtnCharting:
     def test_filter_by_team_and_season(self):
-        result = nfl_ftn_charting(team="KC", season=2024)
+        result = nfl_ftn_charting(team="KC", season=2024, season_type="REG")
         assert "error" not in result
         assert result["total_plays"] > 0
         c = result["charting"]
@@ -524,7 +537,7 @@ class TestNflFtnCharting:
         assert c["avg_defenders_in_box"] is not None
 
     def test_filter_by_player(self):
-        result = nfl_ftn_charting(player="Mahomes", season=2024)
+        result = nfl_ftn_charting(player="Mahomes", season=2024, season_type="REG")
         assert "error" not in result
 
     def test_filter_by_opponent_and_week(self):
@@ -532,56 +545,63 @@ class TestNflFtnCharting:
         assert "error" not in result
 
     def test_season_range(self):
-        result = nfl_ftn_charting(team="KC", season_from=2022, season_to=2024)
+        result = nfl_ftn_charting(team="KC", season_from=2022, season_to=2024, season_type="REG")
         assert "error" not in result
         assert result["total_plays"] > 0
 
     def test_season_before_ftn_coverage_is_out_of_coverage(self):
         # Was the empty shape below; 1999 is a season FTN never charted.
-        result = nfl_ftn_charting(team="KC", season=1999)
+        result = nfl_ftn_charting(team="KC", season=1999, season_type="REG")
         assert result["code"] == "OUT_OF_COVERAGE"
         assert result["first_season"] == 2022
 
     def test_valid_question_with_no_matching_plays_stays_empty(self):
         # A team never has the ball against itself: understood, and truly empty.
-        result = nfl_ftn_charting(team="KC", opponent="KC", season=2024)
-        assert result == {"charting": {}, "total_plays": 0}
+        result = nfl_ftn_charting(team="KC", opponent="KC", season=2024, season_type="REG")
+        assert result["charting"] == {} and result["total_plays"] == 0
+        assert "error" not in result
+    def test_no_matching_plays_returns_empty(self):
+        # Merge: 1999 is before FTN coverage and is now OUT_OF_COVERAGE (test above), so the
+        # empty answer is asked with a question that is in coverage and matches nothing.
+        result = nfl_ftn_charting(team="KC", opponent="KC", season=2024, season_type="REG")
+        assert result["total_plays"] == 0
+        assert result["charting"] == {}
 
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("require_db")
 class TestNflTdLuck:
     def test_no_filters_returns_results(self):
-        result = nfl_td_luck(season=2024)
+        result = nfl_td_luck(season=2024, season_type="REG")
         assert "error" not in result
         assert result["count"] > 0
 
     def test_default_sorted_most_unlucky_first(self):
-        result = nfl_td_luck(season=2024, limit=5)
+        result = nfl_td_luck(season=2024, limit=5, season_type="REG")
         scores = [r["total_td_luck_score"] for r in result["td_luck"]]
         assert scores == sorted(scores)
 
     def test_filter_by_player(self):
-        result = nfl_td_luck(player="Jefferson", season=2024)
+        result = nfl_td_luck(player="Jefferson", season=2024, season_type="REG")
         assert "error" not in result
 
     def test_filter_by_team_and_position(self):
-        result = nfl_td_luck(team="KC", position="TE", season=2024)
+        result = nfl_td_luck(team="KC", position="TE", season=2024, season_type="REG")
         assert "error" not in result
 
     def test_rows_have_expected_fields(self):
-        result = nfl_td_luck(season=2024, limit=1)
+        result = nfl_td_luck(season=2024, limit=1, season_type="REG")
         row = result["td_luck"][0]
         for field in ("full_name", "team", "season", "rec_td_luck", "rush_td_luck", "total_td_luck_score"):
             assert field in row
 
-    def test_invalid_limit_falls_back(self):
-        result = nfl_td_luck(season=2024, limit="oops")
-        assert "error" not in result
+    def test_invalid_limit_returns_error(self):
+        result = nfl_td_luck(season=2024, limit="oops", season_type="REG")
+        assert result["code"] == "INVALID_ARGUMENT"
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):
-            result = nfl_td_luck(season=2024)
+            result = nfl_td_luck(season=2024, season_type="REG")
         assert "boom" in result["error"]
 
 
@@ -589,27 +609,27 @@ class TestNflTdLuck:
 @pytest.mark.usefixtures("require_db")
 class TestNflRoleTrend:
     def test_filter_by_season_and_week(self):
-        result = nfl_role_trend(season=2024, week=8)
+        result = nfl_role_trend(season=2024, week=8, season_type="REG")
         assert "error" not in result
         assert result["count"] > 0
 
     def test_default_sorted_by_snap_delta_desc(self):
-        result = nfl_role_trend(season=2024, week=8, limit=5)
+        result = nfl_role_trend(season=2024, week=8, limit=5, season_type="REG")
         deltas = [r["snap_pct_delta"] for r in result["role_trend"] if r["snap_pct_delta"] is not None]
         assert deltas == sorted(deltas, reverse=True)
 
     def test_min_snap_pct_filter(self):
-        result = nfl_role_trend(season=2024, week=8, min_snap_pct=50)
+        result = nfl_role_trend(season=2024, week=8, min_snap_pct=50, season_type="REG")
         for r in result["role_trend"]:
             assert r["snap_pct"] >= 50
 
     def test_filter_by_player_team_position(self):
-        result = nfl_role_trend(player="Kelce", team="KC", position="TE", season=2024)
+        result = nfl_role_trend(player="Kelce", team="KC", position="TE", season=2024, season_type="REG")
         assert "error" not in result
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):
-            result = nfl_role_trend(season=2024)
+            result = nfl_role_trend(season=2024, season_type="REG")
         assert "boom" in result["error"]
 
 
@@ -617,31 +637,31 @@ class TestNflRoleTrend:
 @pytest.mark.usefixtures("require_db")
 class TestNflSeparationOpportunity:
     def test_no_filters_returns_results(self):
-        result = nfl_separation_opportunity()
+        result = nfl_separation_opportunity(season_type="REG")
         assert "error" not in result
         assert result["count"] > 0
 
     def test_regression_candidate_filter(self):
-        result = nfl_separation_opportunity(regression_candidate=True)
+        result = nfl_separation_opportunity(regression_candidate=True, season_type="REG")
         for r in result["separation_opportunity"]:
             assert r["regression_candidate"] is True
 
     def test_pre_2016_season_guarded(self):
-        result = nfl_separation_opportunity(season=2015)
+        result = nfl_separation_opportunity(season=2015, season_type="REG")
         assert "error" in result
         assert "2016" in result["error"]
 
     def test_filter_by_player_team_position(self):
-        result = nfl_separation_opportunity(player="Jefferson", team="MIN", position="WR", season=2024)
+        result = nfl_separation_opportunity(player="Jefferson", team="MIN", position="WR", season=2024, season_type="REG")
         assert "error" not in result
 
-    def test_invalid_limit_falls_back(self):
-        result = nfl_separation_opportunity(limit="oops")
-        assert "error" not in result
+    def test_invalid_limit_returns_error(self):
+        result = nfl_separation_opportunity(limit="oops", season_type="REG")
+        assert result["code"] == "INVALID_ARGUMENT"
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):
-            result = nfl_separation_opportunity(season=2024)
+            result = nfl_separation_opportunity(season=2024, season_type="REG")
         assert "boom" in result["error"]
 
 
@@ -649,32 +669,32 @@ class TestNflSeparationOpportunity:
 @pytest.mark.usefixtures("require_db")
 class TestNflDropRate:
     def test_filter_by_season(self):
-        result = nfl_drop_rate(season=2024)
+        result = nfl_drop_rate(season=2024, season_type="REG")
         assert "error" not in result
         assert result["count"] > 0
 
     def test_default_sorted_highest_drop_rate_first(self):
-        result = nfl_drop_rate(season=2024, min_targets=30, limit=5)
+        result = nfl_drop_rate(season=2024, min_targets=30, limit=5, season_type="REG")
         rates = [r["drop_rate_pct"] for r in result["drop_rate"] if r["drop_rate_pct"] is not None]
         assert rates == sorted(rates, reverse=True)
 
     def test_pre_2022_season_guarded(self):
-        result = nfl_drop_rate(season=2021)
+        result = nfl_drop_rate(season=2021, season_type="REG")
         assert "error" in result
         assert "2022" in result["error"]
 
     def test_min_targets_filter(self):
-        result = nfl_drop_rate(season=2024, min_targets=40)
+        result = nfl_drop_rate(season=2024, min_targets=40, season_type="REG")
         for r in result["drop_rate"]:
             assert r["catchable_targets"] >= 40
 
     def test_filter_by_player_and_team(self):
-        result = nfl_drop_rate(player="Pollard", team="TEN", season=2024)
+        result = nfl_drop_rate(player="Pollard", team="TEN", season=2024, season_type="REG")
         assert "error" not in result
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):
-            result = nfl_drop_rate(season=2024)
+            result = nfl_drop_rate(season=2024, season_type="REG")
         assert "boom" in result["error"]
 
 
@@ -682,31 +702,31 @@ class TestNflDropRate:
 @pytest.mark.usefixtures("require_db")
 class TestNflContractValue:
     def test_no_filters_returns_results(self):
-        result = nfl_contract_value(season=2024)
+        result = nfl_contract_value(season=2024, season_type="REG")
         assert "error" not in result
         assert result["count"] > 0
 
     def test_default_sorted_best_value_first(self):
-        result = nfl_contract_value(season=2024, min_apy=2, limit=5)
+        result = nfl_contract_value(season=2024, min_apy=2, limit=5, season_type="REG")
         vals = [r["fp_per_million"] for r in result["contract_value"] if r["fp_per_million"] is not None]
         assert vals == sorted(vals, reverse=True)
 
     def test_apy_range_filter(self):
-        result = nfl_contract_value(season=2024, min_apy=5, max_apy=10)
+        result = nfl_contract_value(season=2024, min_apy=5, max_apy=10, season_type="REG")
         for r in result["contract_value"]:
             assert 5 <= r["apy"] <= 10
 
     def test_filter_by_player_team_position(self):
-        result = nfl_contract_value(player="Gibbs", team="DET", position="RB", season=2024)
+        result = nfl_contract_value(player="Gibbs", team="DET", position="RB", season=2024, season_type="REG")
         assert "error" not in result
 
-    def test_invalid_limit_falls_back(self):
-        result = nfl_contract_value(season=2024, limit="oops")
-        assert "error" not in result
+    def test_invalid_limit_returns_error(self):
+        result = nfl_contract_value(season=2024, limit="oops", season_type="REG")
+        assert result["code"] == "INVALID_ARGUMENT"
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):
-            result = nfl_contract_value(season=2024)
+            result = nfl_contract_value(season=2024, season_type="REG")
         assert "boom" in result["error"]
 
 
@@ -737,9 +757,9 @@ class TestNflInjuryReturn:
                           "avg_snap_pct_recovery", "median_snap_pct_recovery", "sample_size"):
                 assert field in row
 
-    def test_invalid_limit_falls_back(self):
+    def test_invalid_limit_returns_error(self):
         result = nfl_injury_return(injury_type="hamstring", limit="oops")
-        assert "error" not in result
+        assert result["code"] == "INVALID_ARGUMENT"
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):
@@ -749,11 +769,11 @@ class TestNflInjuryReturn:
 
 class TestInputValidation:
     def test_invalid_stat_type(self):
-        result = nfl_player_stats(player_name="Mahomes", stat_type="kicking")
+        result = nfl_player_stats(player="Mahomes", stat_type="kicking", season_type="REG")
         assert "error" in result
 
-    def test_invalid_compare_type(self):
-        result = nfl_compare(entity1="KC", entity2="BAL", compare_type="coach")
+    def test_mixed_compare_pair(self):
+        result = nfl_compare(player1="Mahomes", team2="BAL", season_type="REG")
         assert "error" in result
 
 
@@ -799,7 +819,7 @@ class TestNflTeamRecords:
              "wins": 5, "losses": 11, "ties": 0, "source": "espn"},
         ]
         with patch("nfl_mcp.tools._execute", return_value=rows):
-            result = nfl_team_records(team="IND", from_season=1970, to_season=1985)
+            result = nfl_team_records(team="IND", season_from=1970, season_to=1985)
         assert [row["club"] for row in result["records"]] == [
             "Baltimore Colts", "Indianapolis Colts",
         ]
@@ -807,7 +827,7 @@ class TestNflTeamRecords:
 
     def test_range_filters_are_passed_as_parameters(self):
         with patch("nfl_mcp.tools._execute", return_value=[]) as execute:
-            nfl_team_records(team="LV", from_season=1970, to_season=1980)
+            nfl_team_records(team="LV", season_from=1970, season_to=1980)
         # The first call is the records query; a pre-1999 miss also reads the ingest log.
         sql, params = execute.call_args_list[0][0]
         assert "season >= ?" in sql and "season <= ?" in sql
@@ -826,13 +846,15 @@ class TestNflTeamRecords:
         with patch("nfl_mcp.tools._execute", return_value=[]):
             result = nfl_team_records(team="GB", season=1996)
         assert result["status"] == "record_not_available"
-        assert "--pre1999" in result["reason"]
+        # v0.7.3: names the optional ESPN pull, not a command the container user cannot run.
+        assert "optional ESPN data pull" in result["reason"]
+        assert "nfl-mcp" not in result["reason"]
 
     def test_missing_modern_record_makes_no_pull_suggestion(self):
         with patch("nfl_mcp.tools._execute", return_value=[]):
             result = nfl_team_records(team="GB", season=2024)
         assert result["status"] == "record_not_available"
-        assert "pre1999" not in result["reason"]
+        assert "ESPN" not in result["reason"]
 
     def test_database_errors_are_returned(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("no table team_records")):
@@ -866,7 +888,7 @@ class TestNflTeamRecordsIntegration:
     def test_season_range_is_clipped_to_the_bounds(self):
         # CI ingests one season, so assert what a range must always guarantee rather than
         # assuming the database spans it.
-        bounded = nfl_team_records(team="PHI", from_season=2000, to_season=2024)["records"]
+        bounded = nfl_team_records(team="PHI", season_from=2000, season_to=2024)["records"]
         assert bounded
         assert {row["season"] for row in bounded} <= set(range(2000, 2025))
         assert all(row["team"] == "PHI" for row in bounded)

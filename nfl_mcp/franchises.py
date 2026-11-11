@@ -126,7 +126,7 @@ def canonical_team(value: str) -> str | None:
     Returns None for anything unrecognised, so callers can surface a clean error instead
     of silently querying a team that does not exist.
     """
-    if not value:
+    if not value or not isinstance(value, str):
         return None
     code = value.strip().upper()
     if code in FRANCHISES:
@@ -134,11 +134,13 @@ def canonical_team(value: str) -> str | None:
     return _ALIASES.get(code)
 
 
-def franchise_codes(value: str) -> tuple[str, ...] | None:
-    """Every abbreviation the franchise behind `value` is stored under, canonical first.
+def team_codes(value: str) -> tuple[str, ...] | None:
+    """Every abbreviation a franchise has been stored under: the current key first, then aliases.
 
+    "OAK", "oak" and "LV" all give ("LV", "OAK"), so a filter finds a team in every era.
     Tables keep the code of the era (`OAK` through 2019, `LV` after), so a filter that
-    must return the whole franchise matches all of these.  None when `value` is unknown.
+    must return the whole franchise matches all of these. Returns None for anything
+    unrecognised.
     """
     key = canonical_team(value)
     if key is None:
@@ -147,8 +149,13 @@ def franchise_codes(value: str) -> tuple[str, ...] | None:
 
 
 def suggest_teams(value: str, limit: int = 3) -> list[str]:
-    """Canonical codes that look like `value`, closest first, for an "unknown team" error."""
-    code = (value or "").strip().upper()
+    """Canonical codes that look like `value`, closest first, for an "unknown team" error.
+
+    A value that is not a string (a model can send 12) gets no suggestions.
+    """
+    if not isinstance(value, str):
+        return []
+    code = value.strip().upper()
     known = sorted(set(FRANCHISES) | set(_ALIASES))
     matches = difflib.get_close_matches(code, known, n=limit * 2, cutoff=0.5)
     suggestions: list[str] = []

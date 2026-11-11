@@ -68,7 +68,8 @@ Notes on the updater:
 - **A refresh only publishes a database it trusts.** One run at a time holds a lock, a second
   overlapping run skips, and a run stops before the swap when `/data` lacks free space, when the
   new slot has a leftover `.wal` beside it, or when `validate_db.sh` finds no rows in `plays` or
-  `schedules`. A run that loaded no data exits 1, so the swap never happens.
+  `schedules`. An ingest that fails in any other way than a partial load (exit 3) stops the
+  run before the swap.
 - **If the scheduler fails to start, the container log says so once.** `entrypoint.sh` looks for
   `supercronic` two seconds after launching it and prints `[cron] WARNING: supercronic is not
   running. The database will not refresh on schedule.` The server starts anyway.
@@ -169,6 +170,9 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (Claude
 nfl-mcp init               Interactive setup wizard
 nfl-mcp serve              Start the MCP server (Streamable HTTP, default port 8000)
 nfl-mcp ingest             Load NFL data into the database
+nfl-mcp rebuild            Rebuild the derived tables from the loaded data (no download)
+nfl-mcp validate           Check a database file before it replaces the active one
+nfl-mcp upgrade            Bring an older database up to the current schema
 nfl-mcp setup-client       Configure IDE MCP clients
 nfl-mcp doctor             Health check
 ```
@@ -205,15 +209,118 @@ Bowl. The current season is computed from today's date, so a new season is picke
 automatically.
 
 Every run ends with a **run summary**: how many loads landed, came back short, stored nothing, or
-failed, then up to ten of the seasons that stored nothing with the reason. The command exits 1
-when every fetch in the run failed, which is the pattern that says the database gained nothing.
-Some failures are ordinary, so a run where only some fetches failed exits 0: play-by-play for a
-new season does not exist before Week 1, so it fails on every run from March to September. Pass
-`--strict` to exit 1 when any single fetch failed instead.
+failed, then up to ten of the seasons that stored nothing with the reason. The exit codes are in
+the table below. A run where every fetch failed also prints that the database gained nothing.
+Pass `--strict` to exit 3 on any failed fetch, even with `--allow-failures`.
 
 Each load records its own outcome in `_ingest_metadata`, with a short reason when it stored
 nothing, so `nfl_status` and `nfl_catalog` can report a failed season instead of staying quiet
 about it.
+
+Exit codes of `nfl-mcp ingest`:
+
+| Code | Meaning |
+|---|---|
+| 0 | Every requested dataset loaded, or `--allow-failures` was given without `--strict` and some data loaded. |
+| 3 | The run finished, but some datasets or seasons failed to load. Each failed one keeps the rows it had before. `--failures-file PATH` writes them to a file, one per line. |
+| 1 | The run stopped with an error, for example when no play-by-play season could be fetched. |
+| 2 | A usage error, for example an unknown dataset name. |
+
+In the container, `update_db.sh` goes on to the schema upgrade and the validation when the
+ingest exits 3. It logs one `WARNING` line that names the failed datasets. On any other
+non-zero exit it stops and keeps the active slot.
+
+### Upgrade an older database
+
+```bash
+nfl-mcp upgrade [--db PATH] [--check] [--no-fetch]
+```
+
+The database records a schema version. A database with no record is version 0. That is
+every database built by v0.4.0 or earlier. `nfl-mcp upgrade` finds what an older database
+lacks and fixes it. It never deletes the file. It runs three steps in this order:
+
+1. Rebuild the derived tables. This needs no network.
+2. Fill the `season` column of `depth_charts`. This downloads data.
+3. Reload any raw table that lacks a column the tools need. This downloads data. When this
+   step runs, the command rebuilds the derived tables once more afterward, because they
+   are built from the raw tables.
+
+The command stamps the current version only when nothing is left to do. Running it twice is
+safe.
+
+| Option | Effect |
+|---|---|
+| `--db PATH` | Upgrade this file. The default is the configured database. |
+| `--check` | Change nothing. Print one line per step (`ok`, `NEEDED`, or `NEEDED (network)`) and the version. |
+| `--no-fetch` | Run the steps that need no network. List the others as pending. |
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | The database is up to date. |
+| 3 | An upgrade is needed. With `--no-fetch`, only steps that need the network are left. |
+| 1 | An error, a failed step, or a database newer than this version of nfl-mcp. |
+
+A missing file is an error. The command never creates one. The upgrade writes to the file.
+In the container, the active slot is read-only on purpose. Run `update_db.sh` instead. It
+upgrades the new slot before it swaps.
+
+`nfl-mcp serve` checks the database at start and logs one warning when an upgrade is
+needed. It keeps running. `nfl-mcp doctor` prints the schema version and the steps that are
+needed. `nfl-mcp validate` fails a database file whose version is not the current one.
+
+## Configuration
+
+Every setting is an environment variable. All are optional.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `NFL_MCP_DB_PATH` | `~/.nfl-mcp/nflread.duckdb` (`/data/nflread.duckdb` in the container) | Path of the DuckDB file. It overrides the path in the config file. |
+| `NFL_MCP_DUCKDB_MEMORY_LIMIT` | DuckDB default (`512MB` in the container) | Memory cap for every DuckDB connection. Use a number and a unit, such as `512MB` or `2GiB`. A bad value stops `serve` with exit code 1. |
+| `NFL_MCP_DUCKDB_THREADS` | DuckDB default (`1` in the container) | Thread cap. Use a positive whole number. A bad value stops `serve` with exit code 1. |
+| `NFL_MCP_DUCKDB_TEMP_DIR` | DuckDB default (`/tmp/.duckdb_spill` in the container) | Writable directory where DuckDB spills a large query to disk. |
+| `NFL_MCP_AUTH_TOKEN` | unset | When set, every request needs `Authorization: Bearer <token>`. See Security below. |
+| `NFL_MCP_CORS_ORIGINS` | unset (all origins) | Comma-separated list of origins allowed to call the server from a browser. |
+| `NFL_MCP_MAX_CONCURRENT_QUERIES` | `2` | How many tool calls run at once. A bad value logs a warning and the default applies. |
+| `NFL_MCP_QUERY_TIMEOUT_SECONDS` | `10` | Seconds a query may run before the server cancels it. The server reads it on every call. A bad value logs a warning and the default applies. |
+| `NFL_MCP_UPGRADE_ON_START` | on | Container only. Set to `0` to turn off the upgrade check at start. See below. |
+
+**Upgrade on start.** When the container starts, `entrypoint.sh` runs
+`nfl-mcp upgrade --check` on the active database. If an upgrade is needed, it starts one
+background `update_db.sh` run and does not wait for it. The server starts either way. The
+update builds a new, upgraded copy in the idle slot and swaps it in. Set
+`NFL_MCP_UPGRADE_ON_START=0` to skip the check.
+
+## Security
+
+The server is read-only. It binds to localhost unless you say otherwise.
+
+- **Bind address.** `nfl-mcp serve` listens on `127.0.0.1`. Pass `--host 0.0.0.0` to accept
+  other machines. The container does this on purpose.
+- **Bearer token.** Set `NFL_MCP_AUTH_TOKEN` and every request needs the header
+  `Authorization: Bearer <token>`. That includes `/healthz`. Without a token, the server has
+  no authentication, so set one before you expose it beyond localhost. A token that is only
+  whitespace stops `serve` with exit code 1.
+- **CORS.** Set `NFL_MCP_CORS_ORIGINS` to limit which browser origins can connect. When it
+  is unset, the server allows every origin and logs a warning.
+- **Container user.** The container runs the server and the updater as the non-root user
+  `nflmcp`.
+
+### Read-only guards
+
+- Each query opens a new read-only connection. Nothing in the server writes to the
+  database it serves.
+- The connection turns off file and network access, extension install, and extension
+  autoload. Functions that read files, and the statements `COPY`, `ATTACH`, `INSTALL`,
+  `LOAD`, and `SET`, all fail. The connection locks its configuration after it opens.
+- `nfl_query` takes one statement per call. The statement must be a `SELECT` (a `WITH`
+  query, `DESCRIBE`, or `SUMMARIZE` also counts) or `EXPLAIN` of a `SELECT`. The tool
+  rejects every other statement type.
+- `nfl_query` returns at most 500 rows. Every tool stops a query after the timeout above.
+- Every tool carries the MCP annotations `readOnlyHint: true`, `destructiveHint: false`,
+  `idempotentHint: true`, and `openWorldHint: false`.
 
 ## Datasets
 
@@ -273,10 +380,11 @@ family so any data a client might need is already there. The single exception is
 | `team_records` | 1970–present once both sources are loaded (derived) |
 
 > Older seasons are thinner than modern ones. Play-by-play carries `epa`, `wp`, and
-> `shotgun` from 1999, but tracking-derived data (Next Gen Stats, FTN charting), snap
-> counts, and weekly depth only exist from their respective start years above — so any
-> query that spans decades mixes eras of very different column coverage. Rosters before
-> 1966 are available with `--start 1920` and cover the pre-merger leagues.
+> `shotgun` from 1999. Next Gen Stats come from player tracking and start in 2016. FTN
+> charting is manual charting by FTN staff. It is not tracking data, and it starts in
+> 2022. Snap counts and weekly depth also start in their own years, listed above. A query
+> that spans decades mixes eras with very different column coverage. Rosters before 1966
+> are available with `--start 1920` and cover the pre-merger leagues.
 
 ```bash
 nfl-mcp ingest                 # load the full nflverse family (default)
@@ -343,37 +451,61 @@ SELECT season, team, wins, losses, ties FROM team_records WHERE season = 1972 AN
 
 ## MCP Tools
 
-| Tool | Description |
-|------|-------------|
-| `nfl_schema` | Database schema reference — compact summary by default, pass `category` for detail |
-| `nfl_status` | Database health: play counts, loaded seasons, and every loaded dataset with its row count and last refresh. Lists `issues`: loads that failed, stored no rows, or stored an incomplete season |
-| `nfl_query` | Raw SQL SELECT for custom queries (`max_rows` capped at 500, 10s timeout, read-only, cannot read files) |
-| `nfl_search_plays` | Find plays by player, team, season, season type, situation, touchdowns, etc. |
-| `nfl_team_stats` | Pre-aggregated team offense, defense, and situational stats |
-| `nfl_player_stats` | Player stats by season and season type — passing, rushing, or receiving |
-| `nfl_compare` | Side-by-side comparison of two teams or two players |
-| `nfl_schedule` | Game schedule and results — scores, spread, weather, coaches |
-| `nfl_team_records` | Final season win-loss records per franchise, 1970–present (1970–1998 needs `--pre1999`) |
-| `nfl_roster` | Team roster by season and position |
-| `nfl_injuries` | Player injury report status by team, week, and designation |
-| `nfl_snap_counts` | Offensive, defensive, and special teams snap counts per player |
-| `nfl_fantasy_opportunity` | Target share, air yards share, carry share, and expected fantasy points per player per week (2006–present) |
-| `nfl_fantasy_rankings` | Expert consensus rankings (ECR) — draft/dynasty/best-ball (`scope=draft`) or current-week start/sit (`scope=week`) |
-| `nfl_ftn_charting` | Aggregated FTN charting tendencies (2022–present) over scrimmage plays — play-action, RPO, screen, no-huddle, motion, trick-play rates, plus box/pass-rush/blitz counts |
-| `nfl_td_luck` | Actual vs expected touchdowns per player-season — surfaces TD-regression candidates (most "unlucky" first) |
-| `nfl_role_trend` | Rolling 3-week snap / target / carry / air-yards share with current-week delta — usage trending up or down |
-| `nfl_separation_opportunity` | Next Gen Stats separation/YAC joined to fantasy opportunity (2016+) — flags receivers getting open but under-producing |
-| `nfl_drop_rate` | Catchable-target drop rate per receiver-season from FTN charting (2022+), plus contested targets and created receptions |
-| `nfl_contract_value` | Fantasy points per $M of average per year (APY) — best value-for-money players |
-| `nfl_injury_return` | Post-return snap-share recovery (% of pre-injury baseline) at +1..+8 weeks, by normalized injury type and position |
-| `nfl_catalog` | Every dataset in the ingest log, with row counts, the seasons it has, `missing_seasons`, `issues`, and last refresh |
+A required argument is marked "(required)". The tools that take `season_type` require it.
+Pass REG, POST or ALL. Some tools also accept a playoff round code (WC, DIV, CON, SB).
+A `player` name matches exactly, ignoring case, accents, punctuation and a Jr/Sr/II suffix.
+It matches the full name, the last name or the short name (`P.Mahomes`). Part of a name
+matches nobody. If a name matches several players, the tool returns the candidates with
+their `gsis_id` and no rows. Call the tool again with `player_id` set to one `gsis_id`.
+`limit` and `offset` page the tools that return many rows.
 
-Every tool answers in one of two shapes. A failure is a JSON object with `error` (the message) and
-`code` (a stable code such as `INVALID_INPUT`, `UNKNOWN_TEAM`, `OUT_OF_COVERAGE`, `TIMEOUT`, or
-`SQL_ERROR`), and the MCP result is flagged as an error. An answer that had to cut a list short
-says so with `truncated: true` next to its count. A question the loaded data cannot answer, such
-as a team the league never had or a season before the dataset starts, is a failure with a code,
-not an empty list.
+| Tool | Arguments | Description |
+|------|-----------|-------------|
+| `nfl_schema` | `category`, `table` | Database schema reference. The default call gives a summary, the verified table relationships, data notes, and the derived tables. Pass `category` for column detail or `table` for one table's columns, grain, and join keys. |
+| `nfl_status` | none | Database health: total plays, loaded seasons, and per dataset the row count, newest season, newest week, and last refresh time. Lists `issues`: loads that failed, stored no rows, or stored an incomplete season |
+| `nfl_query` | `sql` (required), `max_rows` | Raw SQL SELECT for custom queries (default 100 rows, 500 row cap, 10s timeout, read-only, cannot read files) |
+| `nfl_search_plays` | `season_type` (required), `team`, `opponent`, `player`, `player_id`, `player_role`, `season`, `season_from`, `season_to`, `week`, `play_type`, `situation`, play filters such as `down`, `qtr` and `is_touchdown`, `sort_by`, `columns`, `max_rows` | Find plays by player, team, season, season type, situation, touchdowns, etc. |
+| `nfl_team_stats` | `team` (required), `season_type` (required), `season`, `season_from`, `season_to`, `side` | Pre-aggregated team offense, defense, and situational stats, one row per team, season and season type |
+| `nfl_player_lookup` | `player` or `player_id`, `team`, `season`, `position` | Find players by name and return each candidate's `gsis_id` for the other player tools |
+| `nfl_player_stats` | `player` or `player_id`, `season_type` (required), `season`, `season_from`, `season_to`, `stat_type` | Player stats by season and season type: `games` (games with a snap or a recorded stat), passing, rushing, or receiving |
+| `nfl_compare` | `player1` and `player2`, or `team1` and `team2`; `season_type` (required), `season`, `season_from`, `season_to` | Side-by-side comparison of two teams or two players |
+| `nfl_schedule` | `season_type` (required), `team`, `season`, `week` | Game schedule and results — scores, spread, weather, coaches. `result` is the home margin (`home_score - away_score`). With `team`, each row also has `team`, `opponent`, `location` (home, away or neutral), `team_score`, `opponent_score` and `outcome` (W, L or T for that team, null before the game) |
+| `nfl_team_records` | `team`, `season`, `season_from`, `season_to` (at least one) | Season win-loss records per franchise, 1970–present (1970–1998 needs `--pre1999`), with regular-season `points_for`, `points_against` and `point_diff` (from 1999). A season in progress shows the record and points to date, and each row has `complete`. A team with a two-ended range also gets `gaps`: one entry per season with no record, with a `status` and a `reason`. |
+| `nfl_roster` | `team`, `season`, `position`, `player`, `player_id` | Team roster by season and position. `position` matches the roster position or the depth chart position. Each row has the player's `gsis_id`. |
+| `nfl_injuries` | `season_type` (required), `team`, `season`, `week`, `player`, `player_id`, `report_status`, `practice_status` | Player injury report status by team, week, and designation. Each row has the player's `gsis_id` and a `season_type` (REG or POST). |
+| `nfl_snap_counts` | `season_type` (required), `player`, `player_id`, `team`, `season`, `week`, `position` | Offensive, defensive, and special teams snap counts per player |
+| `nfl_fantasy_opportunity` | `season_type` (required), `player`, `player_id`, `team`, `season`, `week`, `position` | Target share, air yards share, carry share, and expected fantasy points per player per week (2006–present) |
+| `nfl_fantasy_rankings` | `player`, `player_id`, `position`, `team`, `scope`, `ranking_set` | Expert consensus rankings (ECR) — redraft, dynasty and weekly sets (`scope=draft`) or current-week start/sit (`scope=week`). `team=FA` lists free agents. |
+| `nfl_ftn_charting` | `season_type` (required), `team`, `opponent`, `player`, `player_id`, `season`, `season_from`, `season_to`, `week` | Aggregated FTN charting tendencies (2022–present) over scrimmage plays — play-action, RPO, screen, no-huddle, motion, trick-play rates, plus box/pass-rush/blitz counts |
+| `nfl_td_luck` | `season_type` (required), `player`, `player_id`, `position`, `team`, `season` | Actual vs expected touchdowns per player, season, and season type. It surfaces TD-regression candidates (most "unlucky" first). `season_type` is required: REG, POST or ALL. ALL returns the REG rows and the POST rows as separate rows, labeled by `season_type`. |
+| `nfl_role_trend` | `season_type` (required), `player`, `player_id`, `position`, `team`, `season`, `week`, `min_snap_pct` | Rolling 3-week snap / target / carry / air-yards share with current-week delta — usage trending up or down |
+| `nfl_separation_opportunity` | `season_type` (required), `player`, `player_id`, `position`, `team`, `season`, `regression_candidate` | Next Gen Stats separation/YAC joined to fantasy opportunity (2016+) — flags receivers getting open but under-producing |
+| `nfl_drop_rate` | `season_type` (required), `player`, `player_id`, `team`, `season`, `min_targets` | Catchable-target drop rate per receiver, team, season, and season type from FTN charting (2022+), plus contested targets and created receptions. `season_type` is required: REG, POST or ALL. ALL returns the REG rows and the POST rows as separate rows, labeled by `season_type`. |
+| `nfl_contract_value` | `season_type` (required), `player`, `player_id`, `position`, `team`, `season`, `min_apy`, `max_apy` | Fantasy points per $M of average per year (APY) — best value-for-money players |
+| `nfl_injury_return` | `injury_type`, `position`, `week_post_return` | Post-return snap-share recovery (% of pre-injury baseline) at +1..+8 weeks, by injury bucket and position |
+| `nfl_catalog` | none | Every table with its grain (what one row is), live row count, first and last season, join keys, derived flag, and last load time. Each dataset also lists `missing_seasons` and `issues` from the ingest log |
+
+### What every response carries
+
+- **One failure shape.** A failure is a JSON object with `error` (the message) and `code` (a
+  stable code such as `INVALID_ARGUMENT`, `UNKNOWN_TEAM`, `OUT_OF_COVERAGE`, `TIMEOUT`, or
+  `SQL_ERROR`), and the MCP result is flagged as an error. A team the league never had and a
+  season before the dataset starts are failures with a code, not empty lists. A season after
+  the loaded data is answered with no rows and a `reason`.
+- **`truncated`.** A tool that caps its rows says `truncated: true` next to its count when
+  more rows matched than it returned.
+
+- **`data_as_of`.** Every tool response includes `data_as_of`, an ISO 8601 UTC time. It is
+  the newest load time of the tables that tool read. `nfl_schedule` reports the load time of
+  `schedules` only. The server reads these times once per database file and caches them. A
+  swap to a new database file, or a new load into the same file, refreshes the value. Error
+  responses carry it too.
+- **Structured output.** Each result is a JSON object. The MCP response sends it in
+  `structuredContent` and as text. No tool declares an `outputSchema`. The mcpo proxy
+  removes every result field that an `outputSchema` does not list.
+- **Resources.** Clients that read MCP resources can read `nfl://schema`,
+  `nfl://relationships`, and `nfl://data-notes`. They can also read `nfl://schema/<table>`,
+  for example `nfl://schema/plays`. These hold the same facts as `nfl_schema`.
 
 ## Key columns in `plays`
 
@@ -398,6 +530,13 @@ pytest -m unit     # unit tests
 pytest -m integration  # integration tests (requires loaded DB)
 ```
 
+Two dependencies have an upper bound in `pyproject.toml`. `duckdb` stays below 2, because a
+new major version can change SQL behavior and the file format. `nflreadpy` stays below 0.2,
+because a 0.x minor release can rename a loader or change its arguments. Each ingest records
+the installed `nflreadpy` version in the `nflreadpy_version` column of `_ingest_metadata`.
+Derived tables and the ESPN pull have no version, so that column is empty for them. A
+database built before this column existed gets it at the next ingest.
+
 ## Troubleshooting
 
 - `nfl-mcp doctor` is the fastest way to verify config, database, and client setup.
@@ -406,9 +545,9 @@ pytest -m integration  # integration tests (requires loaded DB)
 - Re-running `nfl-mcp ingest` is safe. It skips seasons whose rows are in the database, and
   re-fetches the current season, the static tables, and any season last loaded before it ended.
 - Stats for a game usually appear in nflverse within a few hours; play-by-play is rebuilt overnight and official stat corrections land midweek. Locally, run `nfl-mcp ingest` after that; in the container, the scheduled updater does it (log: `/var/log/nflmcp/nfl_update.log`).
-- In the container, `nfl_status`'s `last_refreshed` shows which data the endpoint is serving. If
-  it never advances, the updater is not running. Check that `ENTRYPOINT` is `/entrypoint.sh` and
-  that `/data/nflread.duckdb` is a symlink to `nflread_a.duckdb` or `nflread_b.duckdb`.
+- Every tool response has `data_as_of`. `nfl_status` shows the newest season, newest week, and last refresh time of each dataset.
+- If `nfl-mcp serve` logs a warning that the database needs an upgrade, run `nfl-mcp upgrade`. Use `--check` first to see what it would do.
+- In the container, `nfl_status`'s `last_refreshed` shows which data the endpoint is serving. If it never advances, the updater is not running — check that `ENTRYPOINT` is `/entrypoint.sh` and that `/data/nflread.duckdb` is a symlink to `nflread_a.duckdb` or `nflread_b.duckdb`.
 
 ## License
 

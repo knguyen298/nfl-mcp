@@ -170,8 +170,11 @@ class TestSharedValidator:
         assert 'sh "$VALIDATE_DB" "$TARGET"' in updater
         assert 'if ! sh "$VALIDATE_DB" "$TARGET"; then' in updater
         # One copy of the table list: the callers ask, the validator knows what it checks.
-        assert "plays" not in updater
-        assert "schedules" not in updater
+        # Merge: main's comments mention plays, so only code lines are checked.
+        code = "\n".join(line for line in updater.splitlines()
+                         if not line.lstrip().startswith("#"))
+        assert "plays" not in code
+        assert "schedules" not in code
 
     def test_validator_is_copied_into_both_images(self):
         for name in ("Dockerfile", "Dockerfile.dev"):
@@ -207,7 +210,8 @@ class TestEntrypoint:
         # every start would serve the older slot after an update, and a restart during
         # an in-place rewrite of slot A would serve a half-written file.
         entrypoint = _read("entrypoint.sh")
-        guard = '[ -L "$SYMLINK" ] && [ -e "$SYMLINK" ]'
+        # Merge: written as "missing or dangling" so main's guard test reads it too.
+        guard = '[ ! -L "$SYMLINK" ] || [ ! -e "$SYMLINK" ]'
         assert guard in entrypoint
         # The guard decides first; the re-link to slot A belongs to the repair branch.
         assert entrypoint.index(guard) < entrypoint.index('ln -sfn "$(basename "$SLOT_A")"')
@@ -331,14 +335,15 @@ class TestUpdateScript:
     def test_locks_one_run_at_a_time_before_it_reads_the_link(self):
         script = _read("update_db.sh")
 
-        assert 'LOCK_FILE="$DB_DIR/.update.lock"' in script
-        assert 'exec 9>"$LOCK_FILE"' in script
+        # Merge: main's lock is on the /data directory itself, so no lock file can be left
+        # behind owned by another user.
+        assert 'exec 9<"$DB_DIR"' in script
         assert "flock -n 9" in script
         # The lock has to be held before the script works out which slot it will delete.
         assert script.index("flock -n 9") < script.index('CURRENT=$(readlink "$SYMLINK")')
         assert script.index("flock -n 9") < script.index('rm -f "$TARGET"')
         # A skipped overlap is not a failure, so the cron log stays quiet about it.
-        assert 'Another update is running, skipping this one"\n    exit 0' in script
+        assert 'Another update is already running; skipping this run."\n    exit 0' in script
         # Debian ships flock(1) in util-linux, an Essential package, so the slim image has
         # it. If it is ever missing, failing beats every later run reporting a skip.
         assert "command -v flock" in script
@@ -349,7 +354,10 @@ class TestUpdateScript:
     def test_accepts_only_the_two_slot_names_and_checks_the_active_file(self):
         script = _read("update_db.sh")
 
-        assert 'case "$CURRENT" in' in script
+        # Merge: an if/elif chain (main's tests read the first test), with no catch-all
+        # branch that picks a slot: any other value ends the run.
+        assert 'if [ "$CURRENT" = "nflread_a.duckdb" ]; then' in script
+        assert 'elif [ "$CURRENT" = "nflread_b.duckdb" ]; then' in script
         assert "unexpected active link" in script
         assert "is not a regular file" in script
         # Both guards decide before the idle slot is deleted, so a rejected run removes
@@ -357,7 +365,10 @@ class TestUpdateScript:
         # where a hand-made link would have the live database deleted.
         for guard in ("unexpected active link", "is not a regular file"):
             assert script.index(guard) < script.index('rm -f "$TARGET"')
-        assert 'if [ "$CURRENT" = "nflread_a.duckdb" ]' not in script
+        chain = script[script.index('if [ "$CURRENT" = "nflread_a.duckdb" ]'):]
+        chain = chain[:chain.index("\nfi\n")]
+        assert chain.count("TARGET=") == 2
+        assert chain.index("else\n") < chain.index("unexpected active link") < chain.index("exit 1")
 
 
 # ── build workflow: what triggers it, and what it accepts ───────────────────────
@@ -467,10 +478,14 @@ def test_update_scripts_parse_as_posix_shell():
 # These run the actual scripts with the container paths rewritten to a temp dir and
 # nfl-mcp / supercronic stubbed on PATH.
 
+# Only `ingest` writes the database; `validate` exits with $STUB_VALIDATE_EXIT (default 0).
 _NFL_MCP_STUB = (
     '#!/bin/sh\n'
     'echo "[stub nfl-mcp $*]"\n'
-    'if [ -n "${NFL_MCP_DB_PATH:-}" ]; then printf INGESTED > "$NFL_MCP_DB_PATH"; fi\n'
+    'if [ "${1:-}" = validate ]; then exit "${STUB_VALIDATE_EXIT:-0}"; fi\n'
+    'if [ "${1:-}" = ingest ] && [ -n "${NFL_MCP_DB_PATH:-}" ]; then\n'
+    '    printf INGESTED > "$NFL_MCP_DB_PATH"\n'
+    'fi\n'
 )
 
 # A tool that writes some bytes and then dies, standing in for a copy or an ingest
@@ -592,18 +607,22 @@ def _sim(tmp_path, *, with_seed=True, existing_baked=False):
     return entrypoint_path, updater_path, data, bin_dir
 
 
-def _run_raw(script, bin_dir, env_extra=None):
+def _env(bin_dir, env_extra=None, **extra_env):
+    """Inherited environment minus NFL_MCP_DB_PATH, so a stub can never write to a path the
+    outer test run exported."""
+    env = {k: v for k, v in os.environ.items() if k != "NFL_MCP_DB_PATH"}
+    return {**env, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            **(env_extra or {}), **extra_env}
+
+
+def _run_raw(script, bin_dir, env_extra=None, **extra_env):
     """Run a script and hand back the result, for the paths expected to fail."""
-    env = {
-        **os.environ,
-        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-        **(env_extra or {}),
-    }
-    return subprocess.run(["sh", str(script)], capture_output=True, text=True, env=env)
+    return subprocess.run(["sh", str(script)], capture_output=True, text=True,
+                          env=_env(bin_dir, env_extra, **extra_env))
 
 
-def _run(script, bin_dir, env_extra=None):
-    result = _run_raw(script, bin_dir, env_extra)
+def _run(script, bin_dir, env_extra=None, **extra_env):
+    result = _run_raw(script, bin_dir, env_extra, **extra_env)
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout
 
@@ -639,9 +658,23 @@ def _hold_lock(data):
     Returns the open handle; closing it releases the lock, the same way the kernel
     releases it when the updater dies.
     """
-    handle = open(data / ".update.lock", "a")
-    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    handle = _DirLock(os.open(data, os.O_RDONLY))   # the script locks the directory itself
+    try:
+        fcntl.flock(handle.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise
     return handle
+
+
+class _DirLock:
+    """An open descriptor on a directory. Closing it releases a flock taken on it."""
+
+    def __init__(self, fd):
+        self.fd = fd
+
+    def close(self):
+        os.close(self.fd)
 
 
 def _lock_is_free(data):
@@ -806,13 +839,69 @@ class TestContainerLifecycle:
         assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
         assert (data / "nflread_b.duckdb").exists()
 
+    def test_updater_makes_the_new_slot_read_only_and_can_reuse_it(self, tmp_path):
+        entrypoint, updater, data, bin_dir = _sim(tmp_path)
+        _run(entrypoint, bin_dir)
+
+        _run(updater, bin_dir)
+        assert (data / "nflread_b.duckdb").stat().st_mode & 0o222 == 0
+
+        # B is now active and read-only; the next pass copies it into A and must still write.
+        _run(updater, bin_dir)
+        assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
+        assert (data / "nflread_a.duckdb").read_text() == "INGESTED"
+
+    def test_updater_keeps_the_active_slot_when_validation_fails(self, tmp_path):
+        entrypoint, updater, data, bin_dir = _sim(tmp_path)
+        _run(entrypoint, bin_dir)
+        result = subprocess.run(["sh", str(updater)], capture_output=True, text=True,
+                                env=_env(bin_dir, STUB_VALIDATE_EXIT="1"))
+
+        assert result.returncode != 0
+        assert "validation failed" in result.stdout
+        assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
+        assert (data / "nflread_a.duckdb").read_text() == "SEED_V1"
+
+    def test_restart_after_an_update_keeps_the_swapped_slot(self, tmp_path):
+        entrypoint, updater, data, bin_dir = _sim(tmp_path)
+        _run(entrypoint, bin_dir)
+        _run(updater, bin_dir)
+
+        _run(entrypoint, bin_dir)
+        assert os.readlink(data / "nflread.duckdb") == "nflread_b.duckdb"
+
+    def test_cold_ingest_tolerates_failed_datasets(self, tmp_path):
+        entrypoint, _, _, bin_dir = _sim(tmp_path, with_seed=False)
+        assert "[stub nfl-mcp ingest --allow-failures]" in _run(entrypoint, bin_dir)
+
     def test_updater_refuses_to_run_without_the_symlink(self, tmp_path):
         _, updater, data, bin_dir = _sim(tmp_path)
-        env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
-        result = subprocess.run(["sh", str(updater)], capture_output=True, text=True, env=env)
+        result = subprocess.run(["sh", str(updater)], capture_output=True, text=True,
+                                env=_env(bin_dir))
 
         assert result.returncode != 0
         assert "is not a symlink" in result.stdout
+
+    def test_second_update_skips_while_another_holds_the_lock(self, tmp_path):
+        # A cron run that overlaps the boot-time update must not touch the idle slot.
+        import fcntl
+
+        entrypoint, updater, data, bin_dir = _sim(tmp_path)
+        _run(entrypoint, bin_dir)
+        fd = os.open(data, os.O_RDONLY)   # the script locks the directory itself
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            out = _run(updater, bin_dir)   # exits 0, like a run with nothing to do
+
+            assert "Another update is already running" in out
+            assert "[stub nfl-mcp" not in out
+            assert not (data / "nflread_b.duckdb").exists()
+            assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
+        finally:
+            os.close(fd)
+        # Lock released: the next run proceeds.
+        _run(updater, bin_dir)
+        assert os.readlink(data / "nflread.duckdb") == "nflread_b.duckdb"
 
     def test_updater_skips_while_another_run_holds_the_lock(self, tmp_path):
         # Two crontab entries, or cron plus a manual `docker exec`, otherwise pick the
@@ -828,7 +917,7 @@ class TestContainerLifecycle:
             holder.close()
 
         assert result.returncode == 0                      # an overlap is not a failure
-        assert "Another update is running" in result.stdout
+        assert "Another update is already running" in result.stdout
         assert os.readlink(data / "nflread.duckdb") == link   # nothing swapped
         assert _slots(data) == slots                        # nothing deleted or copied
         assert not (data / "nflread_b.duckdb").exists()
@@ -1046,3 +1135,53 @@ class TestContainerLifecycleKeepsServing:
         assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
         assert (data / "nflread_a.duckdb").read_text() == "SEED_V1"
         assert _lock_is_free(data)
+
+
+class TestRootStartDropsPrivileges:
+    """entrypoint.sh started as root chowns a foreign-owned /data, then re-runs as nflmcp.
+
+    Nothing runs as root: `id`, `find`, `chown` and `setpriv` are stubs. The `find` stub reports
+    the directory itself as foreign-owned unless the owner is nflmcp.
+    """
+
+    @staticmethod
+    def _stubs(bin_dir, tmp_path, *, owner):
+        log = tmp_path / "calls.log"
+        stubs = {
+            "id": '[ "$1" = -u ] && echo 0\n',
+            "find": f'[ {owner} = nflmcp ] || echo "$1"\n',
+            "chown": 'echo "chown $*" >> "$CALL_LOG"\n',
+            "setpriv": 'echo "setpriv $*" >> "$CALL_LOG"\n',
+        }
+        for name, body in stubs.items():
+            (bin_dir / name).write_text("#!/bin/sh\n" + body)
+            (bin_dir / name).chmod(0o755)
+        return log
+
+    def test_foreign_owner_is_chowned_then_script_reruns_as_nflmcp(self, tmp_path):
+        entrypoint, _, data, bin_dir = _sim(tmp_path)
+        log = self._stubs(bin_dir, tmp_path, owner="root")
+        out = _run(entrypoint, bin_dir, CALL_LOG=str(log))
+
+        calls = log.read_text().splitlines()
+        assert calls == [
+            f"chown -R nflmcp:nflmcp {data}",
+            f"setpriv --reuid=nflmcp --regid=nflmcp --init-groups {entrypoint}",
+        ]
+        assert "changing owner" in out
+        # The stub setpriv does not re-run the script, so nothing below the drop executed.
+        assert "[serve started]" not in out
+        assert not (data / "nflread.duckdb").exists()
+
+    def test_correct_owner_is_not_chowned_again(self, tmp_path):
+        entrypoint, _, _, bin_dir = _sim(tmp_path)
+        log = self._stubs(bin_dir, tmp_path, owner="nflmcp")
+        _run(entrypoint, bin_dir, CALL_LOG=str(log))
+
+        calls = log.read_text().splitlines()
+        assert len(calls) == 1 and calls[0].startswith("setpriv --reuid=nflmcp")
+
+    def test_non_root_start_skips_the_drop(self, tmp_path):
+        entrypoint, _, data, bin_dir = _sim(tmp_path)
+        out = _run(entrypoint, bin_dir)   # real `id -u` is not 0 here
+        assert "[serve started]" in out and "changing owner" not in out

@@ -18,15 +18,16 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=1.0,<2",
-    "duckdb>=1.0",
+    "duckdb>=2.0,<3",
     "pyarrow>=14.0",
-    "nflreadpy>=0.1",
+    "nflreadpy>=0.1.5,<0.2",
     "polars>=0.20",
     "click>=8.0",
     "tqdm>=4.0",
     "starlette>=0.27",
     "uvicorn>=0.20",
     "sse-starlette>=1.6",
+    "pytz",
 ]
 
 [project.optional-dependencies]

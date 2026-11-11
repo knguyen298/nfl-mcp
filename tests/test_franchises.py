@@ -12,7 +12,7 @@ from nfl_mcp.franchises import (
     era_name,
     expected_franchise_count,
     expected_games,
-    franchise_codes,
+    team_codes,
     schedule_alias_case,
     suggest_teams,
 )
@@ -137,10 +137,10 @@ class TestFranchiseCodes:
         ("HOU", ("HOU",)),           # the Texans; the Oilers are TEN
     ])
     def test_every_code_of_the_franchise(self, raw, expected):
-        assert franchise_codes(raw) == expected
+        assert team_codes(raw) == expected
 
     def test_unknown_returns_none(self):
-        assert franchise_codes("ZZZ") is None
+        assert team_codes("ZZZ") is None
 
 
 class TestSuggestTeams:
@@ -151,6 +151,8 @@ class TestSuggestTeams:
     def test_nothing_close_and_empty_input(self):
         assert suggest_teams("XYZ") == []
         assert suggest_teams("") == []
+        assert suggest_teams(12) == []
+        assert suggest_teams(None) == []
 
     def test_never_repeats_a_franchise(self):
         # OAK and LV both look like "OA"; the franchise is offered once.
