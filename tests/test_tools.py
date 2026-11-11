@@ -172,13 +172,12 @@ class TestNflTeamStats:
 
     def test_unknown_team_is_an_unknown_team_error(self):
         # Was an empty success; a mistyped team now says so instead of "no data".
+        # The group H check: an unknown code is an error, not an empty answer.
         result = nfl_team_stats(team="ZZZ", season=2024, season_type="REG")
         assert result["code"] == "UNKNOWN_TEAM"
         assert result["error"].startswith("Unknown team 'ZZZ'")
-    def test_invalid_team_returns_error(self):
-        result = nfl_team_stats(team="ZZZ", season=2024, season_type="REG")
-        assert result["code"] == "UNKNOWN_TEAM"  # group H: an unknown code is an error
         assert "offense" not in result
+        assert "defense" not in result
 
 
 @pytest.mark.integration
@@ -330,8 +329,11 @@ class TestNflRoster:
 
     def test_unknown_team_is_an_unknown_team_error(self):
         # Was an empty success; a mistyped team now says so instead of "no data".
+        # The group H check: an unknown code is an error, not an empty answer.
         result = nfl_roster(team="ZZZ", season=2024)
         assert result["code"] == "UNKNOWN_TEAM"
+        assert result["error"].startswith("Unknown team 'ZZZ'")
+        assert "players" not in result
 
     def test_former_code_returns_the_same_franchise_rows(self):
         # OAK is the Raiders' code before 2020; it must reach the LV rows, and the other
@@ -340,10 +342,6 @@ class TestNflRoster:
         former = nfl_roster(team="OAK", season=2024)
         assert current["count"] > 0
         assert former["players"] == current["players"]
-    def test_unknown_team_returns_error(self):
-        result = nfl_roster(team="ZZZ", season=2024)
-        assert result["code"] == "UNKNOWN_TEAM"  # group H: an unknown code is an error
-        assert "players" not in result
 
 
 @pytest.mark.integration
@@ -454,6 +452,7 @@ class TestNflFantasyOpportunity:
         result = nfl_fantasy_opportunity(season=2005, season_type="REG")
         assert result["code"] == "OUT_OF_COVERAGE"
         assert result["first_season"] == 2006
+
     def test_future_season_returns_dict(self):
         result = nfl_fantasy_opportunity(season=2099, season_type="REG")
         assert isinstance(result, dict)
@@ -557,15 +556,11 @@ class TestNflFtnCharting:
 
     def test_valid_question_with_no_matching_plays_stays_empty(self):
         # A team never has the ball against itself: understood, and truly empty.
+        # Merge: 1999 is before FTN coverage and is refused (test above), so the empty
+        # answer is asked with a question that is in coverage and matches nothing.
         result = nfl_ftn_charting(team="KC", opponent="KC", season=2024, season_type="REG")
         assert result["charting"] == {} and result["total_plays"] == 0
         assert "error" not in result
-    def test_no_matching_plays_returns_empty(self):
-        # Merge: 1999 is before FTN coverage and is now OUT_OF_COVERAGE (test above), so the
-        # empty answer is asked with a question that is in coverage and matches nothing.
-        result = nfl_ftn_charting(team="KC", opponent="KC", season=2024, season_type="REG")
-        assert result["total_plays"] == 0
-        assert result["charting"] == {}
 
 
 @pytest.mark.integration

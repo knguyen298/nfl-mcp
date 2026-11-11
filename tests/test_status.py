@@ -142,12 +142,12 @@ class TestAvailabilityReturnsMembers:
 
 class TestErrorPayloadsKeepTheOldStrings:
     # An exception that escaped a tool reaches _tool_error_payload. UNKNOWN_TOOL and an
-    # unknown argument are written by call_tool before the tool runs (_error_payload). The
-    # merged server keeps main's mapping: a TypeError is a call that does not fit the
-    # signature, so it is INVALID_ARGUMENTS.
+    # unknown argument are written by call_tool before the tool runs (_error_payload).
+    # call_tool checks the schema and binds the arguments first, so a TypeError here came
+    # from inside the tool and is TOOL_EXECUTION_ERROR.
     @pytest.mark.parametrize("exc,code", [
         (TimeoutError("Query exceeded timeout"), "TIMEOUT"),
-        (TypeError("unsupported operand"), "INVALID_ARGUMENTS"),
+        (TypeError("unsupported operand"), "TOOL_EXECUTION_ERROR"),
         (RuntimeError("boom"), "TOOL_EXECUTION_ERROR"),
     ])
     def test_tool_error_payload_code(self, exc, code):

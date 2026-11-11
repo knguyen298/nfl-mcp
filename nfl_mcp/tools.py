@@ -24,7 +24,6 @@ import math
 import os
 import re
 import threading
-import time
 import unicodedata
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -285,21 +284,17 @@ def _refusals_as_errors(fn: Callable[..., Dict[str, Any]]) -> Callable[..., Dict
     return wrapper
 
 
-# ── Argument handling ──────────────────────────────────────────────────────────
-# Shared by every tool that filters on a team, a season, a week, a season type or a
-# number. A bad value raises _BadArgument; @_refusals_as_errors turns it into an error dict.
-
-
-
 # ── Fixed-value arguments and season coverage ─────────────────────────────────
 
-def _choice(param: str, value: Any, allowed: Sequence[str]) -> str:
-    """The allowed spelling of `value`, matched without regard to case.
+def _choice(param: str, value: Any, allowed: Sequence[str]) -> str | None:
+    """The allowed spelling of `value`, matched without regard to case. None stays None.
 
     An unrecognized value is refused with INVALID_ARGUMENT and the allowed list. Ignoring it
     would widen the query past what was asked, and matching it literally would return an
     empty success.
     """
+    if value is None:
+        return None
     text = str(value).strip().lower()
     for option in allowed:
         if option.lower() == text:
@@ -368,6 +363,11 @@ def _check_coverage(
     ))
 
 
+# ── Argument handling ──────────────────────────────────────────────────────────
+# Shared by every tool that filters on a team, a season, a week, a season type or a
+# number. A bad value raises _BadArgument; @_refusals_as_errors turns it into an error dict.
+
+
 def _int_arg(name: str, value: Any, minimum: int | None = None, maximum: int | None = None) -> int | None:
     """None stays None. An int, an integral float or a numeric string gives an int; 0 is a value.
 
@@ -415,13 +415,6 @@ def _bool_arg(name: str, value: Any, default: bool | None = False) -> bool | Non
     if isinstance(value, str) and value.strip().lower() in ("true", "false"):
         return value.strip().lower() == "true"
     raise _BadArgument(f"{name} must be true or false, got {value!r}")
-
-
-def _choice_arg(name: str, value: Any, allowed: Sequence[str]) -> str | None:
-    """None stays None. Otherwise a case-insensitive match against allowed, else an error."""
-    if value is None:
-        return None
-    return _choice(name, value, allowed)
 
 
 def _team_codes(value: Any, name: str = "team", required: bool = False) -> tuple[str, ...] | None:
@@ -1383,7 +1376,8 @@ def _fetch_capped(sql: str, limit: int) -> tuple[list[dict], list[dict]]:
 
     Returns (columns, rows) where columns is [{"name", "type"}]. Duplicate
     column names are made unique (a, a_1, ...) for both columns and row keys.
-    A timeout raises QueryTimeoutError.
+    A timeout raises QueryTimeoutError; _stop_timed_out_query stops the worker first, the
+    same way _execute does.
     """
     timeout = _query_timeout()
     thread_conn: list[Any] = [None]
@@ -1406,22 +1400,16 @@ def _fetch_capped(sql: str, limit: int) -> tuple[list[dict], list[dict]]:
         return future.result(timeout=timeout)
     except FuturesTimeout:
         cancelled.set()
-        interrupted = False
-        for _ in range(5):
-            conn = thread_conn[0]
-            if conn is not None:
-                try:
-                    conn.interrupt()
-                    interrupted = True
-                except (duckdb.Error, RuntimeError):
-                    logger.warning("Failed to interrupt timed out DuckDB query", exc_info=True)
-            if wait([future], timeout=0.2).done:
-                break
-            time.sleep(0.05)
+
+        def _stopped(pause: float) -> bool:
+            return wait([future], timeout=pause).done
+
+        interrupted, worker_alive = _stop_timed_out_query(
+            _PoolWorker(future), lambda: thread_conn[0], _stopped)
         raise QueryTimeoutError(
             f"Query exceeded {timeout:g} second timeout",
             interrupted=interrupted,
-            worker_alive=not future.done(),
+            worker_alive=worker_alive,
         ) from None
     finally:
         pool.shutdown(wait=False)
@@ -1508,8 +1496,8 @@ def nfl_query(sql: str, max_rows: int | None = None) -> Dict[str, Any]:
         refused with FORBIDDEN_KEYWORD. The scan reads only SQL code: string literals,
         quoted identifiers and comments are masked first (_mask_sql), so a function name
         inside a literal or a comment is fine
-      - max_rows is an int from 1 to 500; larger values are clamped to 500. Not given
-        (None): 100
+      - max_rows is an int of at least 1. A value above 500 is clamped to 500 here, and
+        the MCP schema refuses one outside 1-500 before the tool runs. Not given (None): 100
       - Query runs as written; max_rows + 1 rows are fetched to set `truncated`
       - 10-second timeout (NFL_MCP_QUERY_TIMEOUT_SECONDS overrides)
 
@@ -1688,10 +1676,10 @@ def nfl_search_plays(
         ("season", season), ("season_from", season_from), ("season_to", season_to)))
     week, min_yards, down, qtr = (_int_arg(n, v) for n, v in (
         ("week", week), ("min_yards", min_yards), ("down", down), ("qtr", qtr)))
-    play_type = _choice_arg("play_type", play_type, _PLAY_TYPES)
-    situation = _choice_arg("situation", situation, tuple(_SITUATIONS))
-    role = _choice_arg("player_role", player_role, tuple(_ROLE_COLUMNS))
-    sort_by = _choice_arg("sort_by", sort_by, tuple(_PLAY_SORTS)) or "abs_epa"
+    play_type = _choice("play_type", play_type, _PLAY_TYPES)
+    situation = _choice("situation", situation, tuple(_SITUATIONS))
+    role = _choice("player_role", player_role, tuple(_ROLE_COLUMNS))
+    sort_by = _choice("sort_by", sort_by, tuple(_PLAY_SORTS)) or "abs_epa"
     is_touchdown = _bool_arg("is_touchdown", is_touchdown)
     is_turnover = _bool_arg("is_turnover", is_turnover)
     shotgun, no_huddle = (_bool_arg(n, v, default=None) for n, v in (
@@ -1974,7 +1962,7 @@ def nfl_team_stats(
     """Get pre-aggregated team stats (offense, defense, or both) for REG, POST, or ALL games."""
     _season_type_arg(season_type)
     codes = _team_codes(team, required=True)
-    side = _choice_arg("side", "both" if side is None else side, TEAM_STAT_SIDES)
+    side = _choice("side", "both" if side is None else side, TEAM_STAT_SIDES)
     results = {}
     filters = (season, season_from, season_to, season_type)
     _team_stats_filter(*filters)  # validate before any query
@@ -2436,6 +2424,55 @@ def _record_stuck_worker(worker: Any) -> int:
         return len(_stuck_workers)
 
 
+_INTERRUPT_ATTEMPTS = 4
+_INTERRUPT_RETRY_SECONDS = 0.5
+
+
+class _PoolWorker:
+    """A thread-pool future seen as a worker thread, so the stuck-worker count can hold it."""
+
+    def __init__(self, future: Any) -> None:
+        self._future = future
+
+    def is_alive(self) -> bool:
+        return not self._future.done()
+
+
+def _stop_timed_out_query(worker: Any, get_connection: Callable[[], Any],
+                          wait: Callable[[float], bool]) -> tuple[bool, bool]:
+    """Interrupt a query that ran past its timeout and wait for its worker to stop.
+
+    `get_connection()` answers with the worker's connection, or None while it is still
+    opening one. `wait(seconds)` answers whether the worker finished. One interrupt can
+    arrive before the query starts, and then it does nothing, so the call is repeated
+    _INTERRUPT_ATTEMPTS times inside _INTERRUPT_GRACE_SECONDS.
+
+    Returns (interrupted, worker_alive). A worker still running at the end is logged with a
+    warning and counted in _stuck_workers. _execute and _fetch_capped both stop this way.
+    """
+    pause = min(_INTERRUPT_RETRY_SECONDS, _INTERRUPT_GRACE_SECONDS / _INTERRUPT_ATTEMPTS)
+    interrupted = False
+    for _ in range(_INTERRUPT_ATTEMPTS):
+        conn = get_connection()
+        if conn is not None:
+            try:
+                conn.interrupt()
+                interrupted = True
+            except Exception:
+                logger.warning("Failed to interrupt timed out DuckDB query", exc_info=True)
+        if wait(pause):
+            return interrupted, False
+    worker_alive = worker.is_alive()
+    if worker_alive:
+        running = _record_stuck_worker(worker)
+        logger.warning(
+            "Timed out DuckDB query thread is still running after interrupt "
+            "(grace %ss, interrupted=%s); %d such worker(s) running",
+            _INTERRUPT_GRACE_SECONDS, interrupted, running,
+        )
+    return interrupted, worker_alive
+
+
 def _execute(sql: str, params: Sequence[Any] | None = None) -> list[dict]:
     """Execute SQL on DuckDB with timeout and cancellation.
 
@@ -2443,8 +2480,8 @@ def _execute(sql: str, params: Sequence[Any] | None = None) -> list[dict]:
     the active query if it exceeds the timeout (_query_timeout()).
 
     On timeout it raises :class:`QueryTimeoutError`. A worker that gets its connection
-    only after the timeout does not start the query. A worker still running after the
-    grace join is logged with a warning and counted in _stuck_workers.
+    only after the timeout does not start the query. _stop_timed_out_query sends the
+    interrupts and reports the worker: one still running is logged and counted.
     """
     timeout = _query_timeout()
     result = [None]
@@ -2475,23 +2512,16 @@ def _execute(sql: str, params: Sequence[Any] | None = None) -> list[dict]:
     if t.is_alive():
         with lock:
             abandoned[0] = True
-            conn = thread_conn[0]
-        interrupted = False
-        if conn is not None:
-            try:
-                conn.interrupt()
-                interrupted = True
-            except Exception:
-                logger.warning("Failed to interrupt timed out DuckDB query", exc_info=True)
-        t.join(timeout=_INTERRUPT_GRACE_SECONDS)
-        worker_alive = t.is_alive()
-        if worker_alive:
-            running = _record_stuck_worker(t)
-            logger.warning(
-                "Timed out DuckDB query thread is still running after interrupt "
-                "(grace %ss, connected=%s, interrupted=%s); %d such worker(s) running",
-                _INTERRUPT_GRACE_SECONDS, conn is not None, interrupted, running,
-            )
+
+        def _connection() -> Any:
+            with lock:
+                return thread_conn[0]
+
+        def _stopped(pause: float) -> bool:
+            t.join(timeout=pause)
+            return not t.is_alive()
+
+        interrupted, worker_alive = _stop_timed_out_query(t, _connection, _stopped)
         raise QueryTimeoutError(
             f"Query exceeded {timeout:g} second timeout",
             interrupted=interrupted,
@@ -2527,8 +2557,13 @@ def _data_as_of(db_path: str) -> dict[str, str]:
         return cached
     try:
         with get_db_connection() as conn:
+            # A failed or an empty attempt also stamps loaded_at. Only a row whose data is
+            # in the table says how fresh that table is.
+            has_status = bool(conn.execute(_METADATA_STATUS_COLUMN_SQL).fetchall())
+            covered, params = _coverage_filter(has_status)
             rows = conn.execute(
-                "SELECT table_name, MAX(loaded_at) FROM _ingest_metadata GROUP BY table_name").fetchall()
+                f"SELECT table_name, MAX(loaded_at) FROM _ingest_metadata WHERE {covered} "
+                "GROUP BY table_name", params).fetchall()
         times = {name: _iso_utc(loaded) for name, loaded in rows if loaded is not None}
     except duckdb.CatalogException:  # no _ingest_metadata: cache the empty answer, log once
         logger.warning("data_as_of unavailable: the database has no _ingest_metadata table")
@@ -3002,7 +3037,8 @@ def nfl_team_records(
     Needs team, season or a season_from/season_to range. Teams are given by their CURRENT abbreviation, so the
     Raiders are 'LV' in every season; each row also carries `club` (the name the franchise
     played that season under), `source_team` (the code the source used) and `complete`
-    (False while the season is still being played, so the record is to date, not final).
+    (False only while the season is still being played, so the record is to date, not
+    final. A finished season is True even when a game was canceled and never replayed).
 
     A team plus a two-ended range also returns `gaps`: one entry per season in the range
     with no row, each with a `status` and `reason`, when the page holds the whole range.
@@ -3065,9 +3101,14 @@ def nfl_team_records(
         logger.error("Tool error: %s", e, exc_info=True)
         return _error_from_exception(e)
 
+    now = current_season()
     for row in rows:
         row["club"] = era_name(row["season"], row["team"])
-        row["complete"] = row.get("games") == expected_games(row["season"])
+        # A season earlier than the one in progress is over. Its game count can still fall
+        # short: the 2022 Buffalo at Cincinnati game was called off and never replayed, so
+        # both clubs finished with 16 games in a 17-game season.
+        row["complete"] = (row["season"] < now
+                           or row.get("games") == expected_games(row["season"]))
 
     result: Dict[str, Any] = {"records": rows, **page}
     if warning:

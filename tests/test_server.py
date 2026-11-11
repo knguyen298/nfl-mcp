@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import json
+import re
 
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -18,7 +19,6 @@ from nfl_mcp.status import Availability, ErrorCode
 def _call(name, arguments):
     """Call the handler function directly; returns the CallToolResult it built."""
     return asyncio.run(server_module.call_tool(name, arguments))
-from nfl_mcp.server import _error_payload, _tool_error_payload, create_app
 
 
 def test_error_payload_for_unknown_tool():
@@ -64,11 +64,12 @@ def test_error_payload_for_timeout_is_a_backstop():
     assert payload["details"]["type"] == "TimeoutError"
 
 
-def test_error_payload_for_invalid_arguments():
-    # Merge: main's mapping wins. A TypeError that escapes a tool is reported as
-    # INVALID_ARGUMENTS; the branch reported TOOL_EXECUTION_ERROR.
-    payload = _tool_error_payload("nfl_query", TypeError("missing required argument"))
-    assert payload["code"] == "INVALID_ARGUMENTS"
+def test_error_payload_for_type_error_is_an_execution_error():
+    # A TypeError that escapes a tool is a bug inside the tool. call_tool checks the
+    # schema and binds the arguments first, so a call that does not fit never gets here.
+    payload = _tool_error_payload("nfl_query", TypeError("unsupported operand"))
+    assert payload["code"] is ErrorCode.TOOL_EXECUTION_ERROR
+    assert payload["details"]["type"] == "TypeError"
 
 
 def test_every_error_code_value_is_recognised_as_an_error_body():
@@ -100,6 +101,16 @@ def test_a_string_error_is_an_error_body_whatever_its_code(result):
     assert _is_error_result(result)
     assert server_module._failure_from_result("nfl_status", result)["code"] == (
         result.get("code") or "TOOL_ERROR")
+
+
+def test_an_answer_that_holds_the_word_error_is_not_a_failure():
+    # v0.7.3's wire rule: only a top-level string `error` makes a failure. A section whose
+    # `error` value is a dict, and a list of rows one of which has a column named error, are
+    # both answers. v0.7.3 sends whatever code the tool gave, so no fixed code list decides
+    # this.
+    assert not _is_error_result({"error": {"message": "no rows"}, "rows": []})
+    assert not _is_error_result([{"error": None, "n": 1}, {"error": "boom", "n": 2}])
+    assert _is_error_result({"error": "boom", "code": ErrorCode.COLUMN_NOT_FOUND})
 
 
 # ── call_tool ──────────────────────────────────────────────────────────────────
@@ -156,8 +167,7 @@ def test_call_tool_tool_exception_returns_execution_error(monkeypatch):
     assert body["details"]["type"] == "RuntimeError"
 
 
-def test_call_tool_type_error_inside_a_tool_is_reported_as_invalid_arguments(monkeypatch):
-    # Merge: main's TypeError mapping wins over the branch's TOOL_EXECUTION_ERROR.
+def test_call_tool_type_error_inside_a_tool_is_an_execution_error(monkeypatch):
     def _buggy(sql, max_rows=100):
         return None + 1
 
@@ -165,7 +175,7 @@ def test_call_tool_type_error_inside_a_tool_is_reported_as_invalid_arguments(mon
     result = _call("nfl_query", {"sql": "SELECT 1"})
     assert result.isError is True
     body = _body(result)
-    _assert_error_shape(body, "INVALID_ARGUMENTS")
+    _assert_error_shape(body, "TOOL_EXECUTION_ERROR")
     assert body["details"]["type"] == "TypeError"
 
 
@@ -405,6 +415,15 @@ def test_dispatch_and_tools_list_the_same_names():
     assert len(server_module.TOOLS) == len(server_module._DISPATCH)
 
 
+def test_dispatch_maps_each_name_to_a_callable_in_the_module():
+    # The handler resolves a name through this module's namespace, so an entry that names
+    # nothing there, or names something that is not a function, would fail on the call.
+    namespace = vars(server_module)
+    for name, fn in server_module._DISPATCH.items():
+        assert callable(fn), name
+        assert callable(namespace.get(name)), name
+
+
 def test_every_schema_property_is_a_parameter_of_its_function():
     for tool in server_module.TOOLS:
         params = inspect.signature(server_module._DISPATCH[tool.name]).parameters
@@ -492,6 +511,29 @@ def test_season_descriptions_name_the_first_season_the_tool_refuses_below():
         description = tool.inputSchema["properties"]["season"]["description"]
         assert f"Data starts in {tools.first_season(tool.name)}" in description, tool.name
         assert "OUT_OF_COVERAGE" in description, tool.name
+
+
+_UNPUNCTUATED_JOIN = re.compile(r"[^.!?]\s+Data starts\b")
+
+
+def test_coverage_sentences_are_punctuated_and_match_the_check():
+    # tools._check_coverage refuses `season` and `season_to` before a tool's first season.
+    # It answers a range that starts earlier, so only those two descriptions may promise
+    # OUT_OF_COVERAGE. Every sentence starts a new sentence, never runs onto the text
+    # before it.
+    with_sentence = 0
+    for tool in server_module.TOOLS:
+        for name, prop in tool.inputSchema.get("properties", {}).items():
+            text = prop.get("description", "")
+            with_sentence += "Data starts" in text
+            assert not _UNPUNCTUATED_JOIN.search(text), (tool.name, name, text)
+            if "Data starts" not in text:
+                continue
+            refuses = "returns OUT_OF_COVERAGE" in text
+            assert refuses is (name in ("season", "season_to")), (tool.name, name, text)
+            if name == "season_from":
+                assert "is accepted" in text, (tool.name, text)
+    assert with_sentence
 
 
 def test_team_records_description_no_longer_promises_a_final_record():

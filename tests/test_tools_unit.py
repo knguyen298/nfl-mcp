@@ -15,7 +15,7 @@ import pytest
 
 import nfl_mcp.server as server_module
 import nfl_mcp.tools as tools
-from nfl_mcp.franchises import RECORDS_FIRST_NFLVERSE_SEASON
+from nfl_mcp.franchises import RECORDS_FIRST_NFLVERSE_SEASON, expected_games
 from nfl_mcp.registry import REGISTRY
 from nfl_mcp.status import Availability, ErrorCode
 
@@ -859,7 +859,8 @@ def test_execute_timeout_worker_still_alive_after_grace_is_logged(monkeypatch):
             tools._execute("SELECT 1")
         assert info.value.interrupted is True
         assert info.value.worker_alive is True
-        assert _DeafConn.interrupts == 1
+        # The interrupt is retried, because one can arrive before the query starts.
+        assert _DeafConn.interrupts == tools._INTERRUPT_ATTEMPTS
         assert len(tools._stuck_workers) == 1
         assert any("still running" in a[0] for a in warnings)
     finally:
@@ -910,6 +911,97 @@ def test_record_stuck_worker_prunes_finished_threads(monkeypatch):
     alive.is_alive = lambda: True
     assert tools._record_stuck_worker(alive) == 1
     assert tools._stuck_workers == [alive]
+
+
+class _Rows:
+    """Result stand-in for `_fetch_capped`: one column, one row."""
+
+    description = [("n", "INTEGER")]
+
+    def fetchmany(self, size):
+        return [(1,)]
+
+    def fetchall(self):
+        return [(1,)]
+
+
+class _StubConn:
+    """Connection whose query stops on the `stops_on`-th interrupt (never, when None)."""
+
+    def __init__(self, stops_on=None):
+        self.release = threading.Event()
+        self.interrupts = 0
+        self.stops_on = stops_on
+
+    def execute(self, *_args, **_kwargs):
+        self.release.wait(5)
+        return _Rows()
+
+    def interrupt(self):
+        self.interrupts += 1
+        if self.stops_on is not None and self.interrupts >= self.stops_on:
+            self.release.set()
+
+
+def _stub_connection(monkeypatch, conn):
+    @contextmanager
+    def factory():
+        yield conn
+
+    monkeypatch.setattr(tools, "get_db_connection", factory)
+
+
+# Both timeout routines take the same steps, so both are walked through the same tests.
+TIMEOUT_PATHS = [
+    ("_execute", lambda: tools._execute("SELECT 1")),
+    ("_fetch_capped", lambda: tools._fetch_capped("SELECT 1", 10)),
+]
+
+
+@pytest.mark.parametrize("path,run", TIMEOUT_PATHS)
+def test_a_worker_that_ignores_every_interrupt_is_counted_on_both_paths(monkeypatch, path, run):
+    conn = _StubConn()
+    _stub_connection(monkeypatch, conn)
+    warnings = _short_timeouts(monkeypatch)
+    try:
+        with pytest.raises(tools.QueryTimeoutError) as info:
+            run()
+        assert (info.value.interrupted, info.value.worker_alive) == (True, True)
+        assert conn.interrupts == tools._INTERRUPT_ATTEMPTS
+        assert len(tools._stuck_workers) == 1
+        assert any("still running" in a[0] for a in warnings)
+    finally:
+        conn.release.set()
+    threading.Event().wait(0.5)
+    assert not any(w.is_alive() for w in tools._stuck_workers)
+
+
+@pytest.mark.parametrize("path,run", TIMEOUT_PATHS)
+def test_a_worker_that_stops_on_the_second_interrupt_is_not_counted(monkeypatch, path, run):
+    # One interrupt can arrive before the query starts, and then it does nothing. The
+    # caller keeps sending it, so a worker that answers the second one is not stuck.
+    conn = _StubConn(stops_on=2)
+    _stub_connection(monkeypatch, conn)
+    warnings = _short_timeouts(monkeypatch, grace=0.4)
+    with pytest.raises(tools.QueryTimeoutError) as info:
+        run()
+    assert (info.value.interrupted, info.value.worker_alive) == (True, False)
+    assert conn.interrupts >= 2
+    assert tools._stuck_workers == []
+    assert not any("still running" in a[0] for a in warnings)
+
+
+def test_a_query_that_finishes_in_time_needs_no_interrupt(monkeypatch):
+    conn = _StubConn()
+    conn.release.set()
+    _stub_connection(monkeypatch, conn)
+    warnings = _short_timeouts(monkeypatch)
+    assert tools._execute("SELECT 1") == [{"n": 1}]
+    assert tools._fetch_capped("SELECT 1", 10) == (
+        [{"name": "n", "type": "INTEGER"}], [{"n": 1}])
+    assert conn.interrupts == 0
+    assert warnings == []
+    assert tools._stuck_workers == []
 
 
 def test_ftn_charting_builds_all_filters(monkeypatch):
@@ -1994,15 +2086,31 @@ def test_an_unrecognized_fixed_value_is_invalid_input(monkeypatch, name, kwargs,
     assert calls == []
 
 
+def _other_case(value: str) -> str:
+    """A spelling of `value` that differs from the one the tuple holds."""
+    return value.upper() if value != value.upper() else value.lower()
+
+
 @pytest.mark.parametrize("name,kwargs,param,allowed", CHOICE_CASES)
 def test_every_fixed_value_is_accepted_in_any_case(monkeypatch, name, kwargs, param, allowed):
     # Merge: season_type is matched exactly (main's rule, _season_type_arg); every other
-    # fixed-value argument is matched without regard to case (_choice).
-    _record_calls(monkeypatch)
+    # fixed-value argument is matched without regard to case (_choice). A caller who sends
+    # another case gets the answer spelled the way the tuple spells it, which is what the
+    # database holds.
+    calls = _record_calls(monkeypatch)
     for value in allowed:
-        spelled = value if param == "season_type" else value.lower()
+        if param == "season_type":
+            assert _call(name, **{**kwargs, param: value}).get("code") is not ErrorCode.INVALID_ARGUMENT
+            continue
+        spelled = _other_case(value)
+        assert spelled != value, (param, value)  # the same spelling tests nothing
+        calls.clear()
         result = _call(name, **{**kwargs, param: spelled})
-        assert "error" not in result, (name, param, value)
+        assert "error" not in result, (name, param, spelled)
+        assert tools._choice(param, spelled, allowed) == value
+        sent = [p for _sql, params in calls for p in params if isinstance(p, str)]
+        assert spelled not in sent, (name, param, spelled)
+        assert all(p == value for p in sent if p.lower() == spelled.lower()), (name, param)
 
 
 @pytest.mark.parametrize("name,kwargs,param,allowed",
@@ -2115,6 +2223,23 @@ def test_a_declared_upper_bound_caps_the_last_season(monkeypatch):
     assert tools._last_season("nfl_team_records") == REGISTRY["espn_records"].max_season
 
 
+def test_a_start_before_the_floor_reaches_the_query(monkeypatch):
+    # What the season_from description promises. _check_coverage refuses a season or a
+    # season_to below the floor only, so an earlier start reaches the query unchanged and
+    # the rows begin at the first season the database holds.
+    calls = _record_calls(monkeypatch)
+    floor = tools.first_season("nfl_search_plays")
+    result = tools.nfl_search_plays(season_from=floor - 20, season_type="REG")
+    assert "error" not in result
+    ranged = [call for call in calls if "season >= ?" in call[0]]
+    assert ranged, calls
+    assert all(floor - 20 in params for _sql, params in ranged)
+    # The same season at the end of the range is refused, which is what season_to says.
+    refused = tools.nfl_search_plays(season_to=floor - 20, season_type="REG")
+    assert refused["code"] is ErrorCode.OUT_OF_COVERAGE
+    assert refused["first_season"] == floor
+
+
 # ── nfl_team_records: gaps, completeness, and an empty answer ─────────────────
 
 def test_team_range_reports_one_gap_per_missing_season(monkeypatch):
@@ -2204,6 +2329,25 @@ def test_a_season_with_rows_carries_no_status(monkeypatch):
     result = tools.nfl_team_records(season=2024)
     assert "status" not in result
     assert result["records"][0]["complete"] is True
+
+
+def test_a_finished_season_is_complete_when_a_game_was_canceled(monkeypatch):
+    # The 2022 Buffalo at Cincinnati game was called off and never replayed, so both clubs
+    # finished 16 games in a 17-game season. The season is over, so its record is final.
+    monkeypatch.setattr(tools, "current_season", lambda: 2025)
+    rows = [{"season": 2022, "team": "BUF", "source_team": "BUF", "games": 16, "source": "nflverse"}]
+    _record_calls(monkeypatch, rows)
+    row = tools.nfl_team_records(team="BUF", season=2022)["records"][0]
+    assert row["complete"] is True
+
+
+def test_the_in_progress_season_is_complete_only_at_its_full_count(monkeypatch):
+    monkeypatch.setattr(tools, "current_season", lambda: 2025)
+    rows = [{"season": 2025, "team": "KC", "source_team": "KC", "games": 7, "source": "nflverse"}]
+    _record_calls(monkeypatch, rows)
+    assert tools.nfl_team_records(team="KC", season=2025)["records"][0]["complete"] is False
+    rows[0]["games"] = expected_games(2025)
+    assert tools.nfl_team_records(team="KC", season=2025)["records"][0]["complete"] is True
 
 
 # ── nfl_compare: notes, and two names for one entity ──────────────────────────
@@ -2393,7 +2537,7 @@ def test_a_failed_newest_season_read_leaves_the_status_without_it(monkeypatch):
 
 
 def test_an_unknown_argument_skips_the_coverage_check_and_reaches_the_tool():
-    """A call that does not fit the signature is not refused for coverage. The tool raises
-    TypeError itself, and the server reports that as INVALID_ARGUMENTS."""
+    """A call that does not fit the signature is not refused for coverage. The tool itself
+    raises TypeError, and call_tool refuses that call with INVALID_ARGUMENTS before it."""
     with pytest.raises(TypeError):
         tools.nfl_team_stats(team="KC", season=2024, season_type="REG", bogus=1)

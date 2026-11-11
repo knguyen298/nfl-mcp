@@ -136,8 +136,10 @@ def get_tool_limiter() -> anyio.CapacityLimiter:
 # `details`. The server writes the same shape for the failures outside a tool: an unknown
 # name, arguments that are not an object or that the tool does not take, and an exception
 # a tool did not catch.
-
-_ERROR_CODES = frozenset(member.value for member in ErrorCode)
+#
+# A failure is told from an answer by _is_error_result, not by a code list: a tool can
+# return a plain message with no code, and nfl_query can return a row that has a column
+# named error.
 
 
 def _error_payload(code: ErrorCode, message: str, /, **details: Any) -> dict[str, Any]:
@@ -148,13 +150,13 @@ def _error_payload(code: ErrorCode, message: str, /, **details: Any) -> dict[str
 def _tool_error_payload(tool_name: str, exc: Exception) -> dict[str, Any]:
     """The failure body for an exception that escaped a tool.
 
-    TimeoutError is a backstop: every tool catches it from _execute and returns a TIMEOUT
-    body itself. A TypeError is a call that does not fit the signature.
+    call_tool already checked the input schema and bound the arguments, so a TypeError
+    here came from inside the tool. It gets TOOL_EXECUTION_ERROR like any other escaped
+    exception. TimeoutError is a backstop: every tool catches it from _execute and returns
+    a TIMEOUT body itself.
     """
     if isinstance(exc, TimeoutError):
         code = ErrorCode.TIMEOUT
-    elif isinstance(exc, TypeError):
-        code = ErrorCode.INVALID_ARGUMENTS
     else:
         code = ErrorCode.TOOL_EXECUTION_ERROR
     return _error_payload(code, str(exc), tool=tool_name, type=type(exc).__name__)
@@ -340,8 +342,9 @@ TOOLS = [
             "The plays column desc (the play description) is an SQL keyword: quote it as "
             "\"desc\". An unknown column returns did_you_mean, taken from the tables the "
             "statement reads. Returns the rows of the statement as written; a truncated "
-            "result has a hint. max_rows 1-500 (default 100; larger values are clamped to "
-            "500). 10s timeout."
+            "result has a hint. max_rows 1-500 (default 100). The schema refuses a value "
+            "outside that range. A direct Python call clamps a larger value to 500. "
+            "10s timeout."
         ),
         inputSchema={
             "type": "object",
@@ -1183,15 +1186,36 @@ for _tool in TOOLS:
 
 
 # A season before a tool's first season is refused with OUT_OF_COVERAGE (tools._check_coverage).
-# The sentence takes the floor from the same registry lookup, so it cannot drift from the check.
+# A range that starts earlier is answered: the query keeps the caller's start, so its rows
+# begin at the first season that has data. Each sentence takes the floor from the same
+# registry lookup, so it cannot drift from the check.
+_COVERAGE_SENTENCE = {
+    "season": " Data starts in {first}. An earlier season returns OUT_OF_COVERAGE.",
+    "season_to": " Data starts in {first}. A range that ends earlier returns OUT_OF_COVERAGE.",
+    "season_from": (
+        " Data starts in {first}. A start before that is accepted, and the answer begins at"
+        " the first season that has data."
+    ),
+}
+
+
+def _append_sentence(description: str, sentence: str) -> str:
+    """Add `sentence` to `description`, ending the sentence before it first."""
+    text = description.rstrip()
+    if text and not text.endswith((".", "!", "?")):
+        text += "."
+    return text + sentence
+
+
 for _tool in TOOLS:
     _first = first_season(_tool.name) if _tool.name in _COVERAGE else None
     if _first is None:
         continue
-    for _name in ("season", "season_from", "season_to"):
+    for _name, _sentence in _COVERAGE_SENTENCE.items():
         _prop = _tool.inputSchema.get("properties", {}).get(_name)
         if _prop:
-            _prop["description"] += f" Data starts in {_first}; an earlier season returns OUT_OF_COVERAGE."
+            _prop["description"] = _append_sentence(
+                _prop["description"], _sentence.format(first=_first))
 
 
 # Every list tool pages the same way. The tool returns count, truncated and, when more
@@ -1331,6 +1355,11 @@ def _as_of_database() -> str | None:
     return _as_of(None)
 
 
+# The table names every tool the handler answers. It is a contract, not the lookup: the
+# handler reads the function out of this module's namespace by name, so a name rebound
+# after import (a test patch, or a wrapper) is the one that runs. Two tests keep the table
+# honest: test_dispatch_and_tools_list_the_same_names and
+# test_dispatch_maps_each_name_to_a_callable_in_the_module.
 _DISPATCH: dict[str, Callable[..., Any]] = {
     "nfl_schema":       nfl_schema,
     "nfl_status":       nfl_status,

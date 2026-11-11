@@ -763,7 +763,7 @@ class TestDataAsOf:
         resolved = str(db.resolve())
         tools._AS_OF_CACHE[(resolved, 1, 1)] = {"old": "stale"}
         loaded = dt.datetime(2024, 1, 1, 12, tzinfo=dt.timezone.utc)
-        conn = SimpleNamespace(execute=lambda sql: SimpleNamespace(fetchall=lambda: [("plays", loaded)]))
+        conn = SimpleNamespace(execute=lambda sql, params=None: SimpleNamespace(fetchall=lambda: [("plays", loaded)]))
         monkeypatch.setattr(tools, "get_db_connection", _connection_factory(conn))
         assert tools._data_as_of(str(db)) == {"plays": "2024-01-01T12:00:00.000000Z"}
         assert list(tools._AS_OF_CACHE.values()) == [{"plays": "2024-01-01T12:00:00.000000Z"}]
