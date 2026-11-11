@@ -7,11 +7,14 @@ from nfl_mcp.franchises import (
     FRANCHISES,
     RECORDS_FIRST_SEASON,
     availability,
+    before_records_coverage,
     canonical_team,
     era_name,
     expected_franchise_count,
     expected_games,
+    franchise_codes,
     schedule_alias_case,
+    suggest_teams,
 )
 
 
@@ -23,6 +26,7 @@ class TestCanonicalTeam:
         ("STL", "LA"),          # St. Louis -> Los Angeles Rams
         ("LAR", "LA"),          # ESPN's modern Rams code
         ("WSH", "WAS"),         # ESPN's older Washington code
+        ("JAC", "JAX"),         # FantasyPros' Jaguars code
         (" HOU ", "HOU"),       # whitespace tolerated
     ])
     def test_resolves_source_codes(self, raw, expected):
@@ -122,3 +126,37 @@ class TestAliasSql:
 
     def test_passes_unmatched_codes_through(self):
         assert "ELSE team END" in schedule_alias_case("team")
+
+
+class TestFranchiseCodes:
+    @pytest.mark.parametrize("raw,expected", [
+        ("LV", ("LV", "OAK")),
+        ("oak", ("LV", "OAK")),      # an alias returns the whole franchise, canonical first
+        ("SD", ("LAC", "SD")),
+        ("KC", ("KC",)),
+        ("HOU", ("HOU",)),           # the Texans; the Oilers are TEN
+    ])
+    def test_every_code_of_the_franchise(self, raw, expected):
+        assert franchise_codes(raw) == expected
+
+    def test_unknown_returns_none(self):
+        assert franchise_codes("ZZZ") is None
+
+
+class TestSuggestTeams:
+    def test_close_codes_resolve_to_canonical_keys(self):
+        assert suggest_teams("KCC") == ["KC"]
+        assert "LV" in suggest_teams("LVR")
+
+    def test_nothing_close_and_empty_input(self):
+        assert suggest_teams("XYZ") == []
+        assert suggest_teams("") == []
+
+    def test_never_repeats_a_franchise(self):
+        # OAK and LV both look like "OA"; the franchise is offered once.
+        suggestions = suggest_teams("OA", limit=5)
+        assert len(suggestions) == len(set(suggestions))
+
+
+def test_before_records_coverage_is_what_availability_returns():
+    assert availability("GB", 1965) == before_records_coverage()

@@ -17,7 +17,10 @@ they can live in the repo even though the records themselves are fetched from ES
 
 from __future__ import annotations
 
+import difflib
 from dataclasses import dataclass, field
+
+from .status import Availability
 
 # Records coverage boundaries.  RECORDS_FIRST_SEASON is the first merged-era season with
 # a single 26-team league; ESPN's archive supplies final records from here to 1998, and
@@ -72,7 +75,8 @@ FRANCHISES: dict[str, Franchise] = {f.key: f for f in (
     Franchise("HOU", "Houston Texans", 34, first_season=2002),
     Franchise("IND", "Indianapolis Colts", 11, first_season=1953,
               eras=((1953, "Baltimore Colts"), (1984, "Indianapolis Colts"))),
-    Franchise("JAX", "Jacksonville Jaguars", 30, first_season=1995),
+    # FantasyPros (the ff_rankings tables) still files the Jaguars as JAC.
+    Franchise("JAX", "Jacksonville Jaguars", 30, aliases=("JAC",), first_season=1995),
     Franchise("KC", "Kansas City Chiefs", 12, first_season=1960,
               eras=((1960, "Dallas Texans"), (1963, "Kansas City Chiefs"))),
     Franchise("LA", "Los Angeles Rams", 14, aliases=("STL", "LAR", "RAM"), first_season=1937,
@@ -130,6 +134,31 @@ def canonical_team(value: str) -> str | None:
     return _ALIASES.get(code)
 
 
+def franchise_codes(value: str) -> tuple[str, ...] | None:
+    """Every abbreviation the franchise behind `value` is stored under, canonical first.
+
+    Tables keep the code of the era (`OAK` through 2019, `LV` after), so a filter that
+    must return the whole franchise matches all of these.  None when `value` is unknown.
+    """
+    key = canonical_team(value)
+    if key is None:
+        return None
+    return (key, *FRANCHISES[key].aliases)
+
+
+def suggest_teams(value: str, limit: int = 3) -> list[str]:
+    """Canonical codes that look like `value`, closest first, for an "unknown team" error."""
+    code = (value or "").strip().upper()
+    known = sorted(set(FRANCHISES) | set(_ALIASES))
+    matches = difflib.get_close_matches(code, known, n=limit * 2, cutoff=0.5)
+    suggestions: list[str] = []
+    for match in matches:
+        key = canonical_team(match)
+        if key not in suggestions:
+            suggestions.append(key)
+    return suggestions[:limit]
+
+
 def era_name(season: int, team: str) -> str | None:
     """The club's name in `season` ("Baltimore Colts" for 1970), or None if unknown."""
     franchise = FRANCHISES.get(canonical_team(team) or "")
@@ -167,26 +196,31 @@ def availability(team: str, season: int) -> dict | None:
     """
     key = canonical_team(team)
     if key is None:
-        return {"status": "unknown_team", "reason": f"Unknown team '{team}'."}
+        return {"status": Availability.UNKNOWN_TEAM, "reason": f"Unknown team '{team}'."}
     franchise = FRANCHISES[key]
     if season < franchise.first_season:
         return {
-            "status": "franchise_not_yet_active",
+            "status": Availability.FRANCHISE_NOT_YET_ACTIVE,
             "reason": f"{franchise.name} did not exist until {franchise.first_season}.",
             "first_season": franchise.first_season,
         }
     if season in franchise.inactive:
         return {
-            "status": "franchise_inactive",
+            "status": Availability.FRANCHISE_INACTIVE,
             "reason": f"{franchise.name} did not play in {season}.",
         }
     if season < RECORDS_FIRST_SEASON:
-        return {
-            "status": "before_coverage",
-            "reason": f"Team records start in {RECORDS_FIRST_SEASON}, the first merged-era season.",
-            "first_season": RECORDS_FIRST_SEASON,
-        }
+        return before_records_coverage()
     return None
+
+
+def before_records_coverage() -> dict:
+    """The answer for a season before the records floor, with or without a team."""
+    return {
+        "status": Availability.BEFORE_COVERAGE,
+        "reason": f"Team records start in {RECORDS_FIRST_SEASON}, the first merged-era season.",
+        "first_season": RECORDS_FIRST_SEASON,
+    }
 
 
 def schedule_alias_case(column: str = "source_team") -> str:
