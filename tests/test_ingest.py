@@ -2201,6 +2201,8 @@ class TestApplyDuckdbPragmas:
     def test_applies_memory_limit_threads_and_spill(self, conn, monkeypatch, tmp_path):
         monkeypatch.setenv("NFL_MCP_DUCKDB_MEMORY_LIMIT", "256MB")
         monkeypatch.setenv("NFL_MCP_DUCKDB_THREADS", "1")
+        # The fallback is what this test is about, so the variable that overrides it goes.
+        monkeypatch.delenv("NFL_MCP_DUCKDB_TEMP_DIR", raising=False)
         db_path = str(tmp_path / "sub" / "nflread.duckdb")
         _apply_duckdb_pragmas(conn, db_path)
         mem = conn.execute("SELECT current_setting('memory_limit')").fetchone()[0]
@@ -2494,9 +2496,9 @@ class TestIngestEspnRecords:
 # ── What one run says about itself ─────────────────────────────────────────────
 #
 # A run is the unit `nfl-mcp ingest` turns into an exit code, and the container's scheduled
-# refresh swaps the live database only on exit 0. These tests are what keeps the two ends of
-# that chain honest: the attempts a run collected, the summary it printed, and the fact that
-# a run that loaded nothing does not look like a run that loaded something.
+# refresh publishes a newer database only when that code lets it. These tests are what keeps
+# the two ends of that chain honest: the attempts a run collected, the summary it printed, and
+# the fact that a run that loaded nothing does not look like a run that loaded something.
 
 from contextlib import contextmanager  # noqa: E402
 

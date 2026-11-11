@@ -57,10 +57,11 @@ jobs:
       - name: Smoke test — container boots and answers the MCP endpoint
         run: |
           docker run -d --name nfl-mcp-ci -p 8000:8000 nfl-mcp:ci
-          # /mcp is the only route the server registers (create_app in nfl_mcp/server.py), so
-          # ask it what a client asks: an initialize request. A server that works answers 200.
-          # A 4xx or a 5xx means the container is up but the app is broken, so it fails here.
-          # The check this one replaced accepted any HTTP response, so it passed on an HTTP 500.
+          # The server registers two routes: /mcp for the protocol and /healthz, which reports
+          # whether the database opens. Ask /mcp what a client asks: an initialize request.
+          # A server that works answers 200. A 4xx or a 5xx means the container is up but the
+          # app is broken, so it fails here. The check this one replaced accepted any HTTP
+          # response, so it passed on an HTTP 500.
           status=1
           for attempt in $(seq 1 30); do
             code=$(curl -s -o /tmp/mcp-initialize.txt -w '%{http_code}' -m 10 -X POST \

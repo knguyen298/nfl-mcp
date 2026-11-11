@@ -210,11 +210,18 @@ def _run_depth(conn) -> None:
 
 
 def _metadata_seasons(conn, dataset_id: str) -> list[int]:
+    """Seasons the ingest log says this database holds rows for, oldest first.
+
+    A `failed` or an `empty` record is the log of an attempt that landed nothing, so it is
+    not a season to reload. Without that filter `nfl-mcp upgrade` asks for a season that
+    keeps failing, and the command exits 1 on every run while it fails.
+    """
     from . import ingest
     ingest._ensure_metadata_table(conn)
+    predicate, params = ingest._stored_rows_predicate(conn)
     return [r[0] for r in conn.execute(
         "SELECT DISTINCT season FROM _ingest_metadata WHERE dataset_id = ? AND season IS NOT NULL "
-        "ORDER BY season", [dataset_id]).fetchall()]
+        f"{predicate} ORDER BY season", [dataset_id, *params]).fetchall()]
 
 
 def _reload_pbp(conn, seasons: list[int], table_exists: bool) -> None:

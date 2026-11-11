@@ -50,7 +50,7 @@ ENV NFL_MCP_DB_PATH=/data/nflread.duckdb
 # --pre1999 is passed unconditionally so the seed carries 1970-1998 season records from
 # ESPN (about 60 requests, roughly a minute). It is build-time only: the runtime ingest in
 # entrypoint.sh and update_db.sh leaves it out, so a running container never waits on ESPN.
-# `nfl-mcp ingest` exits 3 on any fetch failure, so the bake passes --allow-failures: a season
+# `nfl-mcp ingest` exits 3 on a failed nflverse fetch, so the bake passes --allow-failures: a season
 # that fails to fetch is simply absent from the seed (the ingest prints "Ingest failed for:"
 # naming it) and the build still passes. The row check below still fails an empty seed.
 #

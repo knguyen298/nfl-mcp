@@ -317,9 +317,15 @@ class TestUpdateScript:
     def test_checks_the_new_slot_before_it_publishes_it(self):
         script = _read("update_db.sh")
 
-        # A leftover .wal means the ingest died before DuckDB closed the file.
-        assert 'if [ -e "$TARGET.wal" ]' in script
+        # A leftover .wal means the ingest died before DuckDB closed the file. One guard sits
+        # right after the ingest, before the upgrade can replay the file, and one sits again
+        # before the swap, after the steps that also write to the slot.
+        assert script.count('if [ -e "$TARGET.wal" ]') == 2
         assert "did not close the database cleanly" in script
+        ingest = script.index('NFL_MCP_DB_PATH="$TARGET" nfl-mcp ingest')
+        upgrade = script.index('NFL_MCP_DB_PATH="$TARGET" nfl-mcp upgrade')
+        guards = [i for i in range(len(script)) if script.startswith('if [ -e "$TARGET.wal" ]', i)]
+        assert ingest < guards[0] < upgrade < guards[1]
         assert script.index('if [ -e "$TARGET.wal" ]') < script.index('ln -sfn "$(basename "$TARGET")"')
         # Validation and both WAL guards decide before the swap.
         assert script.index('sh "$VALIDATE_DB" "$TARGET"') < script.index('ln -sfn "$(basename "$TARGET")"')
@@ -442,7 +448,7 @@ class TestBuildWorkflow:
         assert "docker logs nfl-mcp-ci" in step
 
     def test_smoke_step_probes_only_endpoints_the_server_serves(self):
-        # No invented health endpoint: /mcp is the one route create_app registers.
+        # No invented health endpoint: every URL the step probes is a Route create_app makes.
         routes = set(re.findall(r'Route\("(/[^"]*)"', _read("nfl_mcp/server.py")))
         assert routes, "no routes found in nfl_mcp/server.py"
 
@@ -505,6 +511,29 @@ _INGEST_LEAVES_A_WAL = (
     '#!/bin/sh\n'
     'printf INGESTED > "$NFL_MCP_DB_PATH"\n'
     'printf WAL > "$NFL_MCP_DB_PATH.wal"\n'
+)
+
+# Same, and every `nfl-mcp` call is written to $STUB_CALL_LOG, so a test can see how far the
+# updater got before it stopped.
+_INGEST_LEAVES_A_WAL_AND_LOGS_CALLS = (
+    '#!/bin/sh\n'
+    'if [ -n "${STUB_CALL_LOG:-}" ]; then echo "$1" >> "$STUB_CALL_LOG"; fi\n'
+    'if [ "${1:-}" = ingest ]; then\n'
+    '    printf INGESTED > "$NFL_MCP_DB_PATH"\n'
+    '    printf WAL > "$NFL_MCP_DB_PATH.wal"\n'
+    'fi\n'
+)
+
+# An ingest that closes cleanly and an upgrade that does not: the upgrade opens the slot for
+# writing, so this is the one step between the ingest guard and the swap that can leave a WAL.
+_UPGRADE_LEAVES_A_WAL = (
+    '#!/bin/sh\n'
+    'if [ "${1:-}" = ingest ] && [ -n "${NFL_MCP_DB_PATH:-}" ]; then\n'
+    '    printf INGESTED > "$NFL_MCP_DB_PATH"\n'
+    'fi\n'
+    'if [ "${1:-}" = upgrade ]; then\n'
+    '    printf WAL > "${NFL_MCP_DB_PATH:-/dev/null}.wal"\n'
+    'fi\n'
 )
 
 # Disk space is measured with du/df, so both are stubbed: a test then reasons about
@@ -1074,6 +1103,37 @@ class TestContainerLifecycleKeepsServing:
         assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
         assert (data / "nflread_a.duckdb").read_text() == "SEED_V1"
         assert (data / "nflread_b.duckdb.wal").exists()
+
+    def test_the_wal_guard_runs_before_the_schema_upgrade(self, tmp_path):
+        """`nfl-mcp upgrade` opens the slot for writing, and that replays and deletes the WAL.
+
+        A guard after the upgrade cannot tell that the ingest never closed its file: by then
+        the evidence is gone. So the updater must refuse the run right after the ingest, and
+        must not spend the upgrade on a slot it will not publish.
+        """
+        entrypoint, updater, data, bin_dir = _sim(tmp_path)
+        _run(entrypoint, bin_dir)
+        _stub_tool(bin_dir, "nfl-mcp", _INGEST_LEAVES_A_WAL_AND_LOGS_CALLS)
+        calls = tmp_path / "calls.log"
+
+        result = _run_raw(updater, bin_dir, STUB_CALL_LOG=str(calls))
+
+        assert result.returncode != 0
+        assert "nflread_b.duckdb.wal exists after the ingest" in result.stdout
+        assert calls.read_text().split() == ["ingest"]     # the upgrade was never asked
+        assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
+
+    def test_a_wal_the_upgrade_left_also_blocks_the_swap(self, tmp_path):
+        """The second guard stays, because the upgrade writes to the slot too."""
+        entrypoint, updater, data, bin_dir = _sim(tmp_path)
+        _run(entrypoint, bin_dir)
+        _stub_tool(bin_dir, "nfl-mcp", _UPGRADE_LEAVES_A_WAL)
+
+        result = _run_raw(updater, bin_dir)
+
+        assert result.returncode != 0
+        assert "nflread_b.duckdb.wal exists after the schema upgrade" in result.stdout
+        assert os.readlink(data / "nflread.duckdb") == "nflread_a.duckdb"
 
     def test_updater_clears_debris_from_a_crashed_run(self, tmp_path):
         # Without this, the files one crash left behind would block every later update: the

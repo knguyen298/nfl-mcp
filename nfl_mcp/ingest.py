@@ -33,6 +33,7 @@ from .registry import (
     PBP_DATASET_ID,
     PBP_LOADER_FN,
     PBP_TABLE_NAME,
+    REGISTRY,
     SOURCE_ESPN,
     SOURCE_NFLREADPY,
 )
@@ -63,11 +64,17 @@ def _apply_duckdb_pragmas(conn: duckdb.DuckDBPyConnection, db_path: str) -> None
     database into a Docker image) while local runs keep DuckDB's defaults:
       NFL_MCP_DUCKDB_MEMORY_LIMIT  e.g. '5GB'
       NFL_MCP_DUCKDB_THREADS       e.g. '2'
+      NFL_MCP_DUCKDB_TEMP_DIR      where to spill, e.g. '/tmp/.duckdb_spill'
+
+    The spill directory comes from the same variable nfl_mcp/database.py reads for a
+    read-only connection, so the image sends the spill of a query and of an ingest to one
+    place. With the variable unset the ingest spills next to the database file.
     """
     mem = os.getenv("NFL_MCP_DUCKDB_MEMORY_LIMIT")
     if mem:
         conn.execute(f"SET memory_limit='{mem}'")
-        spill = str(Path(db_path).parent / ".duckdb_spill")
+        spill = (os.getenv("NFL_MCP_DUCKDB_TEMP_DIR")
+                 or str(Path(db_path).parent / ".duckdb_spill"))
         conn.execute(f"SET temp_directory='{spill}'")
     threads = os.getenv("NFL_MCP_DUCKDB_THREADS")
     if threads:
@@ -268,6 +275,23 @@ def _ensure_metadata_table(conn: duckdb.DuckDBPyConnection) -> None:
             conn.execute(f"ALTER TABLE _ingest_metadata ADD COLUMN {column} {ddl}")
 
 
+def _stored_rows_predicate(conn: duckdb.DuckDBPyConnection) -> tuple[str, list]:
+    """SQL fragment and its bound values that keeps only the rows whose data is in the table.
+
+    A `failed` or an `empty` row records an attempt that landed nothing. A read that asks
+    which seasons this database holds must skip those rows, or a season whose fetch keeps
+    failing is read as a season that exists. The two callers are the restamp plan and the
+    season list of a schema upgrade.
+
+    The fragment is meant to sit at the end of a WHERE clause, so it starts with AND. It is
+    empty on a database whose metadata table predates the status column: that code wrote a
+    row only when rows landed, so every row it left describes loaded data.
+    """
+    if "status" not in _metadata_columns(conn):
+        return "", []
+    return " AND status IN (?, ?)", [IngestStatus.LOADED, IngestStatus.PARTIAL]
+
+
 def _has_version_column(conn: duckdb.DuckDBPyConnection) -> bool:
     return "nflreadpy_version" in _metadata_columns(conn)
 
@@ -372,6 +396,13 @@ def _needs_refresh(conn: duckdb.DuckDBPyConnection, dataset_id: str, season: int
 # WeakSet so a connection nothing else holds does not stay in the set.
 _open_transactions: "weakref.WeakSet[duckdb.DuckDBPyConnection]" = weakref.WeakSet()
 
+# Attempts written inside the open _transaction of this call stack, waiting for its COMMIT.
+# None means no transaction is open, and an attempt then reaches the run at once. A
+# transaction that rolls back wrote no rows, so the attempts it held are dropped: the run
+# must not report a season as loaded that the database does not hold. _note_attempt fills
+# this list and _transaction empties it on a successful COMMIT.
+_held_notes: "ContextVar[list | None]" = ContextVar("nfl_mcp_held_ingest_notes", default=None)
+
 
 @contextmanager
 def _transaction(conn: duckdb.DuckDBPyConnection, rollback_failed: str = "Rollback failed"):
@@ -383,23 +414,33 @@ def _transaction(conn: duckdb.DuckDBPyConnection, rollback_failed: str = "Rollba
     rolls back DDL too, so a DROP + CREATE that fails partway leaves the old table.
     A ROLLBACK that fails too is printed with `rollback_failed` in front, and the original
     error is raised.
+
+    The attempts a caller records inside the transaction reach the run in progress only
+    after the COMMIT. A rollback drops them, because the rows they describe are gone. A
+    nested `_transaction` on the same connection is a no-op, so the notes it makes stay in
+    the outer transaction's list and commit with it.
     """
     if conn in _open_transactions:
         yield
         return
     _open_transactions.add(conn)
-    conn.execute("BEGIN")
+    token = _held_notes.set([])
     try:
-        yield
-        conn.execute("COMMIT")
-    except BaseException:
+        conn.execute("BEGIN")
         try:
-            conn.execute("ROLLBACK")
-        except Exception as rollback_err:  # noqa: BLE001 - keep the original error
-            print(f"    {rollback_failed}: {rollback_err}")
-        raise
+            yield
+            conn.execute("COMMIT")
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception as rollback_err:  # noqa: BLE001 - keep the original error
+                print(f"    {rollback_failed}: {rollback_err}")
+            raise
+        for attempt in _held_notes.get():
+            _deliver_attempt(attempt)
     finally:
         _open_transactions.discard(conn)
+        _held_notes.reset(token)
 
 
 
@@ -503,10 +544,10 @@ def _record_attempt(
 # ── What one run did ───────────────────────────────────────────────────────────
 #
 # A run of the ingest is the unit someone else acts on: `nfl-mcp ingest` turns it into an
-# exit code, and the container's scheduled refresh swaps the live database only on exit 0.
-# So a run has to be able to say how it went, which is what the types below are for. They
-# describe *this run's* fetches only — not the whole database, and not the seasons this run
-# skipped because an earlier run already loaded them.
+# exit code, and the container's scheduled refresh publishes the new database only when that
+# code lets it (see update_db.sh). So a run has to be able to say how it went, which is what
+# the types below are for. They describe *this run's* fetches only — not the whole database,
+# and not the seasons this run skipped because an earlier run already loaded them.
 
 
 @dataclass(frozen=True)
@@ -514,13 +555,16 @@ class IngestAttempt:
     """One fetch this run made, and how it ended.
 
     season is None for a static (non-seasonal) dataset. detail is the same short reason that
-    goes into the `detail` column of _ingest_metadata.
+    goes into the `detail` column of _ingest_metadata. source is the publisher the fetch
+    asked, and it decides whether a failure of this attempt gates the run (see
+    _gates_the_run).
     """
 
     dataset_id: str
     season: int | None
     status: IngestStatus
     detail: str | None = None
+    source: str = SOURCE_NFLREADPY
 
 
 @dataclass(frozen=True)
@@ -571,23 +615,59 @@ class IngestRunResult:
 
     @property
     def failures(self) -> list[str]:
-        """Each failed attempt as "<dataset>[ <season>]: <reason>", in the order they happened.
+        """Each failed attempt that gates the run, as "<dataset>[ <season>]: <reason>".
 
         This is the list the CLI prints, writes to --failures-file (as labels), and turns into
-        exit 3. failure_labels() reads the label back from the text before the first colon.
+        exit 3, and the list that decides whether the schema version is stamped. A failure on
+        an optional outside source is left out (see _gates_the_run) and appears in
+        `optional_source_failures`. failure_labels() reads the label back from the text before
+        the first colon.
         """
-        out = []
-        for attempt in self.attempts:
-            if attempt.status != IngestStatus.FAILED:
-                continue
-            label = attempt.dataset_id if attempt.season is None else f"{attempt.dataset_id} {attempt.season}"
-            out.append(f"{label}: {attempt.detail or 'failed'}")
-        return out
+        return [_failure_text(a) for a in self.attempts
+                if a.status == IngestStatus.FAILED and _gates_the_run(a.source)]
+
+    @property
+    def optional_source_failures(self) -> list[str]:
+        """Each failed attempt on a source that does not gate the run, in the same shape."""
+        return [_failure_text(a) for a in self.attempts
+                if a.status == IngestStatus.FAILED and not _gates_the_run(a.source)]
 
     @property
     def espn_breaker_tripped(self) -> bool:
         """True when the ESPN pull stopped early instead of working through its seasons."""
         return self.espn_stop is not None
+
+
+def _attempt_source(dataset_id: str) -> str:
+    """The publisher an attempt belongs to, read from the registry by dataset id.
+
+    The registry is the one place that says where a dataset's rows come from, so the run
+    report does not need a second list of names. A dataset id with no registry entry (a
+    caller that wrote metadata under its own name) reads as SOURCE_NFLREADPY, the source
+    that gates the run.
+    """
+    defn = REGISTRY.get(dataset_id)
+    return defn.source if defn is not None else SOURCE_NFLREADPY
+
+
+def _gates_the_run(source: str) -> bool:
+    """True when a failed attempt on this publisher decides the run's exit code.
+
+    nflreadpy is the data the database is built from, so a failure there is a failure of the
+    run: the CLI exits 3 and the schema version stays unstamped. An outside publisher is
+    opt-in, and its rows are extra history the rest of the database does not depend on, so a
+    failure there is recorded in _ingest_metadata and shown in the run summary only. ESPN is
+    that source today (`nfl-mcp ingest --pre1999`). `--strict` asks for any failure at all,
+    so it reads `any_failed`, which counts every source.
+    """
+    return source == SOURCE_NFLREADPY
+
+
+def _failure_text(attempt: "IngestAttempt") -> str:
+    """One failed attempt as "<dataset>[ <season>]: <reason>", the shape failure_labels reads."""
+    label = (attempt.dataset_id if attempt.season is None
+             else f"{attempt.dataset_id} {attempt.season}")
+    return f"{label}: {attempt.detail or 'failed'}"
 
 
 class _RunCollector:
@@ -601,12 +681,9 @@ class _RunCollector:
         self.attempts: list[IngestAttempt] = []
         self.espn_stop: EspnStop | None = None
 
-    def note_attempt(
-        self, dataset_id: str, season: int | None, status: IngestStatus, detail: str | None
-    ) -> None:
-        self.attempts.append(
-            IngestAttempt(dataset_id=dataset_id, season=season, status=status, detail=detail)
-        )
+    def note_attempt(self, attempt: "IngestAttempt") -> None:
+        """Record one attempt this run made, after its write committed."""
+        self.attempts.append(attempt)
 
     def note_espn_stop(self, failed_seasons: int, seasons_left: int) -> None:
         self.espn_stop = EspnStop(failed_seasons=failed_seasons, seasons_left=seasons_left)
@@ -636,17 +713,37 @@ def _collecting():
 
 
 def _note_attempt(
-    dataset_id: str, season: int | None, status: IngestStatus, detail: str | None, loader_fn: str
+    dataset_id: str,
+    season: int | None,
+    status: IngestStatus,
+    detail: str | None,
+    loader_fn: str,
 ) -> None:
     """Report one dataset row to the run in progress, when a run is in progress.
 
     Derived tables are excluded: their row records a rebuild, not a fetch, and counting one
     would let a run with no successful download still look like it loaded something.
+
+    Inside an open _transaction the attempt waits in `_held_notes` until that transaction
+    commits, so a write that rolled back never reports itself as loaded.
     """
-    collector = _ACTIVE_RUN.get()
-    if collector is None or loader_fn == DERIVED_LOADER:
+    if loader_fn == DERIVED_LOADER:
         return
-    collector.note_attempt(dataset_id, season, status, detail)
+    attempt = IngestAttempt(dataset_id=dataset_id, season=season, status=status,
+                            detail=detail, source=_attempt_source(dataset_id))
+    held = _held_notes.get()
+    if held is not None:
+        held.append(attempt)
+        return
+    _deliver_attempt(attempt)
+
+
+def _deliver_attempt(attempt: IngestAttempt) -> None:
+    """Hand one attempt that really happened to the run in progress, when a run is in progress."""
+    collector = _ACTIVE_RUN.get()
+    if collector is None:
+        return
+    collector.note_attempt(attempt)
 
 
 def _note_espn_stop(failed_seasons: int, seasons_left: int) -> None:
@@ -930,15 +1027,16 @@ def _legacy_restamp_plan(conn: duckdb.DuckDBPyConnection, dataset_def) -> tuple[
     table = dataset_def.table_name
     if not _table_exists(conn, table):
         return False, []
+    stored, stored_params = _stored_rows_predicate(conn)
     if "season" not in _table_columns(conn, table):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN season BIGINT")
     if not conn.execute(f"SELECT COUNT(*) FROM {table} WHERE season IS NULL").fetchone()[0]:
         return False, []
     seasons = sorted(r[0] for r in conn.execute(
         "SELECT DISTINCT season FROM _ingest_metadata WHERE dataset_id = ? "
-        f"AND season IS NOT NULL AND season NOT IN "
+        f"{stored} AND season IS NOT NULL AND season NOT IN "
         f"(SELECT DISTINCT season FROM {table} WHERE season IS NOT NULL)",
-        [dataset_def.dataset_id],
+        [dataset_def.dataset_id, *stored_params],
     ).fetchall())
     return True, seasons
 

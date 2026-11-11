@@ -18,6 +18,9 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=1.0,<2",
+    # server.py validates tool arguments with jsonschema itself. mcp pulls it in today,
+    # so this is spelled out to keep the import working if mcp ever drops it.
+    "jsonschema>=4.20.0",
     "duckdb>=2.0,<3",
     "pyarrow>=14.0",
     "nflreadpy>=0.1.5,<0.2",

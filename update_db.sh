@@ -64,12 +64,13 @@ rm -f "$TARGET" "$TARGET.wal" "$TARGET.tmp" "$FAILED_LIST"
 
 # Ask for the space this run needs before it writes anything:
 #   * one full copy of the active slot, into the idle slot, and
-#   * room for DuckDB's temp files and the WAL file it keeps next to the database while
-#     the load writes.
+#   * room for the WAL file DuckDB keeps next to the database while the load writes.
 # The active slot is the only size a running container can measure, so the requirement is
 # that size times a factor. Set NFL_MCP_SPACE_FACTOR to a larger number when the volume
-# needs more headroom. The image puts DuckDB's temp directory in /tmp, on a different
-# filesystem, so this check covers the copy and the WAL on the filesystem the server reads.
+# needs more headroom. DuckDB writes its spill files to the directory in
+# NFL_MCP_DUCKDB_TEMP_DIR, which both the ingest and a query connection read. The image
+# sets it to /tmp/.duckdb_spill, on a different filesystem, so this check covers the copy
+# and the WAL on the filesystem the server reads.
 SPACE_FACTOR="${NFL_MCP_SPACE_FACTOR:-2}"
 ACTIVE_KB=$(du -sk "$DB_DIR/$CURRENT" | cut -f1)
 NEEDED_KB=$(( ACTIVE_KB * SPACE_FACTOR ))
@@ -91,9 +92,10 @@ chmod u+w "$TARGET"
 # rolled back and keeps the rows of the active slot this copy came from, so the update
 # goes on: the schema upgrade below must not wait for every download to succeed, and
 # validate still decides the swap. Any other non-zero exit is a fatal error and stops here.
-# A run in which no fetch put rows in the database also exits 3: the copy then holds the
-# same data as the active slot, so the checks below pass or fail it exactly as they would
-# the active slot.
+# A run where at least one fetch failed and none put rows in the database also exits 3: the
+# copy then holds the same data as the active slot, so the checks below pass or fail it
+# exactly as they would the active slot. A run where every source answered with no rows is
+# not a failure and exits 0.
 echo "[$(date -u)] Running incremental ingest..."
 INGEST_RC=0
 NFL_MCP_DB_PATH="$TARGET" nfl-mcp ingest --failures-file "$FAILED_LIST" || INGEST_RC=$?
@@ -107,6 +109,15 @@ elif [ "$INGEST_RC" -ne 0 ]; then
 fi
 rm -f "$FAILED_LIST"
 
+# A .wal next to the slot right after the ingest means the load process died before DuckDB
+# closed the file. Check it here, before the upgrade: the upgrade opens the slot for writing,
+# and a write open replays that log and deletes it. Waiting for the check below would then
+# publish a slot whose ingest never closed cleanly.
+if [ -e "$TARGET.wal" ]; then
+    echo "[$(date -u)] ERROR: $TARGET.wal exists after the ingest, the load did not close the database cleanly. Keeping $CURRENT active."
+    exit 1
+fi
+
 # Bring a slot copied from an older database up to the current schema (derived tables,
 # depth_charts season, missing raw columns) and record the version. Exit 3 means a step
 # is still pending, which validate would only catch later, so any non-zero stops here.
@@ -118,9 +129,10 @@ fi
 
 # A .wal next to the new slot means a writer died before DuckDB closed the file. If this
 # run published that file, the server answers from the last checkpoint. Stop here, and
-# name the file that blocked the swap.
+# name the file that blocked the swap. The ingest has its own guard above. This one covers
+# the steps between that guard and the swap, the schema upgrade first of all.
 if [ -e "$TARGET.wal" ]; then
-    echo "[$(date -u)] ERROR: $TARGET.wal exists, the ingest did not close the database cleanly. Keeping $CURRENT active."
+    echo "[$(date -u)] ERROR: $TARGET.wal exists after the schema upgrade, a writer did not close the database cleanly. Keeping $CURRENT active."
     exit 1
 fi
 

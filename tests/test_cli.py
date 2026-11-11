@@ -1311,9 +1311,9 @@ class TestDoctorCommand:
 
 # ── ingest exit codes ──────────────────────────────────────────────────────────
 #
-# update_db.sh runs `nfl-mcp ingest` under `set -eu` and swaps the live database only on
-# exit 0. These tests pin the rule: a run where nothing at all loaded leaves the exit code
-# non-zero, and a run that merely failed on some seasons does not.
+# update_db.sh runs `nfl-mcp ingest` under `set -eu`. It treats exit 3 as a warning and goes
+# on, and stops on any other non-zero code. These tests pin the code the command writes: a run
+# where a fetch failed and nothing landed is non-zero, and a partial run is 3, not 1.
 
 from nfl_mcp.cli import INGEST_PARTIAL_EXIT, NOTHING_LOADED_MESSAGE, _run_problems  # noqa: E402
 from nfl_mcp.config import DEFAULT_DUCKDB_PATH  # noqa: E402
@@ -1389,11 +1389,19 @@ class TestIngestExitCode:
         assert result.exit_code == 0, result.output
 
     def test_empty_seasons_alone_are_not_a_failure(self, runner, monkeypatch):
+        """An answer from the publisher is not a failure, which is what the name always claimed.
+
+        This test pinned exit 3 for a run whose every fetch came back EMPTY. v0.7.3 exited 0
+        for that run, and the command's own docstring says a season the publisher has no rows
+        for is not a failure, so the merge review called the old assertion the defect. The
+        name stays, and the body now matches it.
+        """
         _stub_run(monkeypatch, IngestStatus.EMPTY, IngestStatus.EMPTY)
         result = runner.invoke(main, ["ingest", "--dataset", "schedules", "--skip-views"])
-        # Nothing landed, so the run did load nothing, and it still says so.
-        assert result.exit_code == INGEST_PARTIAL_EXIT
-        assert NOTHING_LOADED_MESSAGE in result.output
+        # Nothing landed and nothing failed: one plain line says the sources had no new rows.
+        assert result.exit_code == 0, result.output
+        assert NOTHING_LOADED_MESSAGE not in result.output
+        assert "No source published new rows" in result.output
 
     def test_strict_exits_three_when_any_attempt_failed(self, runner, monkeypatch):
         _stub_run(monkeypatch, IngestStatus.LOADED, IngestStatus.FAILED)

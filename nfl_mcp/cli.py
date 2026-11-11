@@ -231,8 +231,14 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, allo
     """Download NFL data via nflreadpy and load into DuckDB.
 
     Some failures are ordinary: play-by-play for a new season does not exist before
-    Week 1. A run in which no fetch put rows in the database prints that the database
-    was left as it was, and exits 3 even with --allow-failures.
+    Week 1. A run in which no fetch put rows in the database after at least one fetch
+    failed prints that the database was left as it was, and exits 3 even with
+    --allow-failures. A run where every fetch came back and every source had no rows is
+    an answer, not a failure, and exits 0.
+
+    A failure on the optional ESPN records pull (--pre1999) is recorded and listed in the
+    run summary. It does not decide the exit code and does not stop the schema stamp,
+    because that source is opt-in. --strict counts it like any other failure.
 
     \b
     Examples:
@@ -247,10 +253,11 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, allo
 
     \b
       0  Every requested dataset loaded, or --allow-failures was given
-         without --strict. A season the publisher has no rows for is not a
-         failure.
+         without --strict and at least one fetch landed. A season the
+         publisher has no rows for is not a failure.
       3  The run finished, but some datasets or seasons failed to load. Each
          failed one keeps the rows it had before. The failures are listed.
+         A run where every fetch failed also exits 3.
       1  The run stopped with an error, for example when no play-by-play
          season could be fetched or the database could not be opened.
       2  A usage error, for example an unknown dataset name.
@@ -308,20 +315,29 @@ def ingest(datasets, start, end, fresh, skip_views, list_datasets, pre1999, allo
         # A stubbed-out run returns None: nothing ran, so nothing failed.
         result = IngestRunResult()
     failures = result.failures
+    # --strict asks for any failure at all, so it counts the optional outside source too.
+    counted = failures + result.optional_source_failures if strict else failures
     if failures_file:
         labels = failure_labels(failures)
         Path(failures_file).write_text("".join(f"{label}\n" for label in labels))
-    message = "Ingest failed for: " + "; ".join(failures)
-    if result.nothing_loaded:
-        # The run fetched, and no fetch put rows in the database: a dead network, or a
-        # source that answered nothing. The database is no newer than before, so not even
-        # --allow-failures makes this a success. entrypoint.sh stops on it rather than
-        # renaming an empty first-start database into place.
-        if failures:
+    message = "Ingest failed for: " + "; ".join(counted)
+    if result.nothing_loaded and result.any_failed:
+        # The run fetched, at least one fetch failed, and no fetch put rows in the database:
+        # a dead network, or the only source the run asked for answering with an error. The
+        # database is no newer than before, so not even --allow-failures makes this a success.
+        # entrypoint.sh stops on it rather than renaming an empty first-start database into
+        # place. Any failed attempt counts here, an optional source's included: the run asked
+        # for that data and got nothing.
+        if counted:
             click.secho(f"Error: {message}", fg="red", err=True)
         click.secho(NOTHING_LOADED_MESSAGE, fg="red", err=True)
         sys.exit(INGEST_PARTIAL_EXIT)
-    if failures:
+    if result.nothing_loaded:
+        # Every fetch came back and every source answered with no rows. An answer is not a
+        # failure: the database keeps the rows it has and the run is a success.
+        click.echo("No source published new rows. The database keeps the rows it has.")
+        return
+    if counted:
         if allow_failures and not strict:
             click.echo(f"{message} (ignored: --allow-failures)")
             return

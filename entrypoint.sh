@@ -58,8 +58,8 @@ if [ ! -L "$SYMLINK" ] || [ ! -e "$SYMLINK" ]; then
             echo "[init] No seed found; ingesting into slot A (slow startup)..."
             # --allow-failures: one flaky season must not crash-loop a first boot. The ingest
             # prints "Ingest failed for: ..." naming each failure; the weekly update fills gaps.
-            # A run that loads nothing at all still exits 3, so set -e stops here and nothing
-            # is renamed into place.
+            # A run in which a fetch failed and nothing loaded still exits 3, so set -e stops
+            # here and nothing is renamed into place.
             NFL_MCP_DB_PATH="$SLOT_A_TMP" nfl-mcp ingest --allow-failures
             mv "$SLOT_A_TMP" "$SLOT_A"
         fi
