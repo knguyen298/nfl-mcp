@@ -35,9 +35,12 @@ ENV NFL_MCP_DB_PATH=/data/nflread.duckdb
 # within the CI runner's RAM (spilling to disk) without leaking the large limit
 # into the lightweight runtime serve process configured further down.
 #
-# After ingest we validate the seed: no leftover WAL, and the core tables that the
-# slow PBP path produces actually have rows — so a silently-incomplete ingest fails
-# the build instead of shipping a broken image.
+# After the ingest, validate the seed with validate_db.sh, the same script the running
+# container uses before it swaps a slot. The check needs a database file that opens
+# read-only with no leftover WAL beside it, and rows in both core tables. When a load adds
+# too few rows, this fails the build, so the image does not ship a database with gaps in it.
+# validate_db.sh opens the database read-only, so the check cannot create a WAL of its own.
+# The `test ! -e` line is what proves the load closed the file.
 #
 # INGEST_ARGS is empty by default, so production/release builds bake the default window:
 # 1966 onward, clipped per dataset (play-by-play and the stats tables from their 1999
@@ -58,12 +61,15 @@ RUN mkdir -p /seed /data /var/log/nflmcp \
     nfl-mcp ingest --pre1999 ${INGEST_ARGS} \
  && rm -rf /seed/.duckdb_spill /data/.duckdb_spill /root/.cache \
  && test ! -e /seed/nflread.duckdb.wal \
- && python -c "import duckdb,sys; c=duckdb.connect('/seed/nflread.duckdb',read_only=True); rows={t:c.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in ('plays','schedules')}; print('baked rows:',rows); sys.exit(0 if all(v>0 for v in rows.values()) else 1)"
+ && sh /src/validate_db.sh /seed/nflread.duckdb
 
-# A/B slot management plus the schedule that drives it.
+# A/B slot management plus the schedule that drives it. validate_db.sh sits in / so that
+# update_db.sh can call it before every symlink swap: the same check this build step just
+# ran on the seed.
 COPY entrypoint.sh /entrypoint.sh
 COPY update_db.sh /update_db.sh
-RUN chmod +x /entrypoint.sh /update_db.sh
+COPY validate_db.sh /validate_db.sh
+RUN chmod +x /entrypoint.sh /update_db.sh /validate_db.sh
 
 # Runtime resource caps for the small serve container (e.g. 1Gi). Heavy queries
 # spill to /tmp instead of OOM-killing the process. Note the updater inherits these,

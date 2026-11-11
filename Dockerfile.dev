@@ -13,14 +13,24 @@ COPY . /src
 RUN pip install --no-cache-dir uv \
     && uv pip install --system --no-cache .
 
+# Same writable directories as the published image: the container runs as an arbitrary
+# --user, so /data (the A/B slots) and the log directory must be open to it.
 RUN mkdir -p /data /var/log/nflmcp \
-    && chmod 777 /var/log/nflmcp
+    && chmod 777 /data /var/log/nflmcp
 
 COPY entrypoint.sh /entrypoint.sh
 COPY update_db.sh /update_db.sh
-RUN chmod +x /entrypoint.sh /update_db.sh
+COPY validate_db.sh /validate_db.sh
+RUN chmod +x /entrypoint.sh /update_db.sh /validate_db.sh
 
 ENV NFL_MCP_DB_PATH=/data/nflread.duckdb
+
+# Resource limits for the running container, the same as the published image, so the dev
+# container behaves the same way: a heavy query writes to /tmp instead of ending the
+# process that serves requests.
+ENV NFL_MCP_DUCKDB_MEMORY_LIMIT=512MB \
+    NFL_MCP_DUCKDB_THREADS=1 \
+    NFL_MCP_DUCKDB_TEMP_DIR=/tmp/.duckdb_spill
 
 EXPOSE 8000
 

@@ -9,10 +9,19 @@ name: Docker build check
 on:
   pull_request:
     branches: [main]
+    # Every file that changes the image or how the image runs. If a file is missing here, a
+    # pull request can edit the updater or the schedule and no build check ever runs.
+    # `crontab` does not exist yet (entrypoint.sh writes the schedule today); keep the name so
+    # a future split into its own file still triggers this job.
     paths:
       - Dockerfile
+      - Dockerfile.dev
       - .dockerignore
       - pyproject.toml
+      - entrypoint.sh
+      - update_db.sh
+      - validate_db.sh
+      - crontab
       - nfl_mcp/**
       - .github/workflows/docker-build.yml
 
@@ -45,20 +54,34 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Smoke test — container boots and serves
+      - name: Smoke test — container boots and answers the MCP endpoint
         run: |
           docker run -d --name nfl-mcp-ci -p 8000:8000 nfl-mcp:ci
-          for i in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/mcp || true)
-            if [ -n "$code" ] && [ "$code" != "000" ]; then
-              echo "Server responded with HTTP $code"
-              exit 0
+          # /mcp is the only route the server registers (create_app in nfl_mcp/server.py), so
+          # ask it what a client asks: an initialize request. A server that works answers 200.
+          # A 4xx or a 5xx means the container is up but the app is broken, so it fails here.
+          # The check this one replaced accepted any HTTP response, so it passed on an HTTP 500.
+          status=1
+          for attempt in $(seq 1 30); do
+            code=$(curl -s -o /tmp/mcp-initialize.txt -w '%{http_code}' -m 10 -X POST \
+              http://localhost:8000/mcp \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' \
+              -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"ci-smoke","version":"0"},"capabilities":{}}}' \
+              || echo 000)
+            if [ "$code" = "200" ] && grep -q '"result"' /tmp/mcp-initialize.txt; then
+              echo "Server answered initialize with HTTP $code"
+              status=0
+              break
             fi
+            echo "attempt $attempt: HTTP $code, retrying"
             sleep 2
           done
-          echo "Server did not respond on /mcp within timeout"
-          docker logs nfl-mcp-ci || true
-          exit 1
+          if [ "$status" -ne 0 ]; then
+            echo "Server did not answer initialize on /mcp with HTTP 200 within 60s"
+            docker logs nfl-mcp-ci || true
+          fi
+          exit "$status"
 
       - name: Tear down container
         if: always()
