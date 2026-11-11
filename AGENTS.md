@@ -183,9 +183,9 @@ class TestMyNewTool:
 - **Access**: always read-only at query time via `get_db_connection()` in `database.py`
 - **Metadata**: `_ingest_metadata` records one row per dataset+season attempt, with an
   `IngestStatus` in `status` and a short reason in `detail`
-- **Tables**: 42 after a full build with `--pre1999`. That is 30 from the registry, 4
-  play-by-play aggregates, 6 fantasy derived tables, `team_records`, and `_ingest_metadata`.
-  Use `nfl_schema()` to list them or `nfl_schema(table=<name>)` for columns
+- **Tables**: 43 after a full build with `--pre1999`. That is 30 from the registry, 4
+  play-by-play aggregates, 6 fantasy derived tables, `team_records`, `_ingest_metadata`, and
+  `_schema_version`. Use `nfl_schema()` to list them or `nfl_schema(table=<name>)` for columns
 - **What a tool connection can reach**: every connection opens read-only with DuckDB's
   configuration set at connect time (`_runtime_config`) and then locked
   (`_lock_external_access`). Extension autoload and auto-install are off, Python replacement
@@ -257,6 +257,14 @@ attempt ended. Re-running the same ingest command is safe. Use `--fresh` to forc
 `failed` or an `empty` record is the log of an attempt that put nothing in the table, so the next
 run retries that season.
 
+**Every read that asks which seasons the database holds counts the same two statuses.**
+`ingest._stored_rows_predicate` builds that filter and binds the two `IngestStatus` members, and
+its two callers are `_legacy_restamp_plan` (the seasons to re-fetch for a depth_charts row with
+no season) and `migrate._metadata_seasons` (the seasons `nfl-mcp upgrade` reloads). Both work on
+a metadata table that has no `status` column: that code wrote a row only when rows landed, so the
+predicate comes back empty. Without the filter a season whose fetch keeps failing enters the plan
+forever, `nfl-mcp upgrade` exits 1 on every run, and the container's refresh stops on every run.
+
 A season loaded before it ended is fetched again. `_needs_refresh` compares the season's
 `loaded_at` against `seasons.season_settled_on(season)`, which is March 1 of the year after the
 season kicks off. A load recorded before that date can miss the last week of the regular season,
@@ -270,6 +278,11 @@ in-progress season is re-fetched on every run.
   record that says it is loaded. DuckDB rolls back DDL too. A nested `_transaction` on the same
   connection does nothing, because DuckDB refuses `BEGIN` inside an open transaction, so the
   caller that opened it is the one that commits.
+- **The run hears about a season after its COMMIT.** `_record_loaded` and `_record_attempt` note
+  the attempt inside the transaction that writes it. `_note_attempt` puts the note in
+  `_held_notes` while a transaction is open, and `_transaction` delivers the list only after a
+  successful COMMIT. A rollback drops the notes, so a season the database lost never reaches the
+  run summary or `nothing_loaded`. A note made with no transaction open goes straight to the run.
 - **Table existence is asked, never guessed.** `_table_exists` reads `information_schema.tables`
   with the name bound as a parameter. Nothing in `ingest.py` catches `CatalogException` to decide
   whether a table is there, because that exception also fires for a missing column or a missing
@@ -278,11 +291,26 @@ in-progress season is re-fetched on every run.
   `SOURCE_ESPN`, `KNOWN_SOURCES`, `PBP_DATASET_ID`, `PBP_TABLE_NAME` and `PBP_LOADER_FN`. The
   router in `_ingest_datasets` picks the helper from `defn.source` and raises `ValueError` for a
   source outside `KNOWN_SOURCES`, rather than sending it to nflreadpy.
+- **An attempt carries the source it fetched from.** `_note_attempt` reads it from the registry by
+  dataset id (`_attempt_source`) and stores it on the `IngestAttempt`. `_gates_the_run(source)` is
+  the one rule that says whether a failed attempt decides the exit code, the `--failures-file`
+  list, and the schema stamp: it does for `SOURCE_NFLREADPY`, and it does not for an outside
+  publisher. `IngestRunResult.failures` holds the gating ones and
+  `IngestRunResult.optional_source_failures` the rest. `--strict` reads `any_failed`, which counts
+  every source.
 - **The ESPN breaker counts requests, not loop turns.** `ESPN_FAILURE_LIMIT` stops the pull after
   that many seasons fail in a row. A season ESPN answered resets the count to zero, whether the
   records landed, came back short, or came back as no records. A season already loaded, so never
   requested, leaves the count where it was. The run reports the give-up as an `EspnStop`, because
   a pull that stopped and a pull that finished both return a row count.
+- **The write connection spills where a query connection spills.** `_apply_duckdb_pragmas`
+  sets `temp_directory` to `NFL_MCP_DUCKDB_TEMP_DIR` when that variable is set, and to
+  `<database dir>/.duckdb_spill` when it is not. `database.py` reads the same variable for
+  every read-only connection, so the container's `/tmp/.duckdb_spill` holds the spill of a
+  query and of the scheduled ingest. Both set it only when `NFL_MCP_DUCKDB_MEMORY_LIMIT` is
+  set, so a run with no memory cap keeps DuckDB's own defaults. The image build passes a memory
+  cap and no `NFL_MCP_DUCKDB_TEMP_DIR`, so the bake spills inside `/seed` and the `Dockerfile`
+  deletes that folder after the ingest.
 - **A derived table with no sources is dropped.** `_drop_stale_derived_table` deletes the table
   and its `_ingest_metadata` row together, so a copy built from data that is gone cannot keep
   reporting itself as loaded. A derived table records its rows under `loader_fn="derived"`, and
@@ -299,19 +327,28 @@ no fetches, and it is not treated as a failure.
 first `_SUMMARY_LINE_CAP` seasons that landed nothing. A dead network fails every season in the
 range, so the list is capped and the counts carry the size of the problem.
 
-`nfl-mcp ingest` exits 0 when every fetch landed, 3 (`INGEST_PARTIAL_EXIT`) when any fetch
-failed or the run loaded nothing, 1 on a fatal error, and 2 on a usage error. A run that loaded
-nothing also prints `NOTHING_LOADED_MESSAGE`. A season nflreadpy does not publish yet is skipped,
-not failed, so play-by-play for a season before its Week 1 does not set exit 3.
-`--allow-failures` turns a partial run (some fetches landed) into exit 0. `--strict` exits 3 when
-any single fetch failed, even with `--allow-failures`. `--failures-file` writes the failed
-datasets and seasons, one per line.
+`nfl-mcp ingest` exits 0 when every fetch landed, 3 (`INGEST_PARTIAL_EXIT`) when a fetch failed
+and its failure counts, 1 on a fatal error, and 2 on a usage error. A run where at least one
+fetch failed and no fetch put rows in the database prints `NOTHING_LOADED_MESSAGE` and exits 3
+even with `--allow-failures`. A run where every fetch came back and every source had no rows is
+an answer, not a failure: it prints one plain line and exits 0. A season nflreadpy does not
+publish yet is skipped, not failed, so play-by-play for a season before its Week 1 does not set
+exit 3. `--allow-failures` turns a partial run (some fetches landed) into exit 0. `--strict`
+exits 3 when any single fetch failed, even with `--allow-failures`, and counts an ESPN season
+too. `--failures-file` writes the datasets and seasons whose failure decided the run, one per
+line.
+
+A failed ESPN season is the one exception. It is written to `_ingest_metadata`, counted in the
+summary, and listed with the seasons that landed nothing, and it decides nothing else: it does
+not set the exit code and does not stop `stamp_if_current`, so an image build that hit one ESPN
+429 still ships a stamped seed. See "An attempt carries the source it fetched from" above.
 
 That exit code decides whether a running container changes its data. `update_db.sh` treats exit 3
 as a warning: the failed datasets keep their previous rows, and the script goes on to the upgrade
 and the checks. Any other non-zero exit ends the script before the symlink swap, and the server
 keeps the database it already had. `entrypoint.sh` runs the no-seed cold ingest with
-`--allow-failures`, so a run that loaded nothing still exits 3 and stops the first start.
+`--allow-failures`, so a first start where a fetch failed and nothing landed exits 3, stops
+before the rename, and never publishes an empty slot.
 
 ## Tool Results
 
@@ -430,17 +467,23 @@ before the swap, so the live slot keeps serving:
    partway.
 4. Require free space in `/data` of `NFL_MCP_SPACE_FACTOR` times the active slot's size, default
    2. The copy of the active slot and the WAL DuckDB keeps beside it both land on that
-   filesystem. DuckDB's spill directory is elsewhere in the image, so it is not counted here. Set
-   the variable higher when the volume needs more headroom.
+   filesystem. The image sets `NFL_MCP_DUCKDB_TEMP_DIR=/tmp/.duckdb_spill`, and both the ingest
+   (`_apply_duckdb_pragmas`) and every query connection (`_runtime_config`) read that variable,
+   so DuckDB spills off `/data` and is not counted here. Set the variable higher when the volume
+   needs more headroom.
 5. Copy the active slot to the idle slot, then run `nfl-mcp ingest` into it. Exit 3 is a
    warning that names the failed datasets. Any other failure ends the run.
-6. Run `nfl-mcp upgrade` on the idle slot, so it has the current schema version.
-7. Refuse the swap when the idle slot has a `.wal` next to it. That file means the load process
-   died before DuckDB closed the database, and a reader would see only the last checkpoint.
-8. Run `validate_db.sh` on the idle slot, and refuse the swap when it fails or when the script is
+6. Refuse the run when the idle slot has a `.wal` next to it right after the ingest. The check
+   must come before the upgrade: the upgrade opens the slot for writing, and a write open replays
+   that log and removes the evidence.
+7. Run `nfl-mcp upgrade` on the idle slot, so it has the current schema version.
+8. Refuse the swap when the idle slot has a `.wal` next to it. That file means a writer died
+   before DuckDB closed the database, and a reader would see only the last checkpoint. The
+   upgrade is the step between the two guards that also writes to the slot.
+9. Run `validate_db.sh` on the idle slot, and refuse the swap when it fails or when the script is
    missing.
-9. Run `nfl-mcp validate` on the idle slot against the active slot.
-10. Make the idle slot read-only and swap the link with `ln -sfn`.
+10. Run `nfl-mcp validate` on the idle slot against the active slot.
+11. Make the idle slot read-only and swap the link with `ln -sfn`.
 
 Rules:
 
@@ -459,7 +502,11 @@ Rules:
   starts the server anyway. Nothing restarts the scheduler, and stale data beats no data.
 - **Never re-ingest at container start.** A cold ingest takes 10+ minutes and blocks
   readiness behind any startup probe or health check. Copy the seed instead. Only the no-seed
-  fallback ingests at start, and a published image always carries a seed.
+  fallback ingests at start, and a published image always carries a seed. That fallback runs
+  with `--allow-failures`, so a dead network exits 3 and `set -eu` stops the script before the
+  rename. A cold ingest whose every source answered with no rows exits 0, and `entrypoint.sh`
+  publishes that empty slot: it runs no `validate_db.sh` check. `update_db.sh` and the image
+  build both run that check, and both refuse a slot with no rows in `plays` or `schedules`.
 - The seed bake passes `--pre1999` (ESPN season records, ~60 requests); the runtime ingest
   in `entrypoint.sh` and `update_db.sh` must not, or every refresh depends on a third-party
   API at runtime. `test_seed_includes_pre1999_records_but_runtime_does_not` guards this.

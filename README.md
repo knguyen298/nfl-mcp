@@ -210,19 +210,24 @@ automatically.
 
 Every run ends with a **run summary**: how many loads landed, came back short, stored nothing, or
 failed, then up to ten of the seasons that stored nothing with the reason. The exit codes are in
-the table below. A run where every fetch failed also prints that the database gained nothing.
-Pass `--strict` to exit 3 on any failed fetch, even with `--allow-failures`.
+the table below. A run where at least one fetch failed and no fetch landed also prints that the
+database gained nothing. A season the publisher has no rows for is not a failure: a run where
+every fetch came back and every source had no rows prints one line and exits 0. Pass `--strict`
+to exit 3 on any failed fetch, even with `--allow-failures`. A failed season from the optional
+ESPN pull (`--pre1999`) is recorded and listed, and does not change the exit code.
 
 Each load records its own outcome in `_ingest_metadata`, with a short reason when it stored
 nothing, so `nfl_status` and `nfl_catalog` can report a failed season instead of staying quiet
-about it.
+about it. A season is counted as present only when its record says `loaded` or `partial`, so a
+failed season never enters the depth_charts restamp plan or the season list `nfl-mcp upgrade`
+reloads.
 
 Exit codes of `nfl-mcp ingest`:
 
 | Code | Meaning |
 |---|---|
-| 0 | Every requested dataset loaded, or `--allow-failures` was given without `--strict` and some data loaded. |
-| 3 | The run finished, but some datasets or seasons failed to load. Each failed one keeps the rows it had before. `--failures-file PATH` writes them to a file, one per line. |
+| 0 | Every requested dataset loaded, or `--allow-failures` was given without `--strict` and some data loaded, or every source answered with no rows. |
+| 3 | The run finished, but some datasets or seasons failed to load. Each failed one keeps the rows it had before. A run where every fetch failed exits 3 even with `--allow-failures`. `--failures-file PATH` writes the failures to a file, one per line. |
 | 1 | The run stopped with an error, for example when no play-by-play season could be fetched. |
 | 2 | A usage error, for example an unknown dataset name. |
 
@@ -280,7 +285,7 @@ Every setting is an environment variable. All are optional.
 | `NFL_MCP_DB_PATH` | `~/.nfl-mcp/nflread.duckdb` (`/data/nflread.duckdb` in the container) | Path of the DuckDB file. It overrides the path in the config file. |
 | `NFL_MCP_DUCKDB_MEMORY_LIMIT` | DuckDB default (`512MB` in the container) | Memory cap for every DuckDB connection. Use a number and a unit, such as `512MB` or `2GiB`. A bad value stops `serve` with exit code 1. |
 | `NFL_MCP_DUCKDB_THREADS` | DuckDB default (`1` in the container) | Thread cap. Use a positive whole number. A bad value stops `serve` with exit code 1. |
-| `NFL_MCP_DUCKDB_TEMP_DIR` | DuckDB default (`/tmp/.duckdb_spill` in the container) | Writable directory where DuckDB spills a large query to disk. |
+| `NFL_MCP_DUCKDB_TEMP_DIR` | DuckDB default (`/tmp/.duckdb_spill` in the container) | Writable directory where DuckDB spills to disk. `nfl-mcp serve` reads it for every query connection, and `nfl-mcp ingest` reads it when `NFL_MCP_DUCKDB_MEMORY_LIMIT` is set. Without it the ingest spills into `.duckdb_spill` next to the database file. |
 | `NFL_MCP_AUTH_TOKEN` | unset | When set, every request needs `Authorization: Bearer <token>`. See Security below. |
 | `NFL_MCP_CORS_ORIGINS` | unset (all origins) | Comma-separated list of origins allowed to call the server from a browser. |
 | `NFL_MCP_MAX_CONCURRENT_QUERIES` | `2` | How many tool calls run at once. A bad value logs a warning and the default applies. |
@@ -530,12 +535,12 @@ pytest -m unit     # unit tests
 pytest -m integration  # integration tests (requires loaded DB)
 ```
 
-Two dependencies have an upper bound in `pyproject.toml`. `duckdb` stays below 2, because a
-new major version can change SQL behavior and the file format. `nflreadpy` stays below 0.2,
-because a 0.x minor release can rename a loader or change its arguments. Each ingest records
-the installed `nflreadpy` version in the `nflreadpy_version` column of `_ingest_metadata`.
-Derived tables and the ESPN pull have no version, so that column is empty for them. A
-database built before this column existed gets it at the next ingest.
+Two dependencies have an upper bound in `pyproject.toml`. `duckdb` stays below 3, because a new
+major version can change SQL behavior and the file format. The project requires 2.0 or newer.
+`nflreadpy` stays below 0.2, because a 0.x minor release can rename a loader or change its
+arguments. Each ingest records the installed `nflreadpy` version in the `nflreadpy_version`
+column of `_ingest_metadata`. Derived tables and the ESPN pull have no version, so that column is
+empty for them. A database built before this column existed gets it at the next ingest.
 
 ## Troubleshooting
 
