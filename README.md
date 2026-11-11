@@ -37,16 +37,22 @@ Point any MCP client at `http://localhost:8000/mcp`. The `-v` mount is **optiona
 
 | | Without `-v` | With `-v nfl-mcp-data:/data` |
 |---|---|---|
-| First start | copies the baked seed | copies the baked seed |
+| First start | copies the baked seed into slot A | copies the baked seed into slot A |
 | Scheduled refreshes | apply immediately, live in the container's writable layer | apply immediately |
-| Container restart | falls back to the image's seed | keeps the last refreshed copy |
+| Container restart | keeps the last refreshed copy, until you delete the container | keeps the last refreshed copy |
+
+`entrypoint.sh` reads the `/data/nflread.duckdb` symlink to decide what to serve. A link that
+resolves is left as it is, so a restart keeps the slot the last refresh published. Only a missing
+or dangling link copies the seed, and it copies to a scratch name first, then renames. A plain
+`/data/nflread.duckdb` file, written by an older image, is moved into slot A and kept.
 
 Budget roughly **twice the database size** of free space in `/data` (the A/B slots) plus
-room for ingest spill, and **2 GB of memory** if you want the scheduled ingest to have
-headroom — the server itself is comfortable in 1 GB. `--user` is fine; `/data` and
-`/var/log/nflmcp` are world-writable in the image.
+room for ingest spill, and **2 GB of memory** if you want the scheduled ingest to have headroom.
+The server itself is comfortable in 1 GB. `--user` works. `/data` and `/var/log/nflmcp` are
+world-writable in the image. The updater refuses to start a run when `/data` holds less free space
+than `NFL_MCP_SPACE_FACTOR` times the live database, which is 2 by default.
 
-> **The image ships with data and keeps itself current.** A complete DuckDB database is baked into the image as a **seed**, so a new container is queryable in seconds instead of spending 10+ minutes ingesting on startup. At runtime, `entrypoint.sh` copies that seed into slot A and starts `supercronic`, which runs `update_db.sh` on a schedule: ingest into the **idle slot**, then atomically swap the `/data/nflread.duckdb` symlink. The server opens a fresh read-only connection per query, so new data appears on the next request — no restart, no downtime, and a failed ingest leaves the previous copy still serving.
+> **The image ships with data and keeps itself current.** A complete DuckDB database is baked into the image as a **seed**, so a new container is queryable in seconds instead of spending 10+ minutes ingesting on startup. At runtime, `entrypoint.sh` points `/data/nflread.duckdb` at slot A and starts `supercronic`, which runs `update_db.sh` on a schedule: ingest into the **idle slot**, then atomically swap the symlink. The server opens a fresh read-only connection per query, so new data appears on the next request. There is no restart and no downtime, and a failed refresh leaves the previous copy still serving.
 
 ### How the container stays current
 
@@ -57,9 +63,17 @@ headroom — the server itself is comfortable in 1 GB. `--user` is fine; `/data`
 
 Notes on the updater:
 
-- **Watch `/var/log/nflmcp/nfl_update.log`.** It is the only place a failed refresh reports itself; the server keeps serving the last good copy regardless.
+- **Watch `/var/log/nflmcp/nfl_update.log`.** Every refresh writes its own report there, and a
+  failed one says why. The server keeps serving the last good copy regardless.
+- **A refresh only publishes a database it trusts.** One run at a time holds a lock, a second
+  overlapping run skips, and a run stops before the swap when `/data` lacks free space, when the
+  new slot has a leftover `.wal` beside it, or when `validate_db.sh` finds no rows in `plays` or
+  `schedules`. A run that loaded no data exits 1, so the swap never happens.
+- **If the scheduler fails to start, the container log says so once.** `entrypoint.sh` looks for
+  `supercronic` two seconds after launching it and prints `[cron] WARNING: supercronic is not
+  running. The database will not refresh on schedule.` The server starts anyway.
 - **The updater inherits the runtime memory caps** (`512MB`, 1 thread), so raise the container memory to 2 GB if that log shows the ingest being killed.
-- **Check what a running container actually holds** with the `nfl_status` tool: `last_refreshed` reports the newest `_ingest_metadata` timestamp.
+- **Check what a running container actually holds** with the `nfl_status` tool: `last_refreshed` reports the newest load whose rows are in the table, and `issues` lists every load that failed, stored no rows, or stored an incomplete season. `nfl_catalog` gives the same per dataset, plus `missing_seasons`.
 - **Run one container per database.** Every instance keeps its own `/data` slots, so scaling out replicates both the ingest work and the storage.
 
 **Publishing and pulling the image:**
@@ -177,10 +191,29 @@ nfl-mcp ingest --dataset pbp --dataset injuries   # multiple datasets
 nfl-mcp ingest --start 2020 --end 2024  # limit to a season range
 nfl-mcp ingest --fresh                  # re-ingest even if already loaded
 nfl-mcp ingest --pre1999                # also pull 1970–1998 season records from ESPN
+nfl-mcp ingest --strict                 # exit non-zero when any single fetch failed
 nfl-mcp ingest --list                   # show all available dataset names
 ```
 
-Ingest is **idempotent** — re-running skips completed seasons already in the database. The current season and the static snapshot tables (rankings, players, contracts, teams) are re-fetched on every run, so run `nfl-mcp ingest` after a game week to pick up new stats. The current season is computed from today's date (the league year rolls over in March), so a new season is picked up automatically.
+Ingest is **idempotent**. Re-running skips seasons already in the database. A season is skipped
+only when its record says `loaded` or `partial`, so a season whose last attempt failed or stored
+nothing is retried. The current season and the static snapshot tables (rankings, players,
+contracts, teams) are re-fetched on every run, so run `nfl-mcp ingest` after a game week to pick
+up new stats. A season loaded before it ended is fetched once more: the league year rolls over on
+March 1, and a January load misses the last week of the regular season, the playoffs and the Super
+Bowl. The current season is computed from today's date, so a new season is picked up
+automatically.
+
+Every run ends with a **run summary**: how many loads landed, came back short, stored nothing, or
+failed, then up to ten of the seasons that stored nothing with the reason. The command exits 1
+when every fetch in the run failed, which is the pattern that says the database gained nothing.
+Some failures are ordinary, so a run where only some fetches failed exits 0: play-by-play for a
+new season does not exist before Week 1, so it fails on every run from March to September. Pass
+`--strict` to exit 1 when any single fetch failed instead.
+
+Each load records its own outcome in `_ingest_metadata`, with a short reason when it stored
+nothing, so `nfl_status` and `nfl_catalog` can report a failed season instead of staying quiet
+about it.
 
 ## Datasets
 
@@ -205,9 +238,10 @@ family so any data a client might need is already there. The single exception is
 > `min_season` in `nfl_mcp/registry.py`), so a fresh install loads rosters from 1966 while
 > play-by-play and the stats tables start at their 1999 source floor and Next Gen Stats at
 > 2016. Pass `--start` to go deeper — `--start 1920` adds the earlier pre-merger rosters, and no
-> dataset ever requests a season its source never published. `nfl-mcp ingest --list` prints
-> the window for every dataset. Non-seasonal reference tables (draft picks, combine,
-> contracts, players) carry their full historical record.
+> dataset ever requests a season its source never published. `nfl-mcp ingest --list` prints the
+> season window for every seasonal dataset, and marks each dataset `[default]` or `[opt-in]`.
+> Non-seasonal reference tables (draft picks, combine, contracts, players) carry their full
+> historical record.
 
 | Table | Loaded range |
 |---|---|
@@ -312,8 +346,8 @@ SELECT season, team, wins, losses, ties FROM team_records WHERE season = 1972 AN
 | Tool | Description |
 |------|-------------|
 | `nfl_schema` | Database schema reference — compact summary by default, pass `category` for detail |
-| `nfl_status` | Database health: total plays, loaded seasons, available tables |
-| `nfl_query` | Raw SQL SELECT for custom queries (500 row cap, 10s timeout) |
+| `nfl_status` | Database health: play counts, loaded seasons, and every loaded dataset with its row count and last refresh. Lists `issues`: loads that failed, stored no rows, or stored an incomplete season |
+| `nfl_query` | Raw SQL SELECT for custom queries (`max_rows` capped at 500, 10s timeout, read-only, cannot read files) |
 | `nfl_search_plays` | Find plays by player, team, season, season type, situation, touchdowns, etc. |
 | `nfl_team_stats` | Pre-aggregated team offense, defense, and situational stats |
 | `nfl_player_stats` | Player stats by season and season type — passing, rushing, or receiving |
@@ -332,7 +366,14 @@ SELECT season, team, wins, losses, ties FROM team_records WHERE season = 1972 AN
 | `nfl_drop_rate` | Catchable-target drop rate per receiver-season from FTN charting (2022+), plus contested targets and created receptions |
 | `nfl_contract_value` | Fantasy points per $M of average per year (APY) — best value-for-money players |
 | `nfl_injury_return` | Post-return snap-share recovery (% of pre-injury baseline) at +1..+8 weeks, by normalized injury type and position |
-| `nfl_catalog` | List all loaded tables with row counts and last refresh time |
+| `nfl_catalog` | Every dataset in the ingest log, with row counts, the seasons it has, `missing_seasons`, `issues`, and last refresh |
+
+Every tool answers in one of two shapes. A failure is a JSON object with `error` (the message) and
+`code` (a stable code such as `INVALID_INPUT`, `UNKNOWN_TEAM`, `OUT_OF_COVERAGE`, `TIMEOUT`, or
+`SQL_ERROR`), and the MCP result is flagged as an error. An answer that had to cut a list short
+says so with `truncated: true` next to its count. A question the loaded data cannot answer, such
+as a team the league never had or a season before the dataset starts, is a failure with a code,
+not an empty list.
 
 ## Key columns in `plays`
 
@@ -362,9 +403,12 @@ pytest -m integration  # integration tests (requires loaded DB)
 - `nfl-mcp doctor` is the fastest way to verify config, database, and client setup.
 - If tools return database errors, run `nfl-mcp ingest` to ensure data is loaded.
 - You can override the DB location with `NFL_MCP_DB_PATH=/path/to/nflread.duckdb`.
-- Re-running `nfl-mcp ingest` is safe — it skips completed seasons and re-fetches only the current season and static tables.
+- Re-running `nfl-mcp ingest` is safe. It skips seasons whose rows are in the database, and
+  re-fetches the current season, the static tables, and any season last loaded before it ended.
 - Stats for a game usually appear in nflverse within a few hours; play-by-play is rebuilt overnight and official stat corrections land midweek. Locally, run `nfl-mcp ingest` after that; in the container, the scheduled updater does it (log: `/var/log/nflmcp/nfl_update.log`).
-- In the container, `nfl_status`'s `last_refreshed` shows which data the endpoint is serving. If it never advances, the updater is not running — check that `ENTRYPOINT` is `/entrypoint.sh` and that `/data/nflread.duckdb` is a symlink.
+- In the container, `nfl_status`'s `last_refreshed` shows which data the endpoint is serving. If
+  it never advances, the updater is not running. Check that `ENTRYPOINT` is `/entrypoint.sh` and
+  that `/data/nflread.duckdb` is a symlink to `nflread_a.duckdb` or `nflread_b.duckdb`.
 
 ## License
 
