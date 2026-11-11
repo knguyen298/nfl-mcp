@@ -5,18 +5,22 @@ Tools: nfl_schema, nfl_status, nfl_query, nfl_search_plays, nfl_team_stats, nfl_
 """
 
 import contextlib
+import inspect
+import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
+import jsonschema
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp.types import TextContent, Tool
+from mcp.types import CallToolResult, TextContent, Tool
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.routing import Route
 
+from .status import ErrorCode
 from .tools import (
     nfl_schema, nfl_status, nfl_query, nfl_search_plays,
     nfl_team_stats, nfl_player_stats, nfl_compare,
@@ -25,32 +29,94 @@ from .tools import (
     nfl_td_luck, nfl_role_trend, nfl_separation_opportunity,
     nfl_drop_rate, nfl_contract_value, nfl_injury_return,
     nfl_team_records,
+    COMPARE_TYPES, PLAY_TYPES, RANKING_SCOPES, SCHEDULE_SEASON_TYPES, SEASON_TYPES,
+    SITUATIONS, STAT_TYPES, TEAM_STAT_SIDES, first_season,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nfl-mcp")
 
-_mcp_server = Server("nfl-mcp")
+
+_SERVER_INSTRUCTIONS = (
+    "A failed tool call returns a JSON object with `error` (the message) and `code` "
+    "(a stable error code such as INVALID_ARGUMENTS or SQL_ERROR)."
+)
+
+_mcp_server = Server("nfl-mcp", instructions=_SERVER_INSTRUCTIONS)
+
+
+# ── One error shape on the wire ────────────────────────────────────────────────
+#
+# Every failed call, whichever path produced it, reaches the client as a JSON body with
+# `error` (a plain string) and `code` (an ErrorCode value), in a CallToolResult that has
+# isError=True. Tools return that body themselves (tools._err). The server writes it for
+# the failures that happen outside a tool: an unknown name, arguments that fail the input
+# schema or do not fit the signature, and an exception a tool did not catch. Those bodies
+# also carry `tool`, and `type` when an exception caused them.
+
+
+_ERROR_CODES = frozenset(member.value for member in ErrorCode)
+
+
+def _error_body(tool_name: str, code: ErrorCode, message: str, **extra: Any) -> dict[str, Any]:
+    """Build the failure body the server writes for a call that did not reach a result."""
+    return {"error": message, "code": code, "tool": tool_name, **extra}
 
 
 def _tool_error_payload(tool_name: str, exc: Exception) -> dict[str, Any]:
-    if isinstance(exc, ValueError) and str(exc).startswith("Unknown tool:"):
-        code = "UNKNOWN_TOOL"
-    elif isinstance(exc, TimeoutError):
-        code = "TIMEOUT"
-    elif isinstance(exc, TypeError):
-        code = "INVALID_ARGUMENTS"
-    else:
-        code = "TOOL_EXECUTION_ERROR"
+    """Build the failure body for an exception that escaped a tool.
+
+    Argument problems never arrive here: call_tool binds the arguments to the signature
+    before the call, so a TypeError raised inside a tool is a tool bug. TimeoutError is a
+    backstop: every tool catches it from _execute and returns a TIMEOUT body itself.
+    """
+    code = ErrorCode.TIMEOUT if isinstance(exc, TimeoutError) else ErrorCode.TOOL_EXECUTION_ERROR
+    return _error_body(tool_name, code, str(exc), type=type(exc).__name__)
+
+
+def _is_error_result(result: Any) -> bool:
+    """Say whether a tool's return value is a failure body.
+
+    A failure has a string `error` and a `code` that names an ErrorCode. Both checks
+    matter: nfl_compare keys its result by the user's entity names, so an entity called
+    "error" gives a dict value, not a string. Answers such as a `status` of
+    record_not_available have no `error` key and stay successes, and section errors
+    nested inside a successful nfl_status result are not at the top level.
+    """
+    if not isinstance(result, dict):
+        return False
+    error, code = result.get("error"), result.get("code")
+    return isinstance(error, str) and isinstance(code, str) and code in _ERROR_CODES
+
+
+# Fixed-value parameters take their `enum` from the tuples the tools check against, and
+# the season floors come from the same registry lookup the tools refuse with, so a schema
+# cannot accept a value its tool rejects.
+_TEAM_CODES_NOTE = (
+    "Current or former codes both work and match the whole franchise "
+    "(LV or OAK returns every Raiders season). An unknown code returns UNKNOWN_TEAM."
+)
+
+
+def _team_property(text: str = "Team abbreviation (e.g. KC, PHI).") -> dict[str, Any]:
+    """Input-schema property for a team argument, with the accepted-codes sentence."""
+    return {"type": "string", "description": f"{text} {_TEAM_CODES_NOTE}"}
+
+
+def _season_property(tool: str, text: str) -> dict[str, Any]:
+    """Input-schema property for a season argument, naming the tool's first season."""
     return {
-        "ok": False,
-        "error": {
-            "code": code,
-            "type": type(exc).__name__,
-            "message": str(exc),
-            "tool": tool_name,
-        },
+        "type": "integer",
+        "description": (
+            f"{text} Data starts in {first_season(tool)}; an earlier or a future season "
+            "returns OUT_OF_COVERAGE."
+        ),
     }
+
+
+def _enum_property(values: tuple[str, ...], text: str, **extra: Any) -> dict[str, Any]:
+    """Input-schema property for a parameter with a fixed set of values."""
+    return {"type": "string", "enum": list(values), "description": text, **extra}
 
 
 TOOLS = [
@@ -86,7 +152,7 @@ TOOLS = [
     Tool(
         name="nfl_status",
         description=(
-            "Returns database health: play counts, loaded seasons, and a summary of all ingested datasets with row counts and last refresh time. Call this first to understand what data is available."
+            "Returns database health: play counts, loaded seasons, and a summary of all ingested datasets with row counts and last refresh time. Call this first for overall health and play-by-play coverage; use nfl_catalog for per-dataset coverage. The result lists `issues`: ingest attempts that failed, stored no rows, or stored an incomplete season."
         ),
         inputSchema={"type": "object", "properties": {}},
     ),
@@ -111,7 +177,6 @@ TOOLS = [
                     "type": "integer",
                     "description": "Max rows to return (default 100, max 500)",
                     "default": 100,
-                    "maximum": 500,
                 },
             },
             "required": ["sql"],
@@ -128,22 +193,16 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "team": {
-                    "type": "string",
-                    "description": "Offensive team abbreviation (e.g. KC, PHI, BUF)",
-                },
-                "opponent": {
-                    "type": "string",
-                    "description": "Defensive team abbreviation",
-                },
+                "team": _team_property("Offensive team abbreviation (e.g. KC, PHI, BUF)."),
+                "opponent": _team_property("Defensive team abbreviation."),
                 "player": {
                     "type": "string",
                     "description": "Player name (partial match, e.g. 'Mahomes', 'J.Jefferson')",
                 },
-                "season": {
-                    "type": "integer",
-                    "description": "Exact season year (2013 through the current season). Use season_from/season_to for ranges.",
-                },
+                "season": _season_property(
+                    "nfl_search_plays",
+                    "Exact season year. Use season_from/season_to for ranges.",
+                ),
                 "season_from": {
                     "type": "integer",
                     "description": "Start of season range (inclusive), e.g. 2020 for 'since 2020'",
@@ -156,21 +215,12 @@ TOOLS = [
                     "type": "integer",
                     "description": "Week number (1–22)",
                 },
-                "season_type": {
-                    "type": "string",
-                    "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs)",
-                },
-                "play_type": {
-                    "type": "string",
-                    "enum": ["pass", "run", "field_goal", "punt", "kickoff"],
-                    "description": "Type of play",
-                },
-                "situation": {
-                    "type": "string",
-                    "enum": ["red_zone", "third_down", "fourth_down", "two_minute"],
-                    "description": "Game situation filter",
-                },
+                "season_type": _enum_property(
+                    SEASON_TYPES,
+                    "Filter by season type: REG (regular season) or POST (playoffs)",
+                ),
+                "play_type": _enum_property(PLAY_TYPES, "Type of play"),
+                "situation": _enum_property(SITUATIONS, "Game situation filter"),
                 "is_touchdown": {
                     "type": "boolean",
                     "description": "Only touchdown plays",
@@ -201,20 +251,15 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "team": {
-                    "type": "string",
-                    "description": "Team abbreviation (e.g. KC, PHI, BUF, BAL)",
-                },
-                "season": {
-                    "type": "integer",
-                    "description": "Season year. Omit for all available seasons.",
-                },
-                "side": {
-                    "type": "string",
-                    "enum": ["offense", "defense", "situational", "both"],
-                    "description": "Which stats to return (default: both offense + defense + situational)",
-                    "default": "both",
-                },
+                "team": _team_property("Team abbreviation (e.g. KC, PHI, BUF, BAL)."),
+                "season": _season_property(
+                    "nfl_team_stats", "Season year. Omit for all available seasons.",
+                ),
+                "side": _enum_property(
+                    TEAM_STAT_SIDES,
+                    "Which stats to return (default: both offense + defense + situational)",
+                    default="both",
+                ),
             },
             "required": ["team"],
         },
@@ -233,10 +278,9 @@ TOOLS = [
                     "type": "string",
                     "description": "Player name (partial match, e.g. 'Mahomes', 'D.Henry', 'J.Jefferson')",
                 },
-                "season": {
-                    "type": "integer",
-                    "description": "Exact season year. Omit for all seasons.",
-                },
+                "season": _season_property(
+                    "nfl_player_stats", "Exact season year. Omit for all seasons.",
+                ),
                 "season_from": {
                     "type": "integer",
                     "description": "Start of season range (inclusive), e.g. 2020 for 'since 2020'",
@@ -245,17 +289,13 @@ TOOLS = [
                     "type": "integer",
                     "description": "End of season range (inclusive)",
                 },
-                "season_type": {
-                    "type": "string",
-                    "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs)",
-                },
-                "stat_type": {
-                    "type": "string",
-                    "enum": ["passing", "rushing", "receiving"],
-                    "description": "Type of stats to return (default: passing)",
-                    "default": "passing",
-                },
+                "season_type": _enum_property(
+                    SEASON_TYPES,
+                    "Filter by season type: REG (regular season) or POST (playoffs)",
+                ),
+                "stat_type": _enum_property(
+                    STAT_TYPES, "Type of stats to return (default: passing)", default="passing",
+                ),
             },
             "required": ["player_name"],
         },
@@ -266,29 +306,31 @@ TOOLS = [
             "PREFERRED for any comparison question. Side-by-side stats for two teams "
             "or two players in a single call. Always use this instead of calling "
             "nfl_team_stats or nfl_player_stats twice when the user asks to compare, "
-            "rank, or contrast two teams or two players against each other."
+            "rank, or contrast two teams or two players against each other. "
+            "The result also lists `notes`: anything the comparison left out and why "
+            "(a player no play matched, a failed lookup, or season_type in team mode, "
+            "which the team tables cannot split). Two names for the same team or player "
+            "return INVALID_INPUT."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "entity1": {
                     "type": "string",
-                    "description": "First team abbreviation or player name",
+                    "description": f"First team abbreviation or player name. {_TEAM_CODES_NOTE}",
                 },
                 "entity2": {
                     "type": "string",
                     "description": "Second team abbreviation or player name",
                 },
-                "compare_type": {
-                    "type": "string",
-                    "enum": ["team", "player"],
-                    "description": "Whether comparing teams or players (default: team)",
-                    "default": "team",
-                },
-                "season": {
-                    "type": "integer",
-                    "description": "Exact season year. Omit for all seasons.",
-                },
+                "compare_type": _enum_property(
+                    COMPARE_TYPES,
+                    "Whether comparing teams or players (default: team)",
+                    default="team",
+                ),
+                "season": _season_property(
+                    "nfl_compare", "Exact season year. Omit for all seasons.",
+                ),
                 "season_from": {
                     "type": "integer",
                     "description": "Start of season range (inclusive), e.g. 2020 for 'since 2020'",
@@ -297,11 +339,11 @@ TOOLS = [
                     "type": "integer",
                     "description": "End of season range (inclusive)",
                 },
-                "season_type": {
-                    "type": "string",
-                    "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG (regular season) or POST (playoffs)",
-                },
+                "season_type": _enum_property(
+                    SEASON_TYPES,
+                    "Filter by season type: REG (regular season) or POST (playoffs). "
+                    "Player mode only; team mode reports it in `notes` as not applied.",
+                ),
             },
             "required": ["entity1", "entity2"],
         },
@@ -309,9 +351,12 @@ TOOLS = [
     Tool(
         name="nfl_catalog",
         description=(
-            "Returns a catalog of every dataset loaded into the local database: "
+            "Returns a catalog of every dataset in the local database: "
             "table name, row count, seasons available, and when it was last refreshed. "
-            "Call this first to discover what data is available beyond play-by-play."
+            "Use this for per-dataset coverage and gaps; nfl_status is the first call. "
+            "The result lists `missing_seasons` (seasons with no data between the two "
+            "ends a dataset covers) and `issues`: ingest attempts that failed, stored no "
+            "rows, or stored an incomplete season."
         ),
         inputSchema={"type": "object", "properties": {}},
     ),
@@ -325,14 +370,10 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "team": {
-                    "type": "string",
-                    "description": "Team abbreviation (e.g. KC, PHI, BUF)",
-                },
-                "season": {
-                    "type": "integer",
-                    "description": "Season year (e.g. 2024). Omit for all seasons.",
-                },
+                "team": _team_property("Team abbreviation (e.g. KC, PHI, BUF)."),
+                "season": _season_property(
+                    "nfl_roster", "Season year (e.g. 2024). Omit for all seasons.",
+                ),
                 "position": {
                     "type": "string",
                     "description": "Position filter (e.g. QB, WR, LB). Partial match supported.",
@@ -351,14 +392,10 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "team": {
-                    "type": "string",
-                    "description": "Team abbreviation (e.g. KC, PHI)",
-                },
-                "season": {
-                    "type": "integer",
-                    "description": "Season year. Omit for all seasons.",
-                },
+                "team": _team_property(),
+                "season": _season_property(
+                    "nfl_injuries", "Season year. Omit for all seasons.",
+                ),
                 "week": {
                     "type": "integer",
                     "description": "Week number (1–22).",
@@ -384,23 +421,21 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "team": {
-                    "type": "string",
-                    "description": "Team abbreviation — returns all games where team is home or away.",
-                },
-                "season": {
-                    "type": "integer",
-                    "description": "Season year. Omit for all seasons.",
-                },
+                "team": _team_property(
+                    "Team abbreviation — returns all games where team is home or away."
+                ),
+                "season": _season_property(
+                    "nfl_schedule", "Season year. Omit for all seasons.",
+                ),
                 "week": {
                     "type": "integer",
                     "description": "Week number (1–22).",
                 },
-                "season_type": {
-                    "type": "string",
-                    "enum": ["REG", "POST", "SB"],
-                    "description": "Season type filter: REG, POST, or SB (Super Bowl).",
-                },
+                "season_type": _enum_property(
+                    SCHEDULE_SEASON_TYPES,
+                    "Season type filter: REG, POST (every playoff round), or one round: "
+                    "WC (wild card), DIV (divisional), CON (conference), SB (Super Bowl).",
+                ),
             },
         },
     ),
@@ -418,14 +453,10 @@ TOOLS = [
                     "type": "string",
                     "description": "Player name (partial match, e.g. 'Kelce')",
                 },
-                "team": {
-                    "type": "string",
-                    "description": "Team abbreviation (e.g. KC, PHI)",
-                },
-                "season": {
-                    "type": "integer",
-                    "description": "Season year. Omit for all seasons.",
-                },
+                "team": _team_property(),
+                "season": _season_property(
+                    "nfl_snap_counts", "Season year. Omit for all seasons.",
+                ),
                 "week": {
                     "type": "integer",
                     "description": "Week number (1–22).",
@@ -452,14 +483,10 @@ TOOLS = [
                     "type": "string",
                     "description": "Player name (partial match, e.g. 'Jefferson')",
                 },
-                "team": {
-                    "type": "string",
-                    "description": "Team abbreviation (e.g. KC, PHI)",
-                },
-                "season": {
-                    "type": "integer",
-                    "description": "Season year. Omit for all seasons.",
-                },
+                "team": _team_property(),
+                "season": _season_property(
+                    "nfl_fantasy_opportunity", "Season year. Omit for all seasons.",
+                ),
                 "week": {
                     "type": "integer",
                     "description": "Week number (1–22). Omit for full season.",
@@ -492,16 +519,12 @@ TOOLS = [
                     "type": "string",
                     "description": "Position filter (e.g. QB, RB, WR, TE, K, DST).",
                 },
-                "team": {
-                    "type": "string",
-                    "description": "Team abbreviation (e.g. KC, PHI).",
-                },
-                "scope": {
-                    "type": "string",
-                    "enum": ["draft", "week"],
-                    "description": "draft = preseason/dynasty/best-ball rankings; week = current-week start/sit rankings (default: draft).",
-                    "default": "draft",
-                },
+                "team": _team_property("Team abbreviation (e.g. KC, PHI; FA for free agents)."),
+                "scope": _enum_property(
+                    RANKING_SCOPES,
+                    "draft = preseason/dynasty/best-ball rankings; week = current-week start/sit rankings (default: draft).",
+                    default="draft",
+                ),
                 "ranking_set": {
                     "type": "string",
                     "description": "Filter the ranking list/format (partial match). For draft: 'redraft', 'dynasty', 'best', or position-specific like 'redraft-rb'. For week: 'ppr', 'qb', etc.",
@@ -528,22 +551,16 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "team": {
-                    "type": "string",
-                    "description": "Offensive team abbreviation (e.g. KC, PHI).",
-                },
-                "opponent": {
-                    "type": "string",
-                    "description": "Defensive team abbreviation.",
-                },
+                "team": _team_property("Offensive team abbreviation (e.g. KC, PHI)."),
+                "opponent": _team_property("Defensive team abbreviation."),
                 "player": {
                     "type": "string",
                     "description": "Player name (partial match) — matches passer, rusher, or receiver.",
                 },
-                "season": {
-                    "type": "integer",
-                    "description": "Exact season year (2022–present). Use season_from/season_to for ranges.",
-                },
+                "season": _season_property(
+                    "nfl_ftn_charting",
+                    "Exact season year. Use season_from/season_to for ranges.",
+                ),
                 "season_from": {
                     "type": "integer",
                     "description": "Start of season range (inclusive).",
@@ -556,11 +573,9 @@ TOOLS = [
                     "type": "integer",
                     "description": "Week number (1–22).",
                 },
-                "season_type": {
-                    "type": "string",
-                    "enum": ["REG", "POST"],
-                    "description": "Filter by season type: REG or POST.",
-                },
+                "season_type": _enum_property(
+                    SEASON_TYPES, "Filter by season type: REG or POST.",
+                ),
             },
         },
     ),
@@ -579,8 +594,8 @@ TOOLS = [
             "properties": {
                 "player": {"type": "string", "description": "Player full name (partial match)."},
                 "position": {"type": "string", "description": "Position filter (e.g. WR, RB, TE)."},
-                "team": {"type": "string", "description": "Team abbreviation (e.g. KC)."},
-                "season": {"type": "integer", "description": "Exact season year."},
+                "team": _team_property("Team abbreviation (e.g. KC)."),
+                "season": _season_property("nfl_td_luck", "Exact season year."),
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
             },
         },
@@ -599,8 +614,8 @@ TOOLS = [
             "properties": {
                 "player": {"type": "string", "description": "Player full name (partial match)."},
                 "position": {"type": "string", "description": "Position filter (e.g. WR, RB)."},
-                "team": {"type": "string", "description": "Team abbreviation."},
-                "season": {"type": "integer", "description": "Exact season year."},
+                "team": _team_property("Team abbreviation."),
+                "season": _season_property("nfl_role_trend", "Exact season year."),
                 "week": {"type": "integer", "description": "Week number."},
                 "min_snap_pct": {"type": "number", "description": "Minimum snap % (0–100) for the week."},
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
@@ -621,8 +636,8 @@ TOOLS = [
             "properties": {
                 "player": {"type": "string", "description": "Player full name (partial match)."},
                 "position": {"type": "string", "description": "Position filter (e.g. WR, TE)."},
-                "team": {"type": "string", "description": "Team abbreviation."},
-                "season": {"type": "integer", "description": "Exact season year (2016+)."},
+                "team": _team_property("Team abbreviation."),
+                "season": _season_property("nfl_separation_opportunity", "Exact season year."),
                 "regression_candidate": {
                     "type": "boolean",
                     "description": "If true, only return flagged positive-regression candidates.",
@@ -644,8 +659,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "player": {"type": "string", "description": "Player name (partial match, short form)."},
-                "team": {"type": "string", "description": "Team abbreviation."},
-                "season": {"type": "integer", "description": "Exact season year (2022+)."},
+                "team": _team_property("Team abbreviation."),
+                "season": _season_property("nfl_drop_rate", "Exact season year."),
                 "min_targets": {"type": "integer", "description": "Minimum catchable targets to qualify."},
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
             },
@@ -665,8 +680,8 @@ TOOLS = [
             "properties": {
                 "player": {"type": "string", "description": "Player full name (partial match)."},
                 "position": {"type": "string", "description": "Position filter (e.g. RB, WR)."},
-                "team": {"type": "string", "description": "Team abbreviation."},
-                "season": {"type": "integer", "description": "Exact season year."},
+                "team": _team_property("Team abbreviation."),
+                "season": _season_property("nfl_contract_value", "Exact season year."),
                 "min_apy": {"type": "number", "description": "Minimum APY in $millions."},
                 "max_apy": {"type": "number", "description": "Maximum APY in $millions."},
                 "limit": {"type": "integer", "description": "Max rows (default 50, max 500)."},
@@ -708,9 +723,12 @@ TOOLS = [
         name="nfl_team_records",
         description=(
             "PREFERRED for win-loss, record and standings questions. Returns each "
-            "franchise's final regular-season record, 1970 to present. Use the team's "
+            "franchise's regular-season record, 1970 to present. Use the team's "
             "CURRENT abbreviation ('LV' for the Raiders in every era); rows include the "
-            "name the club played that season under. Pre-1999 seasons need the optional "
+            "name the club played that season under, and `complete` is false while a "
+            "season is still being played (the record is to date, not final). A team with "
+            "a season range also returns `gaps`: each season in the range with no record, "
+            "and why. Pre-1999 seasons need the optional "
             "'nfl-mcp ingest --pre1999' pull and report record_not_available if absent."
         ),
         inputSchema={
@@ -725,7 +743,7 @@ TOOLS = [
                 },
                 "season": {
                     "type": "integer",
-                    "description": "Season year (1970 or later).",
+                    "description": "Season year (1970 or later). A future season returns OUT_OF_COVERAGE.",
                 },
                 "from_season": {
                     "type": "integer",
@@ -746,45 +764,70 @@ async def list_tools() -> list[Tool]:
     return TOOLS
 
 
-@_mcp_server.call_tool()
-async def call_tool(name: str, arguments: Any) -> list[TextContent]:
-    import json
+_DISPATCH: dict[str, Callable[..., Any]] = {
+    "nfl_schema":       nfl_schema,
+    "nfl_status":       nfl_status,
+    "nfl_query":        nfl_query,
+    "nfl_search_plays": nfl_search_plays,
+    "nfl_team_stats":   nfl_team_stats,
+    "nfl_player_stats": nfl_player_stats,
+    "nfl_compare":      nfl_compare,
+    "nfl_catalog":      nfl_catalog,
+    "nfl_roster":       nfl_roster,
+    "nfl_injuries":     nfl_injuries,
+    "nfl_schedule":     nfl_schedule,
+    "nfl_snap_counts":          nfl_snap_counts,
+    "nfl_fantasy_opportunity":  nfl_fantasy_opportunity,
+    "nfl_fantasy_rankings":     nfl_fantasy_rankings,
+    "nfl_ftn_charting":         nfl_ftn_charting,
+    "nfl_td_luck":              nfl_td_luck,
+    "nfl_role_trend":           nfl_role_trend,
+    "nfl_separation_opportunity": nfl_separation_opportunity,
+    "nfl_drop_rate":            nfl_drop_rate,
+    "nfl_contract_value":       nfl_contract_value,
+    "nfl_injury_return":        nfl_injury_return,
+    "nfl_team_records":         nfl_team_records,
+}
 
-    _DISPATCH = {
-        "nfl_schema":       nfl_schema,
-        "nfl_status":       nfl_status,
-        "nfl_query":        nfl_query,
-        "nfl_search_plays": nfl_search_plays,
-        "nfl_team_stats":   nfl_team_stats,
-        "nfl_player_stats": nfl_player_stats,
-        "nfl_compare":      nfl_compare,
-        "nfl_catalog":      nfl_catalog,
-        "nfl_roster":       nfl_roster,
-        "nfl_injuries":     nfl_injuries,
-        "nfl_schedule":     nfl_schedule,
-        "nfl_snap_counts":          nfl_snap_counts,
-        "nfl_fantasy_opportunity":  nfl_fantasy_opportunity,
-        "nfl_fantasy_rankings":     nfl_fantasy_rankings,
-        "nfl_ftn_charting":         nfl_ftn_charting,
-        "nfl_td_luck":              nfl_td_luck,
-        "nfl_role_trend":           nfl_role_trend,
-        "nfl_separation_opportunity": nfl_separation_opportunity,
-        "nfl_drop_rate":            nfl_drop_rate,
-        "nfl_contract_value":       nfl_contract_value,
-        "nfl_injury_return":        nfl_injury_return,
-        "nfl_team_records":         nfl_team_records,
-    }
+_TOOLS_BY_NAME: dict[str, Tool] = {tool.name: tool for tool in TOOLS}
+
+
+def _call_result(body: Any) -> CallToolResult:
+    """Serialize a tool's return value, and flag it as an error when it is a failure body."""
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(body, indent=2, default=str))],
+        isError=_is_error_result(body),
+    )
+
+
+# validate_input=False: the SDK would answer a schema failure with bare text
+# ("Input validation error: ..."). call_tool runs the same jsonschema check itself, so
+# that failure gets the same JSON body and code as every other one.
+@_mcp_server.call_tool(validate_input=False)
+async def call_tool(name: str, arguments: Any) -> CallToolResult:
+    arguments = arguments or {}
+    fn = _DISPATCH.get(name)
+    if fn is None:
+        return _call_result(_error_body(name, ErrorCode.UNKNOWN_TOOL, f"Unknown tool: {name}"))
 
     try:
-        fn = _DISPATCH.get(name)
-        if fn is None:
-            raise ValueError(f"Unknown tool: {name}")
-        result = fn(**arguments) if arguments else fn()
-        return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+        jsonschema.validate(instance=arguments, schema=_TOOLS_BY_NAME[name].inputSchema)
+    except jsonschema.ValidationError as e:
+        message = f"Input validation error: {e.message}"
+        return _call_result(_error_body(name, ErrorCode.INVALID_ARGUMENTS, message))
 
+    try:
+        inspect.signature(fn).bind(**arguments)
+    except TypeError as e:
+        message = f"Invalid arguments for {name}: {e}"
+        return _call_result(_error_body(name, ErrorCode.INVALID_ARGUMENTS, message))
+
+    try:
+        result = fn(**arguments)
     except Exception as e:
-        logger.error(f"Error in {name}: {e}", exc_info=True)
-        return [TextContent(type="text", text=json.dumps(_tool_error_payload(name, e), indent=2))]
+        logger.error("Error in %s: %s", name, e, exc_info=True)
+        return _call_result(_tool_error_payload(name, e))
+    return _call_result(result)
 
 
 def create_app() -> Starlette:

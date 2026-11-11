@@ -54,6 +54,7 @@ class TestNflSchema:
         result = nfl_schema(category="nonexistent")
         assert "error" in result
         assert "available" in result
+        assert result["code"] == "INVALID_INPUT"
 
 
 @pytest.mark.integration
@@ -99,6 +100,7 @@ class TestNflSchemaIntegration:
         assert "error" in result
         assert "available_tables" in result
         assert len(result["available_tables"]) > 0
+        assert result["code"] == "TABLE_NOT_FOUND"
 
 
 @pytest.mark.integration
@@ -109,6 +111,8 @@ class TestNflSearchPlays:
         assert "error" not in result
         assert result["row_count"] > 0
         assert all(r["posteam"] == "KC" for r in result["rows"])
+        # KC 2024 has far more than 5 plays, so the cap must report the cut.
+        assert result["truncated"] is True
 
     def test_search_by_player(self):
         result = nfl_search_plays(player="Mahomes", season=2024, max_rows=5)
@@ -138,6 +142,7 @@ class TestNflSearchPlays:
         result = nfl_search_plays(max_rows=10)
         assert "error" not in result
         assert result["row_count"] > 0
+        assert result["truncated"] is True
 
 
 @pytest.mark.integration
@@ -165,10 +170,11 @@ class TestNflTeamStats:
         assert "situational" in result
         assert len(result["situational"]) > 0
 
-    def test_invalid_team_returns_empty(self):
+    def test_unknown_team_is_an_unknown_team_error(self):
+        # Was an empty success; a mistyped team now says so instead of "no data".
         result = nfl_team_stats(team="ZZZ", season=2024)
-        assert "error" not in result
-        assert len(result["offense"]) == 0
+        assert result["code"] == "UNKNOWN_TEAM"
+        assert result["error"] == "Unknown team 'ZZZ'."
 
 
 @pytest.mark.integration
@@ -244,6 +250,10 @@ class TestNflStatus:
         assert "loaded" in datasets
         assert datasets["total_loaded"] > 0
         assert isinstance(datasets["loaded"], list)
+        # A database written before the outcome columns exists reports no issues.
+        assert isinstance(datasets["issues"], list)
+        assert all(set(issue) == {"dataset_id", "season", "status", "detail"}
+                   for issue in datasets["issues"])
 
     def test_datasets_loaded_entries_have_fields(self):
         loaded = nfl_status()["datasets"]["loaded"]
@@ -265,14 +275,31 @@ class TestNflCatalog:
 
     def test_includes_row_counts(self):
         result = nfl_catalog()
+        datasets_with_rows = 0
         for ds in result["datasets"]:
             assert "dataset_id" in ds
             assert "total_rows" in ds
-            assert ds["total_rows"] > 0
+            if not ds["seasons_loaded"]:
+                # The ingest log knows only attempts that landed nothing (failed/empty),
+                # so the dataset is listed and reads as zero rows.
+                assert ds["total_rows"] == 0
+                assert ds["issues"]
+            else:
+                assert ds["total_rows"] > 0
+                datasets_with_rows += 1
+        assert datasets_with_rows > 0
 
     def test_total_datasets_matches_list(self):
         result = nfl_catalog()
         assert result["total_datasets"] == len(result["datasets"])
+
+    def test_each_dataset_reports_gaps_and_failed_attempts(self):
+        result = nfl_catalog()
+        for ds in result["datasets"]:
+            assert isinstance(ds["missing_seasons"], list)
+            assert ds["missing_seasons"] == sorted(ds["missing_seasons"])
+            assert isinstance(ds["issues"], list)
+            assert all(set(issue) == {"season", "status", "detail"} for issue in ds["issues"])
 
 
 @pytest.mark.integration
@@ -282,6 +309,7 @@ class TestNflRoster:
         result = nfl_roster(team="KC", season=2024)
         assert "error" not in result
         assert result["count"] > 0
+        assert result["truncated"] is False  # one roster is far under the 500-row cap
         assert all(r["team"] == "KC" for r in result["players"])
         assert all(r["season"] == 2024 for r in result["players"])
 
@@ -296,10 +324,18 @@ class TestNflRoster:
         for field in ("full_name", "position", "team", "season"):
             assert field in row
 
-    def test_unknown_team_returns_empty(self):
+    def test_unknown_team_is_an_unknown_team_error(self):
+        # Was an empty success; a mistyped team now says so instead of "no data".
         result = nfl_roster(team="ZZZ", season=2024)
-        assert "error" not in result
-        assert result["count"] == 0
+        assert result["code"] == "UNKNOWN_TEAM"
+
+    def test_former_code_returns_the_same_franchise_rows(self):
+        # OAK is the Raiders' code before 2020; it must reach the LV rows, and the other
+        # way round, so a query across the move returns both sides of it.
+        current = nfl_roster(team="LV", season=2024)
+        former = nfl_roster(team="OAK", season=2024)
+        assert current["count"] > 0
+        assert former["players"] == current["players"]
 
 
 @pytest.mark.integration
@@ -356,6 +392,12 @@ class TestNflSchedule:
         assert "error" not in result
         assert all(r["game_type"] == "REG" for r in result["games"])
 
+    def test_post_season_type_returns_every_playoff_round(self):
+        # schedules.game_type has no POST value; POST used to match nothing at all.
+        result = nfl_schedule(team="KC", season=2024, season_type="POST")
+        assert result["count"] > 0
+        assert {r["game_type"] for r in result["games"]} <= {"WC", "DIV", "CON", "SB"}
+
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("require_db")
@@ -383,6 +425,8 @@ class TestNflSnapCounts:
                 assert field in row
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("require_db")
 class TestNflFantasyOpportunity:
     def test_no_filters_returns_results(self):
         result = nfl_fantasy_opportunity(season=2024)
@@ -396,9 +440,9 @@ class TestNflFantasyOpportunity:
         result = nfl_fantasy_opportunity(team="KC", position="WR", season=2024)
         assert "error" not in result
 
-    def test_future_season_returns_dict(self):
+    def test_future_season_is_out_of_coverage(self):
         result = nfl_fantasy_opportunity(season=2099)
-        assert isinstance(result, dict)
+        assert result["code"] == "OUT_OF_COVERAGE"
 
     def test_filter_by_week(self):
         result = nfl_fantasy_opportunity(team="KC", season=2024, week=1)
@@ -411,6 +455,8 @@ class TestNflFantasyOpportunity:
         assert "boom" in result["error"]
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("require_db")
 class TestNflFantasyRankings:
     def test_draft_scope_returns_results(self):
         result = nfl_fantasy_rankings(scope="draft")
@@ -457,6 +503,7 @@ class TestNflFantasyRankings:
     def test_limit_is_capped(self):
         result = nfl_fantasy_rankings(scope="draft", limit=99999)
         assert result["count"] <= 500
+        assert isinstance(result["truncated"], bool)
 
     def test_db_error_returns_error_dict(self):
         with patch("nfl_mcp.tools._execute", side_effect=duckdb.Error("boom")):
@@ -465,6 +512,7 @@ class TestNflFantasyRankings:
         assert "boom" in result["error"]
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("require_db")
 class TestNflFtnCharting:
     def test_filter_by_team_and_season(self):
@@ -488,10 +536,16 @@ class TestNflFtnCharting:
         assert "error" not in result
         assert result["total_plays"] > 0
 
-    def test_no_matching_plays_returns_empty(self):
+    def test_season_before_ftn_coverage_is_out_of_coverage(self):
+        # Was the empty shape below; 1999 is a season FTN never charted.
         result = nfl_ftn_charting(team="KC", season=1999)
-        assert result["total_plays"] == 0
-        assert result["charting"] == {}
+        assert result["code"] == "OUT_OF_COVERAGE"
+        assert result["first_season"] == 2022
+
+    def test_valid_question_with_no_matching_plays_stays_empty(self):
+        # A team never has the ball against itself: understood, and truly empty.
+        result = nfl_ftn_charting(team="KC", opponent="KC", season=2024)
+        assert result == {"charting": {}, "total_plays": 0}
 
 
 @pytest.mark.integration
@@ -725,6 +779,7 @@ class TestNflTeamRecords:
         assert result["status"] == "franchise_not_yet_active"
         assert result["first_season"] == 2002
         assert result["records"] == []
+        assert result["truncated"] is False
 
     def test_franchise_that_sat_a_season_out(self):
         result = nfl_team_records(team="CLE", season=1997)
@@ -753,7 +808,8 @@ class TestNflTeamRecords:
     def test_range_filters_are_passed_as_parameters(self):
         with patch("nfl_mcp.tools._execute", return_value=[]) as execute:
             nfl_team_records(team="LV", from_season=1970, to_season=1980)
-        sql, params = execute.call_args[0]
+        # The first call is the records query; a pre-1999 miss also reads the ingest log.
+        sql, params = execute.call_args_list[0][0]
         assert "season >= ?" in sql and "season <= ?" in sql
         assert params == ["LV", 1970, 1980]
 
@@ -765,6 +821,8 @@ class TestNflTeamRecords:
         assert params == [2024]
 
     def test_missing_pre1999_record_points_at_the_opt_in_pull(self):
+        # `return_value=[]` also answers the extra ingest-log lookup: no `status` column,
+        # no `espn_records` row, so the advice to run the opt-in pull stays.
         with patch("nfl_mcp.tools._execute", return_value=[]):
             result = nfl_team_records(team="GB", season=1996)
         assert result["status"] == "record_not_available"
@@ -789,6 +847,7 @@ class TestNflTeamRecordsIntegration:
         result = nfl_team_records(season=2024)
         assert "error" not in result
         assert result["count"] >= 30
+        assert result["truncated"] is False  # one season is far under the 500-row cap
         teams = {row["team"] for row in result["records"]}
         assert len(teams) == result["count"]
 
@@ -797,6 +856,7 @@ class TestNflTeamRecordsIntegration:
         assert row["wins"] + row["losses"] + row["ties"] == row["games"] == 17
         assert row["source"] == "nflverse"
         assert row["club"] == "Kansas City Chiefs"
+        assert row["complete"] is True
 
     def test_alias_finds_the_same_franchise(self):
         modern = nfl_team_records(team="LV", season=2024)["records"]
@@ -812,3 +872,21 @@ class TestNflTeamRecordsIntegration:
         assert all(row["team"] == "PHI" for row in bounded)
         unbounded = nfl_team_records(team="PHI")["records"]
         assert len(bounded) <= len(unbounded)
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("require_db")
+class TestErrorCodePayloads:
+    """Real DuckDB failures must reach the caller as a code, not only as prose."""
+
+    def test_missing_table_reports_table_not_found(self):
+        result = nfl_query("SELECT * FROM definitely_not_a_table")
+        assert result["code"] == "TABLE_NOT_FOUND"
+        assert result["unknown_table"] == "definitely_not_a_table"
+        assert isinstance(result["error"], str)
+
+    def test_invented_column_reports_column_not_found(self):
+        result = nfl_query("SELECT play_epa FROM plays")
+        assert result["code"] == "COLUMN_NOT_FOUND"
+        assert result["unknown_column"] == "play_epa"
+        assert "epa" in result["did_you_mean"]

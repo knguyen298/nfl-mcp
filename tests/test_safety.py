@@ -1,7 +1,17 @@
 """Tests for SQL safety guardrails in nfl_mcp.tools."""
 
+import duckdb
 import pytest
-from nfl_mcp.tools import nfl_query, _FORBIDDEN
+
+from nfl_mcp import tools
+from nfl_mcp.status import ErrorCode
+from nfl_mcp.tools import (
+    _FORBIDDEN,
+    _FORBIDDEN_FUNCTIONS,
+    _FORBIDDEN_KEYWORDS,
+    _mask_sql,
+    nfl_query,
+)
 
 
 # ── Forbidden keyword detection ────────────────────────────────────────────────
@@ -16,6 +26,8 @@ class TestForbiddenRegex:
         "REINDEX", "COMMENT", "SECURITY", "OWNER", "TABLESPACE",
         "SCHEMA", "SET", "DO", "LISTEN", "NOTIFY", "PREPARE",
         "DEALLOCATE", "LOAD", "DISCARD", "RESET",
+        "ATTACH", "DETACH", "INSTALL", "PRAGMA", "EXPORT", "IMPORT",
+        "CHECKPOINT", "USE",
     ])
     def test_blocks_dangerous_keywords(self, keyword):
         assert _FORBIDDEN.search(keyword), f"Should block: {keyword}"
@@ -25,6 +37,14 @@ class TestForbiddenRegex:
         "pg_read_file", "pg_read_binary_file", "pg_write_file",
         "pg_sleep", "lo_import", "lo_export", "dblink",
         "current_setting", "pg_terminate_backend", "pg_cancel_backend",
+        "read_text", "read_blob", "read_csv", "read_csv_auto", "sniff_csv",
+        "read_parquet", "parquet_scan", "parquet_metadata", "parquet_schema",
+        "parquet_file_metadata", "parquet_kv_metadata", "parquet_full_metadata",
+        "parquet_bloom_probe", "read_json", "read_json_auto", "read_json_objects",
+        "read_json_objects_auto", "read_ndjson", "read_ndjson_auto",
+        "read_ndjson_objects", "read_duckdb", "query", "query_table",
+        "json_execute_serialized_sql", "arrow_scan", "arrow_scan_dumb",
+        "pandas_scan", "python_map_function",
     ])
     def test_blocks_dangerous_functions(self, keyword):
         assert _FORBIDDEN.search(keyword), f"Should block function: {keyword}"
@@ -38,8 +58,21 @@ class TestForbiddenRegex:
                      "THEN", "ELSE", "END", "AS", "ON", "AND", "OR", "NOT",
                      "IN", "BETWEEN", "LIKE", "ILIKE", "IS", "NULL",
                      "COUNT", "SUM", "AVG", "MIN", "MAX", "ROUND",
-                     "COALESCE", "NULLIF", "DISTINCT", "LIMIT", "OFFSET"]:
+                     "COALESCE", "NULLIF", "DISTINCT", "LIMIT", "OFFSET",
+                     "WITH", "GLOB", "desc", "settings", "offset_yards", "reset_x"]:
             assert _FORBIDDEN.search(word) is None, f"Should allow: {word}"
+
+    def test_lists_and_pattern_agree(self):
+        """The pattern is built from the two lists: every listed word is blocked."""
+        for word in _FORBIDDEN_KEYWORDS + _FORBIDDEN_FUNCTIONS:
+            assert _FORBIDDEN.fullmatch(word), word
+
+    def test_glob_blocked_only_as_a_function_call(self):
+        """GLOB is also a string-match operator, so only glob( is blocked."""
+        assert _FORBIDDEN.search("SELECT * FROM glob('/tmp/*')")
+        assert _FORBIDDEN.search("SELECT * FROM GLOB ('/tmp/*')")
+        assert _FORBIDDEN.search("SELECT * FROM glob   ('/tmp/*')")
+        assert _FORBIDDEN.search("WHERE \"desc\" GLOB '*TOUCHDOWN*'") is None
 
 
 # ── nfl_query guardrails ──────────────────────────────────────────────────────
@@ -101,6 +134,18 @@ class TestNflQueryGuardrails:
         # Should not error on max_rows being too large — it gets clamped
         assert "error" not in result or "max_rows" not in result.get("error", "")
 
+    @pytest.mark.parametrize("sql,code", [
+        ("INSERT INTO plays VALUES (1)", "NOT_SELECT"),
+        ("DELETE FROM plays", "NOT_SELECT"),
+        ("SELECT pg_sleep(100)", "FORBIDDEN_KEYWORD"),
+        ("SELECT 1; SELECT 2", "MULTIPLE_STATEMENTS"),
+    ])
+    def test_guardrail_errors_carry_a_machine_readable_code(self, sql, code):
+        """A caller branches on `code` instead of reading the English `error` text."""
+        result = nfl_query(sql)
+        assert result["code"] == code
+        assert isinstance(result["error"], str)
+
 
 # ── nfl_query with live DuckDB ────────────────────────────────────────────────
 
@@ -138,3 +183,394 @@ class TestNflQueryLive:
     def test_truncation_flag(self):
         result = nfl_query("SELECT * FROM plays", max_rows=3)
         assert result["truncated"] is True
+
+
+# ── Lexical masking ───────────────────────────────────────────────────────────
+
+@pytest.fixture
+def captured(monkeypatch):
+    """Replace _execute: record the SQL nfl_query would run, return one row."""
+    seen = []
+
+    def fake_execute(sql, params=None):
+        seen.append(sql)
+        return [{"ok": 1}]
+
+    monkeypatch.setattr(tools, "_execute", fake_execute)
+    return seen
+
+
+class TestMaskSql:
+    """_mask_sql blanks literals, quoted names and comments the way DuckDB lexes them."""
+
+    # (sql, the parts DuckDB does not run as code). A literal or quoted name becomes a
+    # run of `#`, a comment becomes spaces; everything else is kept as is.
+    @pytest.mark.parametrize("sql,masked_parts", [
+        ("SELECT 'set'", ["'set'"]),
+        ("SELECT 'it''s; set'", ["'it''s; set'"]),
+        ('SELECT "de""sc"', ['"de""sc"']),
+        ("SELECT 1 -- set; x", ["-- set; x"]),
+        ("SELECT 1 -- set\n, 2", ["-- set"]),
+        ("SELECT 1 -- set\r, 2", ["-- set"]),
+        ("SELECT /* a /* set */ b */ 1", ["/* a /* set */ b */"]),
+        ("SELECT E'a\\'b; set'", ["E'a\\'b; set'"]),
+        ("SELECT e'a\\\\', 1", ["e'a\\\\'"]),
+        ("SELECT X'1F', B'01'", ["X'1F'", "B'01'"]),
+        ("SELECT 'a\\', 1", ["'a\\'"]),
+        ("SELECT $$it's; set$$", ["$$it's; set$$"]),
+        ("SELECT $t$ a $$ set $t$", ["$t$ a $$ set $t$"]),
+        ("SELECT 1 AS a$b$, 2", []),
+        ("SELECT 'é; set', 1", ["'é; set'"]),
+        ("SELECT 'a'||'b'", ["'a'", "'b'"]),
+        ("SELECT abcE'x'", ["'x'"]),
+    ])
+    def test_masks_what_duckdb_does_not_run_as_code(self, sql, masked_parts):
+        expected = sql
+        for part in masked_parts:
+            fill = " " if part.startswith(("--", "/*")) else "#"
+            expected = expected.replace(part, fill * len(part), 1)
+        masked, _ = _mask_sql(sql)
+        assert masked == expected
+        assert len(masked) == len(sql)
+
+    def test_returns_the_unescaped_quoted_names(self):
+        assert _mask_sql('SELECT "a""b", "desc" FROM t')[1] == ['a"b', "desc"]
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT 'abc",
+        "SELECT 'it''s",
+        "SELECT \"desc",
+        "SELECT 1 /* x",
+        "SELECT 1 /* a /* b */",
+        "SELECT $$ x",
+        "SELECT $t$ x $u$",
+        "SELECT E'abc\\'",
+    ])
+    def test_unterminated_construct_returns_none(self, sql):
+        assert _mask_sql(sql) is None
+
+    def test_disagreement_with_the_engine_returns_none(self):
+        # DuckDB lexes 1E'x' as the number 1 and the E-string E'x'; the scanner reads the
+        # E as part of the number. They disagree on where the literal starts.
+        assert _mask_sql("SELECT 1E'x'") is None
+
+    def test_engine_token_inside_a_masked_span_returns_none(self, monkeypatch):
+        # A tokenizer that starts a token inside the comment: the engine would run that
+        # text as code while the scanner skipped it.
+        monkeypatch.setattr(duckdb, "tokenize", lambda sql: [(0, duckdb.token_type.keyword),
+                                                             (12, duckdb.token_type.keyword)])
+        assert _mask_sql("SELECT 1 /* SET */") is None
+
+    def test_literal_the_engine_does_not_see_returns_none(self, monkeypatch):
+        monkeypatch.setattr(duckdb, "tokenize", lambda sql: [(0, duckdb.token_type.keyword)])
+        assert _mask_sql("SELECT 'x'") is None
+
+
+# ── nfl_query: what is now allowed ──────────────────────────────────────────
+
+class TestNflQueryAllows:
+    @pytest.mark.parametrize("sql", [
+        "SELECT \"desc\" FROM plays WHERE \"desc\" ILIKE '%set%'",
+        "SELECT \"desc\" FROM plays WHERE \"desc\" ILIKE '%Call%'",
+        "SELECT * FROM plays WHERE \"desc\" ILIKE '%DROP TABLE%' OR \"desc\" ILIKE '%delete%'",
+        "SELECT 'a;b' AS s",
+        "SELECT 'a -- b /* c' AS s",
+        "SELECT 'it''s; set' AS s",
+        "SELECT 1 AS \"set\"",
+        "SELECT 1 AS \"drop zone\"",
+        "SELECT 1 AS \"read_text_column\"",
+        "WITH kc AS (SELECT * FROM plays WHERE posteam = 'KC') SELECT count(*) FROM kc",
+        "with a AS (SELECT 1 AS x), b AS (SELECT x FROM a) SELECT * FROM b",
+        "-- top 5\nSELECT 1",
+        "/* note */ SELECT 1",
+        "/* a /* nested */ b */\n-- line\nWITH a AS (SELECT 1) SELECT * FROM a",
+        "SELECT $$ ; set $$ AS s",
+        "SELECT E'it\\'s; set' AS s",
+        "SELECT 1 FROM plays WHERE \"desc\" GLOB '*TOUCHDOWN*'",
+    ])
+    def test_passes_the_guard(self, captured, sql):
+        result = nfl_query(sql)
+        assert "error" not in result, result
+        assert len(captured) == 1
+
+    def test_wrap_keeps_the_body_and_drops_trailing_semicolons_and_comments(self, captured):
+        nfl_query("SELECT 'a;b' AS s ; ; -- done\n/* end */", max_rows=5)
+        assert captured == ["SELECT * FROM (SELECT 'a;b' AS s) AS _q LIMIT 6"]
+
+    def test_trailing_line_comment_cannot_swallow_the_wrap(self, captured):
+        nfl_query("SELECT 1 AS x -- note", max_rows=5)
+        assert captured == ["SELECT * FROM (SELECT 1 AS x) AS _q LIMIT 6"]
+
+
+# ── nfl_query: bypass attempts ────────────────────────────────────────────────
+
+class TestNflQueryBypassAttempts:
+    @pytest.mark.parametrize("sql,code", [
+        # a keyword separated from its call or its statement by a comment
+        ("SELECT * FROM read_text/**/('/etc/passwd')", ErrorCode.FORBIDDEN_KEYWORD),
+        ("SELECT * FROM read_text--x\n('/etc/passwd')", ErrorCode.FORBIDDEN_KEYWORD),
+        ("SELECT 1 /**/;/**/ SELECT 2", ErrorCode.MULTIPLE_STATEMENTS),
+        ("SELECT 1 --x\n; SELECT 2", ErrorCode.MULTIPLE_STATEMENTS),
+        ("SELECT 1 --x\r; SELECT 2", ErrorCode.MULTIPLE_STATEMENTS),
+        # hidden after a literal with an escaped quote
+        ("SELECT 'it''s', read_text('/etc/passwd')", ErrorCode.FORBIDDEN_KEYWORD),
+        ("SELECT E'it\\'s', read_text('/etc/passwd')", ErrorCode.FORBIDDEN_KEYWORD),
+        # in a plain string a backslash is not an escape: the literal ends at the 2nd quote
+        ("SELECT 'a\\', read_text('/etc/passwd') --'", ErrorCode.FORBIDDEN_KEYWORD),
+        ("SELECT \"a\"\"\", read_text('/etc/passwd')", ErrorCode.FORBIDDEN_KEYWORD),
+        # mixed case
+        ("SeLeCt * FrOm ReAd_TeXt('/etc/passwd')", ErrorCode.FORBIDDEN_KEYWORD),
+        ("select 1 WHERE 1 = 1 oR 1 IN (sElEcT 1 FROM plays) UnIoN SELECT 1; dRoP TABLE plays",
+         ErrorCode.FORBIDDEN_KEYWORD),
+        # inside a CTE
+        ("WITH x AS (SELECT * FROM read_csv('/etc/passwd')) SELECT * FROM x",
+         ErrorCode.FORBIDDEN_KEYWORD),
+        ("WITH x AS (DELETE FROM plays RETURNING *) SELECT * FROM x", ErrorCode.FORBIDDEN_KEYWORD),
+        # a second statement after a literal that contains a quote
+        ("SELECT 'O''Brien'; SELECT 2", ErrorCode.MULTIPLE_STATEMENTS),
+        ("SELECT E'\\''; SELECT 2", ErrorCode.MULTIPLE_STATEMENTS),
+        ("SELECT \"a;\"\"b\"; SELECT 2", ErrorCode.MULTIPLE_STATEMENTS),
+        # dollar-quoted strings
+        ("SELECT $t$ ; $t$; SELECT 2", ErrorCode.MULTIPLE_STATEMENTS),
+        ("SELECT $$x$$, read_text('/etc/passwd')", ErrorCode.FORBIDDEN_KEYWORD),
+        # a quoted function name
+        ("SELECT * FROM \"read_text\"('/etc/passwd')", ErrorCode.FORBIDDEN_KEYWORD),
+        ("SELECT * FROM main.\"READ_CSV\"('/etc/passwd')", ErrorCode.FORBIDDEN_KEYWORD),
+        ("SELECT * FROM \"glob\"('/tmp/*')", ErrorCode.FORBIDDEN_KEYWORD),
+        ("SELECT * FROM query('SELECT 1')", ErrorCode.FORBIDDEN_KEYWORD),
+        # unterminated literal, identifier or comment: fail closed
+        ("SELECT 'abc", ErrorCode.SQL_ERROR),
+        ("SELECT 1 /* ; SELECT 2", ErrorCode.SQL_ERROR),
+        ("SELECT \"desc FROM plays", ErrorCode.SQL_ERROR),
+        ("SELECT $$ ; SELECT 2", ErrorCode.SQL_ERROR),
+        ("SELECT E'\\'; SELECT 2", ErrorCode.SQL_ERROR),
+        ("SELECT 1E'x'", ErrorCode.SQL_ERROR),
+        # not a query
+        ("/* SELECT */ DELETE FROM plays", ErrorCode.NOT_SELECT),
+        ("-- SELECT\nINSERT INTO plays VALUES (1)", ErrorCode.NOT_SELECT),
+        ("'SELECT' FROM plays", ErrorCode.NOT_SELECT),
+        ("SET enable_external_access = true", ErrorCode.NOT_SELECT),
+        ("RESET lock_configuration", ErrorCode.NOT_SELECT),
+        ("PRAGMA enable_external_access = true", ErrorCode.NOT_SELECT),
+        ("FROM plays", ErrorCode.NOT_SELECT),
+        ("", ErrorCode.NOT_SELECT),
+        ("SELECT 1; SET enable_external_access = true", ErrorCode.FORBIDDEN_KEYWORD),
+        ("SELECT 1; RESET lock_configuration", ErrorCode.FORBIDDEN_KEYWORD),
+    ])
+    def test_rejected_before_execution(self, captured, sql, code):
+        result = nfl_query(sql)
+        assert result["code"] == code, result
+        assert isinstance(result["error"], str)
+        assert captured == []
+
+    def test_unterminated_message(self, captured):
+        assert nfl_query("SELECT 'abc")["error"] == (
+            "Unterminated or ambiguous string literal, quoted identifier or comment."
+        )
+
+    def test_forbidden_message_names_the_original_text(self, captured):
+        assert nfl_query("SELECT * FROM ReAd_TeXt('x')")["error"] == "Forbidden keyword: 'ReAd_TeXt'"
+        assert nfl_query('SELECT * FROM "Read_Text"(\'x\')')["error"] == "Forbidden keyword: 'Read_Text'"
+
+
+class TestDenylistProperty:
+    """Each denylisted word is fine inside a literal and rejected as a bare token."""
+
+    @pytest.mark.parametrize("word", _FORBIDDEN_KEYWORDS + _FORBIDDEN_FUNCTIONS + ("glob",))
+    def test_inside_a_literal_is_allowed(self, captured, word):
+        for sql in (
+            f"SELECT \"desc\" FROM plays WHERE \"desc\" ILIKE '%{word}%'",
+            f"SELECT '{word.lower()}; {word}(1) -- /*' AS s",
+            f"SELECT $${word}$$ AS s",
+            f"SELECT 1 /* {word} */ AS s -- {word}",
+        ):
+            assert "error" not in nfl_query(sql), sql
+
+    @pytest.mark.parametrize("word", _FORBIDDEN_KEYWORDS + _FORBIDDEN_FUNCTIONS)
+    def test_as_a_bare_token_is_rejected(self, captured, word):
+        for sql in (f"SELECT {word}", f"SELECT 1 FROM plays WHERE {word.lower()} = 1"):
+            result = nfl_query(sql)
+            assert result["code"] == ErrorCode.FORBIDDEN_KEYWORD, sql
+        assert captured == []
+
+    @pytest.mark.parametrize("word", _FORBIDDEN_FUNCTIONS + ("glob",))
+    def test_function_as_a_quoted_name_is_rejected(self, captured, word):
+        result = nfl_query(f'SELECT * FROM "{word}"(\'x\')')
+        assert result["code"] == ErrorCode.FORBIDDEN_KEYWORD
+        assert captured == []
+
+    def test_glob_call_is_rejected(self, captured):
+        assert nfl_query("SELECT * FROM glob('/tmp/*')")["code"] == ErrorCode.FORBIDDEN_KEYWORD
+
+
+# ── nfl_query: max_rows clamp ─────────────────────────────────────────────────
+
+class TestMaxRowsClamp:
+    @pytest.mark.parametrize("max_rows", [0, -1, -500])
+    def test_non_positive_clamps_to_one(self, monkeypatch, max_rows):
+        seen = []
+        monkeypatch.setattr(tools, "_execute",
+                            lambda sql, params=None: seen.append(sql) or [{"x": 1}, {"x": 2}])
+        result = nfl_query("SELECT 1 AS x", max_rows=max_rows)
+        assert seen[0].endswith("LIMIT 2")
+        assert result == {"rows": [{"x": 1}], "row_count": 1, "truncated": True}
+
+    def test_zero_rows_back_is_not_truncated(self, monkeypatch):
+        monkeypatch.setattr(tools, "_execute", lambda sql, params=None: [])
+        assert nfl_query("SELECT 1 WHERE false", max_rows=0) == {
+            "rows": [], "row_count": 0, "truncated": False,
+        }
+
+    def test_large_clamps_to_500(self, captured):
+        nfl_query("SELECT 1", max_rows=10_000)
+        assert captured[0].endswith("LIMIT 501")
+
+
+# ── nfl_query: the engine parser backstop ─────────────────────────────────────
+
+class _FakeStatement:
+    def __init__(self, type_):
+        self.type = type_
+
+
+class TestParserBackstop:
+    """DuckDB's parser must see exactly one SELECT, whatever the text checks concluded."""
+
+    @pytest.mark.parametrize("statements", [
+        [_FakeStatement(duckdb.StatementType.SELECT)] * 2,
+        [_FakeStatement(duckdb.StatementType.SET)],
+        [],
+    ])
+    def test_rejects_unless_one_select(self, captured, monkeypatch, statements):
+        monkeypatch.setattr(duckdb, "extract_statements", lambda sql: statements)
+        result = nfl_query("SELECT 1")
+        assert result["code"] == ErrorCode.MULTIPLE_STATEMENTS
+        assert captured == []
+
+    def test_parse_error_is_a_sql_error(self, captured):
+        result = nfl_query("SELECT FROM WHERE")
+        assert result["code"] == ErrorCode.SQL_ERROR
+        assert "Parser Error" in result["error"]
+        assert captured == []
+
+
+# ── nfl_query end to end against a temporary database ─────────────────────────
+
+_PLAY_DESCRIPTIONS = (
+    "(1, 'KC', 'P.Mahomes pass short; set up by a play-action fake'),"
+    " (2, 'KC', 'Call reversed -- after review /* booth */'),"
+    " (3, 'BUF', 'J.Allen scrambles, O''Brien tackles'),"
+    " (4, 'BUF', 'Timeout #1 by BUF')"
+)
+
+
+@pytest.fixture
+def temp_db(tmp_path, monkeypatch):
+    """A temporary database with a plays table, plus a secret file outside it."""
+    for var in ("NFL_MCP_DUCKDB_MEMORY_LIMIT", "NFL_MCP_DUCKDB_THREADS", "NFL_MCP_DUCKDB_TEMP_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    path = tmp_path / "nflread.duckdb"
+    con = duckdb.connect(str(path))
+    con.execute(f"CREATE TABLE plays AS SELECT * FROM (VALUES {_PLAY_DESCRIPTIONS}) "
+                "AS v(play_id, posteam, \"desc\")")
+    con.close()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.csv").write_text("a,b\nTOPSECRET,2\n")
+    mem = duckdb.connect(":memory:")
+    mem.execute(f"COPY (SELECT 'TOPSECRET' AS s) TO '{outside / 'secret.parquet'}' (FORMAT parquet)")
+    mem.execute(f"COPY (SELECT 'TOPSECRET' AS s) TO '{outside / 'secret.json'}'")
+    mem.close()
+    monkeypatch.setenv("NFL_MCP_DB_PATH", str(path))
+    return outside
+
+
+@pytest.fixture
+def no_text_guard(monkeypatch):
+    """Turn the keyword scan off, so the engine setting is the only thing under test."""
+    monkeypatch.setattr(tools, "_FORBIDDEN", __import__("re").compile(r"(?!x)x"))
+    monkeypatch.setattr(tools, "_FORBIDDEN_QUOTED_NAMES", frozenset())
+
+
+_FILE_VECTORS = [
+    "SELECT * FROM read_text('{d}/secret.csv')",
+    "SELECT * FROM read_blob('{d}/secret.csv')",
+    "SELECT * FROM read_csv('{d}/secret.csv')",
+    "SELECT * FROM read_csv_auto('{d}/secret.csv')",
+    "SELECT * FROM sniff_csv('{d}/secret.csv')",
+    "SELECT * FROM read_parquet('{d}/secret.parquet')",
+    "SELECT * FROM parquet_scan('{d}/secret.parquet')",
+    "SELECT * FROM parquet_metadata('{d}/secret.parquet')",
+    "SELECT * FROM read_json('{d}/secret.json')",
+    "SELECT * FROM read_json_auto('{d}/secret.json')",
+    "SELECT * FROM glob('{d}/*')",
+    "SELECT * FROM '{d}/secret.csv'",
+    "SELECT * FROM \"{d}/secret.csv\"",
+    "SELECT * FROM '{d}/secret.parquet'",
+    "SELECT * FROM query('SELECT * FROM read_text(''{d}/secret.csv'')')",
+    "SELECT * FROM read_csv('https://example.invalid/x.csv')",
+    "SELECT * FROM read_parquet('http://127.0.0.1:9/x.parquet')",
+    "WITH s AS (SELECT * FROM read_text('{d}/secret.csv')) SELECT * FROM s",
+]
+
+
+class TestNflQueryEngineRefusesExternalAccess:
+    @pytest.mark.parametrize("template", _FILE_VECTORS)
+    def test_text_guard_or_engine_refuses(self, temp_db, template):
+        result = nfl_query(template.format(d=temp_db))
+        assert "error" in result and "code" in result
+        assert "TOPSECRET" not in repr(result)
+        assert "secret.csv\\n" not in repr(result)
+
+    @pytest.mark.parametrize("template", _FILE_VECTORS)
+    def test_engine_refuses_with_the_text_guard_off(self, temp_db, no_text_guard, template):
+        result = nfl_query(template.format(d=temp_db))
+        assert "error" in result and "code" in result
+        assert "TOPSECRET" not in repr(result)
+        assert "rows" not in result
+
+    def test_engine_error_says_file_access_is_disabled(self, temp_db, no_text_guard):
+        result = nfl_query(f"SELECT * FROM read_text('{temp_db}/secret.csv')")
+        assert result["code"] == ErrorCode.SQL_ERROR
+        assert "disabled by configuration" in result["error"]
+
+    def test_data_modifying_cte_fails_closed(self, temp_db, no_text_guard):
+        result = nfl_query("WITH x AS (DELETE FROM plays RETURNING *) SELECT * FROM x")
+        assert result["code"] == ErrorCode.SQL_ERROR
+        assert nfl_query("SELECT count(*) AS n FROM plays")["rows"] == [{"n": 4}]
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT current_setting('enable_external_access') AS v",
+        "SELECT value AS v FROM duckdb_settings() WHERE name = 'lock_configuration'",
+    ])
+    def test_settings_read_back_locked_through_nfl_query(self, temp_db, no_text_guard, sql):
+        rows = nfl_query(sql)["rows"]
+        assert rows[0]["v"] in (False, "true")
+
+
+class TestNflQueryEndToEnd:
+    @pytest.mark.parametrize("sql,expected", [
+        ("SELECT play_id FROM plays WHERE \"desc\" ILIKE '%set%' ORDER BY 1", [1]),
+        ("SELECT play_id FROM plays WHERE \"desc\" ILIKE '%Call%' ORDER BY 1", [2]),
+        ("SELECT play_id FROM plays WHERE \"desc\" LIKE '%; set%'", [1]),
+        ("SELECT play_id FROM plays WHERE \"desc\" LIKE '%-- after%' AND \"desc\" LIKE '%/* booth%'", [2]),
+        ("SELECT play_id FROM plays WHERE \"desc\" ILIKE '%O''Brien%'", [3]),
+        ("SELECT play_id FROM plays WHERE \"desc\" GLOB '*#1*'", [4]),
+        ("WITH k AS (SELECT * FROM plays WHERE posteam = 'KC') SELECT play_id FROM k ORDER BY 1", [1, 2]),
+        ("-- KC plays\nSELECT play_id FROM plays WHERE posteam = 'KC' ORDER BY 1;", [1, 2]),
+        ("/* a /* b */ c */ SELECT play_id AS \"set\" FROM plays WHERE play_id = 3", [3]),
+        ("SELECT play_id FROM plays WHERE $$BUF$$ = posteam ORDER BY 1 -- trailing", [3, 4]),
+        ("SELECT play_id FROM plays WHERE E'K\\x43' = posteam ORDER BY 1", [1, 2]),
+    ])
+    def test_normal_queries_work(self, temp_db, sql, expected):
+        result = nfl_query(sql)
+        assert "error" not in result, result
+        assert [list(r.values())[0] for r in result["rows"]] == expected
+
+    def test_max_rows_zero_returns_one_row(self, temp_db):
+        result = nfl_query("SELECT play_id FROM plays ORDER BY 1", max_rows=0)
+        assert result == {"rows": [{"play_id": 1}], "row_count": 1, "truncated": True}
+
+    def test_max_rows_negative_returns_one_row(self, temp_db):
+        result = nfl_query("SELECT play_id FROM plays WHERE play_id = 4", max_rows=-3)
+        assert result == {"rows": [{"play_id": 4}], "row_count": 1, "truncated": False}
