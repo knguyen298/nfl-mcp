@@ -1124,6 +1124,8 @@ class TestDoctorCommand:
 
         monkeypatch.setattr("nfl_mcp.config.config_exists", lambda: True)
         monkeypatch.setattr("nfl_mcp.config.get_duckdb_path", lambda: db_path)
+        # doctor opens the file through database.py, which holds its own reference.
+        monkeypatch.setattr("nfl_mcp.database.get_duckdb_path", lambda: db_path)
         monkeypatch.setattr("nfl_mcp.cli._claude_desktop_config_path", lambda: claude_path)
         monkeypatch.setattr("nfl_mcp.cli.Path.cwd", lambda: tmp_path)
         monkeypatch.setattr("nfl_mcp.database.get_db_connection", _fake_get_db_connection)
@@ -1138,6 +1140,8 @@ class TestDoctorCommand:
 
         monkeypatch.setattr("nfl_mcp.config.config_exists", lambda: True)
         monkeypatch.setattr("nfl_mcp.config.get_duckdb_path", lambda: db_path)
+        # doctor opens the file through database.py, which holds its own reference.
+        monkeypatch.setattr("nfl_mcp.database.get_duckdb_path", lambda: db_path)
         monkeypatch.setattr("nfl_mcp.cli._claude_desktop_config_path", lambda: None)
         monkeypatch.setattr("nfl_mcp.cli.Path.cwd", lambda: tmp_path)
         monkeypatch.setattr(
@@ -1179,6 +1183,8 @@ class TestDoctorCommand:
 
         monkeypatch.setattr("nfl_mcp.config.config_exists", lambda: True)
         monkeypatch.setattr("nfl_mcp.config.get_duckdb_path", lambda: db_path)
+        # doctor opens the file through database.py, which holds its own reference.
+        monkeypatch.setattr("nfl_mcp.database.get_duckdb_path", lambda: db_path)
         monkeypatch.setattr("nfl_mcp.cli._claude_desktop_config_path", lambda: None)
         monkeypatch.setattr("nfl_mcp.cli.Path.cwd", lambda: tmp_path)
         monkeypatch.setattr("duckdb.connect", lambda *args, **kwargs: _FakeEmptyDb())
@@ -1199,6 +1205,8 @@ class TestDoctorCommand:
 
         monkeypatch.setattr("nfl_mcp.config.config_exists", lambda: True)
         monkeypatch.setattr("nfl_mcp.config.get_duckdb_path", lambda: db_path)
+        # doctor opens the file through database.py, which holds its own reference.
+        monkeypatch.setattr("nfl_mcp.database.get_duckdb_path", lambda: db_path)
         monkeypatch.setattr("nfl_mcp.cli._claude_desktop_config_path", lambda: None)
         monkeypatch.setattr("nfl_mcp.cli.Path.cwd", lambda: tmp_path)
         monkeypatch.setattr("duckdb.connect", lambda *args, **kwargs: _FakeNoPlaysDb())
@@ -1240,6 +1248,8 @@ class TestDoctorCommand:
 
         monkeypatch.setattr("nfl_mcp.config.config_exists", lambda: True)
         monkeypatch.setattr("nfl_mcp.config.get_duckdb_path", lambda: db_path)
+        # doctor opens the file through database.py, which holds its own reference.
+        monkeypatch.setattr("nfl_mcp.database.get_duckdb_path", lambda: db_path)
         monkeypatch.setattr("nfl_mcp.cli._claude_desktop_config_path", lambda: claude_path)
         monkeypatch.setattr("nfl_mcp.cli.Path.cwd", lambda: tmp_path)
 
@@ -1262,6 +1272,8 @@ class TestDoctorCommand:
 
         monkeypatch.setattr("nfl_mcp.config.config_exists", lambda: True)
         monkeypatch.setattr("nfl_mcp.config.get_duckdb_path", lambda: db_path)
+        # doctor opens the file through database.py, which holds its own reference.
+        monkeypatch.setattr("nfl_mcp.database.get_duckdb_path", lambda: db_path)
         monkeypatch.setattr("nfl_mcp.cli._claude_desktop_config_path", lambda: claude_path)
         monkeypatch.setattr("nfl_mcp.cli.Path.cwd", lambda: tmp_path)
 
@@ -1283,6 +1295,8 @@ class TestDoctorCommand:
 
         monkeypatch.setattr("nfl_mcp.config.config_exists", lambda: True)
         monkeypatch.setattr("nfl_mcp.config.get_duckdb_path", lambda: db_path)
+        # doctor opens the file through database.py, which holds its own reference.
+        monkeypatch.setattr("nfl_mcp.database.get_duckdb_path", lambda: db_path)
         monkeypatch.setattr("nfl_mcp.cli._claude_desktop_config_path", lambda: claude_path)
         monkeypatch.setattr("nfl_mcp.cli.Path.cwd", lambda: tmp_path)
         monkeypatch.setattr("duckdb.connect", lambda *args, **kwargs: _FakeHealthyDb())
